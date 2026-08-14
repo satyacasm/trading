@@ -1,0 +1,26 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb-ha:pg17
+    container_name: trading_tsdb
+    environment:
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD: trading_local
+      POSTGRES_DB: trading
+    ports: ["5432:5432"]
+    volumes: ["tsdb_data:/home/postgres/pgdata/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading -d trading"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+    container_name: trading_redis
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  tsdb_data:

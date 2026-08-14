@@ -822,8 +822,10 @@ class ParserCase:
     parser: Parser
     fixture: Path            # the file this parser owns
     source_key: str
-    min_rows: int            # sanity floor for the trimmed fixture
+    exact_rows: int          # NOT a floor — silently dropped rows must fail
     required_columns: tuple[str, ...]
+    golden_row_index: int    # a row whose values are asserted verbatim
+    golden_row: dict[str, str]   # column -> expected str(value); catches column swaps
 
 
 PARSER_CASES: list[ParserCase] = []
@@ -889,9 +891,45 @@ def test_parse_returns_the_declared_columns(case: ParserCase) -> None:
     assert not missing, f"{case.name} did not emit {sorted(missing)}"
 
 
-def test_parse_returns_enough_rows(case: ParserCase) -> None:
+def test_parse_returns_exactly_the_expected_rows(case: ParserCase) -> None:
+    """Exact, not a floor. A floor cannot catch silently dropped rows."""
     payload = make_payload(case.fixture, case.source_key, date(2026, 8, 13))
-    assert case.parser.parse(payload).height >= case.min_rows
+    assert case.parser.parse(payload).height == case.exact_rows
+
+
+def test_parse_maps_columns_correctly_on_a_known_row(case: ParserCase) -> None:
+    """Assert real values from a real file.
+
+    Column-name and row-count checks cannot distinguish a correct parser from
+    one that returns the right shape full of garbage, or one with open/close
+    transposed. This is the only test that reads what is actually in a cell.
+    """
+    payload = make_payload(case.fixture, case.source_key, date(2026, 8, 13))
+    frame = case.parser.parse(payload)
+    row = frame.row(case.golden_row_index, named=True)
+    for column, expected in case.golden_row.items():
+        assert str(row[column]) == expected, (
+            f"{case.name}: column {column!r} was {row[column]!r}, expected {expected!r}"
+        )
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    [b"\x00\xff\xfe\x01" * 64, b"col_a,col_b\n1,2\n", b"   \n\n  \n"],
+    ids=["binary", "foreign-csv", "whitespace"],
+)
+def test_can_parse_never_raises_on_hostile_input(
+    case: ParserCase, garbage: bytes, tmp_path: Path
+) -> None:
+    """ParserRegistry.select calls can_parse on EVERY registered parser.
+
+    One parser that raises on a foreign payload breaks dispatch for all of
+    them, so this property has to be enforced in code, not just documented.
+    """
+    path = tmp_path / "hostile.bin"
+    path.write_bytes(garbage)
+    payload = make_payload(path, case.source_key, date(2026, 8, 13))
+    assert case.parser.can_parse(payload) is False
 
 
 def test_parse_is_pure(case: ParserCase) -> None:
@@ -1686,8 +1724,25 @@ PARSER_CASES.append(
         parser=UdiffParser(),
         fixture=FIXTURE_ROOT / "udiff" / "nse_fo_udiff.zip",
         source_key="nse_fo_udiff",
-        min_rows=50,
+        exact_rows=50,
         required_columns=("TradDt", "Sgmt", "FinInstrmTp", "ClsPric", "NewBrdLotQty"),
+        golden_row_index=0,
+        # Real values read off the live 2026-08-13 NSE F&O file. UndrlygPric and
+        # NewBrdLotQty are included deliberately: they are the two fields finding F3
+        # depends on, and a column-shift would corrupt them silently.
+        golden_row={
+            "TradDt": "2026-08-13",
+            "Sgmt": "FO",
+            "Src": "NSE",
+            "FinInstrmTp": "STO",
+            "TckrSymb": "ABCAPITAL",
+            "XpryDt": "2026-10-27",
+            "StrkPric": "430.00",
+            "OptnTp": "CE",
+            "ClsPric": "19.45",
+            "NewBrdLotQty": "3100",
+            "UndrlygPric": "407.70",
+        },
     )
 )
 ```
@@ -1695,7 +1750,7 @@ PARSER_CASES.append(
 - [ ] **Step 7: Run the parser tests and the contract suite**
 
 Run: `uv run pytest tests/parsers/test_udiff.py tests/contracts -v`
-Expected: PASS. The contract suite now runs its 7 parametrized checks against `udiff`.
+Expected: PASS. The contract suite now runs its parametrized checks against `udiff`, including the golden-row and hostile-input tests.
 
 - [ ] **Step 8: Commit**
 
@@ -1854,8 +1909,22 @@ PARSER_CASES.append(
         parser=NseLegacyCmParser(),
         fixture=FIXTURE_ROOT / "nse_legacy" / "cm_legacy.zip",
         source_key="nse_cm_legacy",
-        min_rows=50,
+        exact_rows=50,
         required_columns=("SYMBOL", "SERIES", "CLOSE", "TIMESTAMP", "ISIN"),
+        golden_row_index=0,
+        # Real values from the live 2019-03-14 file. OPEN/HIGH/LOW/CLOSE are all
+        # asserted because a transposition among them is the classic legacy-parser
+        # bug and no other test in the suite would see it.
+        golden_row={
+            "SYMBOL": "20MICRONS",
+            "SERIES": "EQ",
+            "OPEN": "39.5",
+            "HIGH": "40",
+            "LOW": "38.5",
+            "CLOSE": "38.95",
+            "TIMESTAMP": "14-MAR-2019",
+            "ISIN": "INE144J01027",
+        },
     )
 )
 ```
@@ -2066,8 +2135,23 @@ PARSER_CASES.append(
         parser=AmfiNavParser(),
         fixture=FIXTURE_ROOT / "amfi" / "navall.txt",
         source_key="amfi_nav",
-        min_rows=20,
+        # Set this to the exact data-row count your trimmed fixture produces.
+        exact_rows=40,
         required_columns=("scheme_code", "nav", "nav_date", "amc_name", "scheme_type"),
+        golden_row_index=0,
+        # Real values from the live file. amc_name is asserted because it is
+        # *carried down* from a section header rather than read off the row —
+        # if the stateful scan is wrong, this is the field that shows it.
+        golden_row={
+            "scheme_code": "119551",
+            "isin_growth": "INF209KA12Z1",
+            "scheme_name": (
+                "Aditya Birla Sun Life Banking & PSU Debt Fund  - DIRECT - IDCW"
+            ),
+            "nav": "107.2564",
+            "nav_date": "13-Aug-2026",
+            "amc_name": "Aditya Birla Sun Life Mutual Fund",
+        },
     )
 )
 ```

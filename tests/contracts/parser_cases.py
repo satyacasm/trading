@@ -21,8 +21,10 @@ class ParserCase:
     parser: Parser
     fixture: Path  # the file this parser owns
     source_key: str
-    min_rows: int  # sanity floor for the trimmed fixture
+    exact_rows: int  # NOT a floor — silently dropped rows must fail
     required_columns: tuple[str, ...]
+    golden_row_index: int  # a row whose values are asserted verbatim
+    golden_row: dict[str, str]  # column -> expected str(value); catches column swaps
 
 
 PARSER_CASES: list[ParserCase] = []

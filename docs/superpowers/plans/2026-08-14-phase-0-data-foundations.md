@@ -1054,6 +1054,24 @@ def test_data_sources_match_the_python_enum(db_conn):
 
     rows = db_conn.execute("SELECT source_id, source_key FROM data_sources").fetchall()
     assert {(r[0], r[1]) for r in rows} == {(s.value, s.name) for s in DataSource}
+
+
+def test_data_source_values_are_pinned():
+    """These integers are persisted on every bar row (~250M at full backfill).
+
+    Renumbering them would silently reattribute the provenance of all existing
+    data with no error anywhere. This test is the guard rail: adding a member is
+    fine, changing an existing member's value must break the build.
+    """
+    from trading.contracts import DataSource
+
+    assert {s.name: s.value for s in DataSource} == {
+        "NSE_CM_UDIFF": 1,
+        "NSE_FO_UDIFF": 2,
+        "BSE_CM_UDIFF": 3,
+        "NSE_CM_LEGACY": 4,
+        "AMFI_NAV": 5,
+    }
 ```
 
 - [ ] **Step 2: Add the database fixture to `tests/conftest.py`**
@@ -1114,7 +1132,7 @@ for source in DataSource:
 - [ ] **Step 5: Apply and re-run**
 
 Run: `uv run alembic upgrade head && uv run pytest tests/test_migrations.py -v -m db`
-Expected: PASS (6 passed)
+Expected: PASS (7 passed)
 
 - [ ] **Step 6: Verify the migration is reversible**
 
@@ -1332,7 +1350,7 @@ class ArchivingClient:
 - [ ] **Step 4: Run and confirm the client tests pass**
 
 Run: `uv run pytest tests/sources/test_http.py -v`
-Expected: PASS (6 passed)
+Expected: PASS (7 passed)
 
 - [ ] **Step 5: Implement the four sources**
 

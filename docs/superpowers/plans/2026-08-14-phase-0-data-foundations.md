@@ -211,12 +211,19 @@ from pathlib import Path
 from trading.config import Settings
 
 
+# NOTE: every Settings() in this file passes _env_file=None.
+# Settings normally reads .env and .env.local. Without this, the moment real
+# broker credentials are added to .env.local, `assert s.upstox_api_key is None`
+# starts failing — a confusing breakage at exactly the wrong time. Tests must
+# read the environment they set, and nothing else.
+
+
 def test_settings_read_from_env(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
     monkeypatch.setenv("DATA_ROOT", str(tmp_path))
 
-    s = Settings()
+    s = Settings(_env_file=None)
 
     assert s.database_url == "postgresql://u:p@localhost:5432/db"
     assert s.data_root == Path(tmp_path)
@@ -228,10 +235,23 @@ def test_data_subdirectories_are_derived(monkeypatch, tmp_path):
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
     monkeypatch.setenv("DATA_ROOT", str(tmp_path))
 
-    s = Settings()
+    s = Settings(_env_file=None)
 
     assert s.raw_archive_root == tmp_path / "raw"
     assert s.recordings_root == tmp_path / "recordings"
+
+
+def test_real_credentials_in_env_local_do_not_break_the_suite(monkeypatch, tmp_path):
+    """Regression guard: adding a real broker key must not fail unrelated tests."""
+    env_local = tmp_path / ".env.local"
+    env_local.write_text("UPSTOX_API_KEY=a-real-looking-key\n")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+
+    s = Settings(_env_file=None)
+
+    assert s.upstox_api_key is None
 ```
 
 - [ ] **Step 6: Run it and confirm it fails**
@@ -1040,10 +1060,16 @@ def test_bars_daily_is_a_hypertable(db_conn):
 
 
 def test_untraded_option_row_is_accepted(db_conn):
-    """Finding F2: OHLC=0 with a real close and zero volume is legitimate."""
+    """Finding F2: OHLC=0 with a real close and zero volume is legitimate.
+
+    NOTE: expiry/strike/option_type are mandatory on an OPTION row — the
+    ck_option_fields and ck_derivative_expiry constraints enforce it. Omitting
+    them makes this test fail for a reason that has nothing to do with OHLC.
+    """
     db_conn.execute(
-        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
-        "status, canonical_key) VALUES ('OPTION','NSE','FO','TESTOPT','INR','ACTIVE',"
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, expiry, "
+        "strike, option_type, currency, status, canonical_key) VALUES "
+        "('OPTION','NSE','FO','TESTOPT','2026-10-27',430,'CE','INR','ACTIVE',"
         "'NSE:FO:TESTOPT:2026-10-27:430:CE') RETURNING instrument_id"
     )
     iid = db_conn.execute(

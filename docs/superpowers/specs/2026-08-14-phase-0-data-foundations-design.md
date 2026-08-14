@@ -75,7 +75,7 @@ Before writing the implementation plan, all five EOD sources were actually downl
 
 **F1 — Five parsers collapse to three.** NSE CM, NSE FO, and BSE CM all emit a **byte-identical 34-column UDiFF header** (BSE differs only by `CRLF` line endings). One `UdiffParser` covers all three, discriminating on `Sgmt`, `Src`, and `FinInstrmTp`. Only the pre-UDiFF NSE legacy format (13 columns) and AMFI need separate parsers. This supersedes D7's "four parser variants" premise.
 
-**F2 — The `ck_ohlc_order` CHECK constraint as specified would reject 49% of F&O rows.** On 2026-08-13, **16,984 of 34,799** F&O rows had `OpnPric = HghPric = LwPric = 0.00` with a non-zero `ClsPric`: contracts that did not trade, for which the exchange still publishes a theoretically-derived close and settlement. The invariant must be conditioned on positive volume. See §4.5 for the corrected DDL. A validator quarantining `open <= 0` would likewise discard half of every F&O day.
+**F2 — The `ck_ohlc_order` CHECK constraint as specified would reject 60% of F&O rows.** On 2026-08-13, **20,954 of 34,799** F&O rows had `OpnPric = HghPric = LwPric = 0.00` with a non-zero `ClsPric`: contracts that did not trade, for which the exchange still publishes a theoretically-derived close and settlement. The invariant must be conditioned on positive volume. See §4.5 for the corrected DDL. A validator quarantining `open <= 0` would likewise discard most of every F&O day.
 
 **F3 — Lot size and underlying spot come free with the backfill.** UDiFF carries `NewBrdLotQty` (lot size) and `UndrlygPric` (underlying spot) on every row. `instrument_lot_history` (§4.2) is therefore **derivable directly from EOD ingestion** with no separate source, and the spot series required by the relative-strike reconstruction of parent §3.1 arrives aligned to every option row.
 
@@ -259,7 +259,7 @@ CREATE TABLE bars_daily (
     PRIMARY KEY (instrument_id, ts),
     -- Conditioned on positive volume: untraded F&O contracts publish
     -- OHLC = 0 with a theoretically-derived non-zero close. See finding F2 —
-    -- an unconditional constraint rejects ~49% of F&O rows.
+    -- an unconditional constraint rejects ~60% of F&O rows.
     CONSTRAINT ck_ohlc_order CHECK (
         volume IS NULL OR volume = 0 OR (
             high >= low AND high >= open AND high >= close

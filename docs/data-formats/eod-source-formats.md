@@ -98,12 +98,12 @@ Stock option — **note `OpnPric`/`HghPric`/`LwPric` are all `0.00` while `ClsPr
 
 ### ⚠️ Untraded contracts break naive OHLC validation
 
-**16,984 of 34,799 F&O rows (49%) on 2026-08-13 had `OpnPric = 0.00` with a non-zero `ClsPric`.** These are contracts that did not trade that day; the exchange still publishes a close and a settlement price derived theoretically.
+**20,954 of 34,799 F&O rows (60%) on 2026-08-13 had `OpnPric = 0.00` with a non-zero `ClsPric`.** These are contracts that did not trade that day; the exchange still publishes a close and a settlement price derived theoretically.
 
 Consequences:
 
-1. A `CHECK (high >= low AND high >= open AND high >= close …)` constraint **rejects half the F&O universe**. The invariant must be conditioned on `TtlTradgVol > 0`.
-2. A validator that quarantines `open <= 0` would discard half of every F&O day.
+1. A `CHECK (high >= low AND high >= open AND high >= close …)` constraint **rejects most of the F&O universe**. The invariant must be conditioned on `TtlTradgVol > 0`.
+2. A validator that quarantines `open <= 0` would discard most of every F&O day.
 3. Backtests must treat these bars as **non-tradable marks**, not as fillable prices. `TtlTradgVol = 0` is the flag.
 
 ### Two fields that are worth more than they look

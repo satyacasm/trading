@@ -26,7 +26,7 @@ Every task's requirements implicitly include this section.
 - **No network in tests** except tests marked `@pytest.mark.live`, which are excluded from the default run.
 - **Every task ends with a passing `pytest` run and a commit.**
 - **Column names come from `docs/data-formats/eod-source-formats.md`.** Never invent one; if it is not in that document, download a sample and add it there first.
-- **Untraded contracts are real.** ~49% of F&O rows have `OpnPric = HghPric = LwPric = 0.00` with a non-zero `ClsPric`. Never treat these as corrupt (finding F2).
+- **Untraded contracts are real.** ~60% of F&O rows have `OpnPric = HghPric = LwPric = 0.00` with a non-zero `ClsPric`. Never treat these as corrupt (finding F2).
 - Lint/type gate: `ruff check . && ruff format --check . && mypy src/trading/contracts` must pass before any commit.
 
 ---
@@ -970,7 +970,7 @@ git commit -m "test(contracts): parser conformance suite enforcing mutual exclus
 **Reference:** transcribe the DDL from spec §4.1–§4.6 exactly. Two details that are easy to get wrong and are load-bearing:
 
 1. `instruments` natural key **must** use `UNIQUE NULLS NOT DISTINCT` (PG15+). Without it every equity row (NULL expiry/strike/option_type) is distinct from every other and the constraint enforces nothing.
-2. `bars_daily.ck_ohlc_order` **must** be conditioned on `volume`. Finding F2: 49% of F&O rows are untraded with `OHLC = 0` and a non-zero close, and an unconditional constraint rejects them all.
+2. `bars_daily.ck_ohlc_order` **must** be conditioned on `volume`. Finding F2: 60% of F&O rows are untraded with `OHLC = 0` and a non-zero close, and an unconditional constraint rejects them all.
 
 - [ ] **Step 1: Write the failing migration test**
 
@@ -2683,7 +2683,9 @@ git add -A && git commit -m "feat(resolver): instrument resolution with abort gu
 | `duplicate_key` | same `(instrument_id, ts)` twice in one batch |
 | `nav_not_available` | AMFI `N.A.` NAV (null close from an MF row) |
 
-**Critical:** untraded F&O rows (`volume = 0`, OHLC = 0, `close > 0`) **must pass**. Finding F2 — quarantining them discards half of every F&O day.
+**Critical:** untraded F&O rows (`volume = 0`, OHLC = 0, `close > 0`) **must pass**. Finding F2 — quarantining them discards 60% of every F&O day.
+
+**`volume > 0` is an exact discriminator, not an approximation.** Measured on the 2026-08-13 F&O file: the set of rows with `volume = 0 AND close > 0` and the set with `open = 0 AND close > 0` are *the same 20,954 rows*. And **zero** rows have `volume > 0` combined with impossible OHLC ordering — so gating on volume accepts 100% of a real trading day while still catching genuine corruption.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2725,7 +2727,7 @@ def test_a_good_row_passes():
 
 
 def test_untraded_option_with_zero_ohlc_passes():
-    """Finding F2 — 49% of F&O rows look like this."""
+    """Finding F2 — 60% of F&O rows look like this."""
     outcome = _validate(
         _frame(open=Decimal("0"), high=Decimal("0"), low=Decimal("0"),
                close=Decimal("19.45"), volume=0)

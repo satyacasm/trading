@@ -283,7 +283,17 @@ SELECT add_compression_policy('bars_daily', INTERVAL '3 months');
 
 The `ck_ohlc_order` CHECK is deliberately in the database, not only in the validator. Any future write path — a Phase 1 recorder, a manual backfill — inherits the invariant for free.
 
-**`source` provenance codes.** `source SMALLINT` references a small `data_sources` lookup table (`source_id`, `source_key`, `description`), seeded by migration and mirrored by a Python `IntEnum` kept in sync by a test. A smallint rather than a text column because it is repeated across ~250M rows; a lookup table rather than a bare enum because Phase 1 adds broker sources without a schema change.
+**`source` provenance codes.** `source SMALLINT` references a small `data_sources` lookup table, seeded by migration and mirrored by a Python `IntEnum` kept in sync by a test. A smallint rather than a text column because it is repeated across ~250M rows; a lookup table rather than a bare enum because Phase 1 adds broker sources without a schema change.
+
+```sql
+CREATE TABLE data_sources (
+    source_id   SMALLINT PRIMARY KEY,
+    source_key  TEXT NOT NULL UNIQUE,   -- mirrors DataSource member NAME
+    description TEXT
+);
+```
+
+Seeded by iterating `trading.contracts.DataSource`, so drift is impossible by construction. Two tests guard it: one asserts the table and the enum agree, the other pins the enum's literal integer values — **those integers are persisted on every bar row, and renumbering them would silently reattribute the provenance of all existing data with no error raised anywhere.**
 
 ### 4.6 Operational tables
 

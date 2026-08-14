@@ -100,6 +100,7 @@ Decisions taken during brainstorming on 2026-08-14, with rationale.
 | D14 | **Polars only, no pandas, in Phase 0** | Polars covers every Phase 0 need | Adding pandas pre-emptively |
 | D15 | **Real trimmed exchange files committed as golden fixtures** | Hand-written fake CSVs test your own misunderstanding of the format. Public free data, private repo | Synthetic fixtures; network-dependent tests |
 | D16 | **Raw market recorder included in Phase 0**, capturing to disk only | User decision, overruling initial scoping. Lost days of point-in-time history are unrecoverable, and finding §2.3 makes self-recording the primary intraday options source rather than a backup. Coupling is near-zero, so it does not slow the rest of Phase 0 | Deferring to Phase 1 — cleaner, but the clock runs the whole time |
+| D17 | **Recorder runs on Oracle Cloud Always Free** (Ampere A1, aarch64) | Resolves O4. True 24/7 uptime at zero cost, and large enough (4 cores / 24 GB / 200 GB) to also host TimescaleDB in Phase 1. Critically, **the dev Mac is Apple M5 / arm64 and Ampere A1 is aarch64 — the same architecture**, so Docker images run identically in both places with no cross-building or emulation | MacBook + launchd (loses any day the lid closes); home Pi (hardware-dependent); Mac-now-migrate-later (early gaps are permanent) |
 
 ---
 
@@ -543,7 +544,7 @@ Phase 0 is complete when all of the following pass. "It ran without errors" is n
 | O1 | Does Dhan's expired-options endpoint sit behind the ₹499/mo Data API subscription? | Empirical: hit `/v2/charts/rollingoption` once credentials exist |
 | O2 | Given §2.1, what replaces Upstox expired-instruments in the Phase 1 backfill plan? | Re-plan at the start of Phase 1, informed by O1 |
 | O3 | How far back do NSE/BSE archives remain reliably downloadable? | Discovered during backfill; the ledger records exactly where coverage ends |
-| **O4** | **Where does the recorder run?** A sleeping MacBook loses whole trading days, which defeats the purpose | **Blocks the recorder's usefulness, not its construction.** Must be answered before step R is considered complete |
+| ~~O4~~ | ~~Where does the recorder run?~~ | **Resolved 2026-08-14 → D17: Oracle Cloud Always Free (Ampere A1).** Remaining sub-task: confirm ARM capacity is available in the chosen region at signup |
 
 ### 9.2 Risks
 
@@ -556,7 +557,8 @@ Phase 0 is complete when all of the following pass. "It ran without errors" is n
 | Schema churn once Phase 1 begins | `bars_intraday` and `users` created empty now; `user_id` multi-tenancy retained; source abstraction isolates broker bindings in `source_bindings` JSONB |
 | Solo bandwidth against MathWorks and Astro Acharya | Parallel parser delegation; each build-order step is independently mergeable and testable |
 | **Recorder silently dies and nobody notices for weeks** — the highest-cost failure in Phase 0, since the loss is unrecoverable | Per-minute heartbeat file; session manifest written even on failure; verification check 7 reports gaps explicitly; daily summary surfaces a dead recorder same-day |
-| **Recorder host sleeps or loses network**, losing whole trading days | Open question O4 — hosting must be decided before the recorder is useful |
+| **Recorder host sleeps or loses network**, losing whole trading days | Resolved by D17 — always-on cloud host rather than a laptop |
+| Oracle reclaims an idle Always Free instance, or ARM capacity is unavailable at signup | The recorder keeps the instance genuinely non-idle; confirm capacity during signup; the recorder's zero coupling makes re-hosting cheap if it ever happens |
 
 ---
 

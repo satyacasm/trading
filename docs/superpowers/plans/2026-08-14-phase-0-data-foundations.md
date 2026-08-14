@@ -845,7 +845,14 @@ class ParserCase:
     exact_rows: int          # NOT a floor — silently dropped rows must fail
     required_columns: tuple[str, ...]
     golden_row_index: int    # a row whose values are asserted verbatim
-    golden_row: dict[str, str]   # column -> expected str(value); catches column swaps
+    # column -> expected str(value); catches column swaps and garbage output.
+    # WARNING: this compares str(cell), so pick columns whose dtype stringifies
+    # predictably — String, Int64, Date, Decimal. A Float64 column loses trailing
+    # zeros ("1230.10" parses to 1230.1 and stringifies to "1230.1"), producing a
+    # confusing failure that looks like a parser bug but is float formatting.
+    # All three Phase 0 parsers return String columns by design (type coercion is
+    # the normalizer's job), so this is a trap for future parsers, not current ones.
+    golden_row: dict[str, str]
 
 
 PARSER_CASES: list[ParserCase] = []

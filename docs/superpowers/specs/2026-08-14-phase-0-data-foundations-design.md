@@ -67,7 +67,19 @@ Parent plan §3.1 states the Dhan expired-options dataset covers *"ATM and ±10 
 
 ### 2.3 Net effect on strategy
 
-Self-recording is promoted from "guaranteed-free floor" to **the primary source of intraday options history**. This does not change Phase 0's contents, but it raises the priority of the recorder work at the start of Phase 1.
+Self-recording is promoted from "guaranteed-free floor" to **the primary source of intraday options history**. This does not change Phase 0's contents, but it raises the priority of the recorder work — see D16.
+
+### 2.4 Live format reconnaissance (2026-08-14)
+
+Before writing the implementation plan, all five EOD sources were actually downloaded and inspected. Full detail is in [`docs/data-formats/eod-source-formats.md`](../../data-formats/eod-source-formats.md); four findings change this spec.
+
+**F1 — Five parsers collapse to three.** NSE CM, NSE FO, and BSE CM all emit a **byte-identical 34-column UDiFF header** (BSE differs only by `CRLF` line endings). One `UdiffParser` covers all three, discriminating on `Sgmt`, `Src`, and `FinInstrmTp`. Only the pre-UDiFF NSE legacy format (13 columns) and AMFI need separate parsers. This supersedes D7's "four parser variants" premise.
+
+**F2 — The `ck_ohlc_order` CHECK constraint as specified would reject 49% of F&O rows.** On 2026-08-13, **16,984 of 34,799** F&O rows had `OpnPric = HghPric = LwPric = 0.00` with a non-zero `ClsPric`: contracts that did not trade, for which the exchange still publishes a theoretically-derived close and settlement. The invariant must be conditioned on positive volume. See §4.5 for the corrected DDL. A validator quarantining `open <= 0` would likewise discard half of every F&O day.
+
+**F3 — Lot size and underlying spot come free with the backfill.** UDiFF carries `NewBrdLotQty` (lot size) and `UndrlygPric` (underlying spot) on every row. `instrument_lot_history` (§4.2) is therefore **derivable directly from EOD ingestion** with no separate source, and the spot series required by the relative-strike reconstruction of parent §3.1 arrives aligned to every option row.
+
+**F4 — Two access details that would have failed silently.** NSE returns 403 without cookie priming (`GET https://www.nseindia.com` first, then reuse cookies with a browser `User-Agent` and `Referer`). AMFI's documented URL `www.amfiindia.com/spages/NAVAll.txt` now **302s to `portal.amfiindia.com`**. And AMFI's file is not a CSV at all — data rows are interleaved with section headers and AMC names, requiring a stateful line scanner.
 
 ---
 
@@ -90,7 +102,7 @@ Decisions taken during brainstorming on 2026-08-14, with rationale.
 | D4 | **Colima + Docker Compose** for local Postgres/Redis | Local environment stays identical to the Phase 1 VPS deploy target | Homebrew-native Postgres — faster, but diverges from prod and the formula lags |
 | D5 | **Surrogate `BIGSERIAL instrument_id`** + `UNIQUE` natural key | Narrow 8-byte FK across ~250M bar rows; rename-safe; one physical contract keeps one ID forever | Human-readable string PK — ~35 bytes × 250M rows, index bloat, convention changes become mass migrations |
 | D6 | **`canonical_key` as a plain column** maintained by the resolver, `UNIQUE`-indexed — not a Postgres generated column | The natural expression needs `to_char`/date→text casts, which are `STABLE` not `IMMUTABLE`, and Postgres rejects those in generated columns. Application-side construction is deterministic and avoids the minefield | Generated column — cleaner in principle, fragile in practice |
-| D7 | **Full breadth backfill:** NSE equity + NSE F&O + BSE equity + AMFI, ~10 years | User decision. Four parser variants is exactly the pressure that proves the abstraction | 3 years / NSE-only — faster, but too thin for credible equity backtests |
+| D7 | **Full breadth backfill:** NSE equity + NSE F&O + BSE equity + AMFI, ~10 years | User decision. *Amended by finding F1: this needs three parsers, not four — NSE CM, NSE FO and BSE CM share one UDiFF schema. Breadth turned out cheaper than estimated* | 3 years / NSE-only — faster, but too thin for credible equity backtests |
 | D8 | **Approach A** — six typed pipeline stages, Polars inside bulk stages | Typed boundaries where bugs hide and subagents hand off; columnar speed where volume is | One-class-per-source (untestable without mocks); pure-dataframe (no typed boundaries) |
 | D9 | **Separate `bars_daily` and `bars_intraday` hypertables** | Daily bars are *authoritative* bhavcopy settlement data, not a rollup. One table would let a continuous aggregate silently overwrite official settlement prices; and 1-day vs 1-min data need different chunk sizing | Single `bars` table with an `interval` column |
 | D10 | **No `adjusted_close` column** — adjustment computed at read time | Parent §6: fills recorded at unadjusted actual prices. Storing adjusted prices means rewriting history on every corporate action | Materialised adjusted series |
@@ -245,8 +257,16 @@ CREATE TABLE bars_daily (
     source        SMALLINT    NOT NULL,
     ingested_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (instrument_id, ts),
-    CONSTRAINT ck_ohlc_order CHECK (high >= low AND high >= open AND high >= close
-                                    AND low <= open AND low <= close)
+    -- Conditioned on positive volume: untraded F&O contracts publish
+    -- OHLC = 0 with a theoretically-derived non-zero close. See finding F2 —
+    -- an unconditional constraint rejects ~49% of F&O rows.
+    CONSTRAINT ck_ohlc_order CHECK (
+        volume IS NULL OR volume = 0 OR (
+            high >= low AND high >= open AND high >= close
+            AND low <= open AND low <= close
+        )
+    ),
+    CONSTRAINT ck_close_positive CHECK (close > 0)
 );
 
 SELECT create_hypertable('bars_daily', 'ts', chunk_time_interval => INTERVAL '1 month');
@@ -504,18 +524,18 @@ If a subagent cannot make the test pass without editing the test, that is treate
 | 4 | Trading calendar + NSE/BSE holiday ingestion | Sonnet | 1, 2 |
 | 5 | Pipeline runner, `ingest_jobs` ledger, `BackfillRunner` | Sonnet | 2, 3 |
 | 6 | `InstrumentResolver` incl. abort guard | Sonnet | 1, 2 |
-| 7a | Parser: NSE equity, legacy format | Sonnet (parallel) | 3, 4 |
-| 7b | Parser: NSE equity, UDiFF format | Sonnet (parallel) | 3, 4 |
-| 7c | Parser: NSE F&O | Sonnet (parallel) | 3, 4 |
-| 7d | Parser: BSE equity | Sonnet (parallel) | 3, 4 |
-| 7e | Parser: AMFI NAV | Sonnet (parallel) | 3, 4 |
+| 7a | Parser: **UDiFF** — covers NSE CM + NSE FO + BSE CM (finding F1) | Sonnet (parallel) | 3, 4 |
+| 7b | Parser: NSE legacy CM (pre-UDiFF) | Sonnet (parallel) | 3, 4 |
+| 7c | Parser: AMFI NAV — stateful line scanner, not CSV (finding F4) | Sonnet (parallel) | 3, 4 |
 | 8 | Corporate actions ingestion + read-time adjustment | Sonnet | 6 |
 | 9 | Execute 10-year backfill + reconciliation | Opus drives | all |
 | **R** | **Raw market recorder (§5.6) + scheduling** | Sonnet | 0, credentials |
 
 **Step R runs on its own track.** It depends only on the repo scaffold and on broker credentials — not on the schema, the contracts, or any other step. It is scheduled **first among all delegated work** the moment credentials exist, because its value is a function of wall-clock days elapsed, not of engineering effort.
 
-Steps **2 and 3 are the critical path** for everything else and are single-authored, because contract consistency is where correctness comes from. Nothing else parallelises until they exist. Step 7 is where delegation pays: five parsers, five briefs, one shared contract suite.
+Steps **2 and 3 are the critical path** for everything else and are single-authored, because contract consistency is where correctness comes from. Nothing else parallelises until they exist. Step 7 is where delegation pays: three parsers, three briefs, one shared contract suite.
+
+Step 8's scope shrinks given finding F3: `instrument_lot_history` is populated as a by-product of UDiFF ingestion rather than from a separate source, so step 8 covers only corporate actions and read-time adjustment.
 
 **Stack:** `uv` · Python 3.12 · Polars · Pydantic v2 · psycopg3 · httpx · Alembic · structlog · pytest · ruff · mypy (strict on the contracts module only).
 

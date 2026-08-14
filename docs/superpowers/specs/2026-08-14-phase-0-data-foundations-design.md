@@ -20,14 +20,16 @@ Concretely, at the end of Phase 0:
 - Corporate actions are ingested as dated events, and price adjustment is computed at read time.
 - Re-running any ingestion day is provably a no-op.
 - Four reconciliation checks pass against the populated database.
+- **The raw market recorder is running daily** (§5.6), archiving option-chain WebSocket frames to disk from the day credentials land.
 
 ### Out of scope (deferred, with the phase that owns them)
 
 | Deferred | Owner phase |
 |---|---|
-| Real-time streaming, WebSocket ingestion, stream gateway | Phase 1 |
+| Real-time streaming *for the UI*, stream gateway, Redis fan-out | Phase 1 |
 | Order placement, fills, cost model, portfolio ledger | Phase 1 |
-| Self-recorders (option chain, news) | Phase 1 — see §3.3 |
+| **Parsing** recorded frames into `bars_intraday` / option-chain tables | Phase 1 — Phase 0 only captures (§5.6) |
+| News / announcements recorder | Phase 1 |
 | Agent Contract, sandbox, strategy runtime | Phase 2 |
 | Intelligence layer, FinBERT, entity linking | Phase 2.5 |
 | Backtest engine, metrics | Phase 3 |
@@ -97,6 +99,7 @@ Decisions taken during brainstorming on 2026-08-14, with rationale.
 | D13 | **Python 3.12 via `uv`**, not system 3.14 | Ecosystem wheel maturity; discovering a missing wheel in month three is far worse than pinning now | System Python 3.14 |
 | D14 | **Polars only, no pandas, in Phase 0** | Polars covers every Phase 0 need | Adding pandas pre-emptively |
 | D15 | **Real trimmed exchange files committed as golden fixtures** | Hand-written fake CSVs test your own misunderstanding of the format. Public free data, private repo | Synthetic fixtures; network-dependent tests |
+| D16 | **Raw market recorder included in Phase 0**, capturing to disk only | User decision, overruling initial scoping. Lost days of point-in-time history are unrecoverable, and finding §2.3 makes self-recording the primary intraday options source rather than a backup. Coupling is near-zero, so it does not slow the rest of Phase 0 | Deferring to Phase 1 — cleaner, but the clock runs the whole time |
 
 ---
 
@@ -402,6 +405,40 @@ Algorithm, per batch:
 
 **Abort guard.** A parser typo would silently mint garbage instruments at scale. The resolver aborts the job if a single business date would create more than **5,000** new instruments. Real F&O days mint a few hundred; the first day of a backfill is exempted via an explicit `bootstrap=True` flag.
 
+### 5.6 Raw market recorder
+
+Included in Phase 0 by explicit decision (D16), overruling the initial scoping. Rationale: every day the recorder does not run is a day of point-in-time intraday option history that can never be recovered — and finding §2.3 promotes self-recording from backup plan to primary source.
+
+**Governing principle: record raw, parse later.**
+
+The recorder's only responsibility is durable, lossless capture of exactly the bytes the broker sent. It does not parse, normalise, resolve instruments, or touch the database. If capture-time interpretation is wrong, the data is lost forever; if raw frames are archived, they can be re-parsed indefinitely as understanding improves.
+
+This gives the recorder near-zero coupling: it depends on no other Phase 0 component and can run standalone while the rest of Phase 0 is still under construction.
+
+**What it captures.** Upstox market-feed WebSocket frames for the configured option-chain universe — NIFTY, BANKNIFTY, SENSEX, plus a configurable list of stock underlyings — for the full trading session.
+
+**Storage layout:**
+
+```
+data/recordings/{source_key}/{YYYY-MM-DD}/{HH}.frames.gz     # raw frames, append-only
+data/recordings/{source_key}/{YYYY-MM-DD}/session.json       # manifest
+```
+
+Files are append-only and gzip-compressed, rotated hourly so a crash costs at most the current hour's buffer.
+
+**The session manifest is as important as the frames.** It records, as first-class events:
+
+- the exact subscription list requested, and what the broker acknowledged
+- every connect, disconnect, and reconnect with timestamps
+- **explicit gap records** for each disconnected interval
+- frame counts per hour and a terminal end-of-session summary
+
+Without explicit gap records, a WebSocket drop from 11:32 to 11:35 is indistinguishable from three minutes in which no trades occurred. A future backtest would read the silence as market data. This is the single most important correctness property of the recorder, and it is why the manifest is not optional metadata.
+
+**Failure posture.** The recorder favours capturing something over capturing perfectly: reconnect with backoff and keep going, never crash the session over a malformed frame, and record every anomaly to the manifest rather than to a log that nobody reads. A heartbeat file is touched every minute so an external check can detect a dead recorder the same day rather than a month later.
+
+**Explicitly deferred to Phase 1:** a `RecordedFrameSource` implementing the §5.1 `Source` protocol, which reads the archive off disk and flows recordings through the same six pipeline stages as every other source. Phase 0 captures; Phase 1 ingests.
+
 ---
 
 ## 6. Testing strategy
@@ -473,8 +510,11 @@ If a subagent cannot make the test pass without editing the test, that is treate
 | 7e | Parser: AMFI NAV | Sonnet (parallel) | 3, 4 |
 | 8 | Corporate actions ingestion + read-time adjustment | Sonnet | 6 |
 | 9 | Execute 10-year backfill + reconciliation | Opus drives | all |
+| **R** | **Raw market recorder (§5.6) + scheduling** | Sonnet | 0, credentials |
 
-Steps **2 and 3 are the critical path** and are single-authored, because contract consistency is where correctness comes from. Nothing parallelises until they exist. Step 7 is where delegation pays: five parsers, five briefs, one shared contract suite.
+**Step R runs on its own track.** It depends only on the repo scaffold and on broker credentials — not on the schema, the contracts, or any other step. It is scheduled **first among all delegated work** the moment credentials exist, because its value is a function of wall-clock days elapsed, not of engineering effort.
+
+Steps **2 and 3 are the critical path** for everything else and are single-authored, because contract consistency is where correctness comes from. Nothing else parallelises until they exist. Step 7 is where delegation pays: five parsers, five briefs, one shared contract suite.
 
 **Stack:** `uv` · Python 3.12 · Polars · Pydantic v2 · psycopg3 · httpx · Alembic · structlog · pytest · ruff · mypy (strict on the contracts module only).
 
@@ -490,6 +530,7 @@ Phase 0 is complete when all of the following pass. "It ran without errors" is n
 4. **Continuity.** No unexplained single-day price move beyond ±20% that is not matched by a corporate action. This is the check that actually catches split-adjustment bugs.
 5. **Idempotency proof.** Re-running a randomly selected 30-day window changes zero rows (verified by comparing a checksum of the affected chunks before and after).
 6. **Quarantine review.** Total quarantine rate below 0.01% of rows, and every distinct quarantine `reason` reviewed and either fixed or documented as expected.
+7. **Recorder liveness.** For every trading day since credentials landed, a session manifest exists, its declared subscription list matches the configured universe, and total gap duration is under 1% of session length. Days that fail this are visible as an explicit report, never as silent absence.
 
 ---
 
@@ -502,6 +543,7 @@ Phase 0 is complete when all of the following pass. "It ran without errors" is n
 | O1 | Does Dhan's expired-options endpoint sit behind the ₹499/mo Data API subscription? | Empirical: hit `/v2/charts/rollingoption` once credentials exist |
 | O2 | Given §2.1, what replaces Upstox expired-instruments in the Phase 1 backfill plan? | Re-plan at the start of Phase 1, informed by O1 |
 | O3 | How far back do NSE/BSE archives remain reliably downloadable? | Discovered during backfill; the ledger records exactly where coverage ends |
+| **O4** | **Where does the recorder run?** A sleeping MacBook loses whole trading days, which defeats the purpose | **Blocks the recorder's usefulness, not its construction.** Must be answered before step R is considered complete |
 
 ### 9.2 Risks
 
@@ -513,6 +555,8 @@ Phase 0 is complete when all of the following pass. "It ran without errors" is n
 | Parser typo mints garbage instruments at scale | Resolver abort guard (>5,000 new instruments/day) |
 | Schema churn once Phase 1 begins | `bars_intraday` and `users` created empty now; `user_id` multi-tenancy retained; source abstraction isolates broker bindings in `source_bindings` JSONB |
 | Solo bandwidth against MathWorks and Astro Acharya | Parallel parser delegation; each build-order step is independently mergeable and testable |
+| **Recorder silently dies and nobody notices for weeks** — the highest-cost failure in Phase 0, since the loss is unrecoverable | Per-minute heartbeat file; session manifest written even on failure; verification check 7 reports gaps explicitly; daily summary surfaces a dead recorder same-day |
+| **Recorder host sleeps or loses network**, losing whole trading days | Open question O4 — hosting must be decided before the recorder is useful |
 
 ---
 
@@ -522,4 +566,5 @@ The following should be reflected in `implementation-plan.md` when next revised:
 
 - **§3.1 / §12 Q3** — Upstox Expired Instruments APIs are confirmed **Upstox Plus (paid)**, not free. The three-layer free stack is now two layers.
 - **§3.1** — Dhan strike coverage is **ATM±10 for index options near expiry only; ATM±3 otherwise**, not ATM±10 for both index and stock options. The relative-strike reconstruction policy becomes mandatory for stock options.
-- **§10 Phase 0** — the self-recorders move to the start of Phase 1 rather than Phase 0, because Phase 0 was scoped (by decision D1) to EOD foundations only. Their priority is raised by finding §2.3.
+- **§10 Phase 0** — the option-chain recorder stays in Phase 0 as the parent plan requires (D16), but in a deliberately reduced form: **capture to disk only, no parsing and no database writes**. Parsing recorded frames into the database moves to Phase 1. The news/announcements recorder moves to Phase 1 in full.
+- **§3.1 / §7.3** — the parent plan's argument that recorders must start immediately is *strengthened* by finding §2.3, not weakened. With Upstox expired data paywalled and Dhan's window narrowed, self-recording is the primary intraday options source rather than a floor.

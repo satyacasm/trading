@@ -587,16 +587,16 @@ import polars as pl
 
 CANONICAL_BAR_SCHEMA: dict[str, pl.DataType] = {
     # identity (natural key)
-    "exchange": pl.String,
-    "segment": pl.String,
-    "symbol": pl.String,
-    "asset_class": pl.String,
-    "expiry": pl.Date,
+    "exchange": pl.String(),
+    "segment": pl.String(),
+    "symbol": pl.String(),
+    "asset_class": pl.String(),
+    "expiry": pl.Date(),
     "strike": pl.Decimal(18, 4),
-    "option_type": pl.String,
+    "option_type": pl.String(),
     # descriptive
-    "isin": pl.String,
-    "name": pl.String,
+    "isin": pl.String(),
+    "name": pl.String(),
     # time
     "ts": pl.Datetime("us", "UTC"),
     # prices
@@ -608,15 +608,15 @@ CANONICAL_BAR_SCHEMA: dict[str, pl.DataType] = {
     "settle_price": pl.Decimal(18, 4),
     "underlying_price": pl.Decimal(18, 4),
     # activity
-    "volume": pl.Int64,
+    "volume": pl.Int64(),
     "turnover": pl.Decimal(22, 4),
-    "trades": pl.Int32,
-    "open_interest": pl.Int64,
-    "oi_change": pl.Int64,
-    "delivery_qty": pl.Int64,
+    "trades": pl.Int32(),
+    "open_interest": pl.Int64(),
+    "oi_change": pl.Int64(),
+    "delivery_qty": pl.Int64(),
     "delivery_pct": pl.Decimal(7, 4),
     # instrument attributes carried by the row (finding F3)
-    "lot_size": pl.Int32,
+    "lot_size": pl.Int32(),
     "tick_size": pl.Decimal(12, 6),
 }
 
@@ -2027,10 +2027,10 @@ class AmfiNavParser:
         return pl.DataFrame(
             rows,
             schema={
-                "scheme_code": pl.String, "isin_growth": pl.String,
-                "isin_reinvest": pl.String, "scheme_name": pl.String,
-                "nav": pl.String, "nav_date": pl.String,
-                "scheme_type": pl.String, "amc_name": pl.String,
+                "scheme_code": pl.String(), "isin_growth": pl.String(),
+                "isin_reinvest": pl.String(), "scheme_name": pl.String(),
+                "nav": pl.String(), "nav_date": pl.String(),
+                "scheme_type": pl.String(), "amc_name": pl.String(),
             },
         )
 ```
@@ -3799,7 +3799,7 @@ def adjusted_bars(
             "ts": pl.Datetime("us", "UTC"), "open": pl.Decimal(18, 4),
             "high": pl.Decimal(18, 4), "low": pl.Decimal(18, 4),
             "close": pl.Decimal(18, 4), "prev_close": pl.Decimal(18, 4),
-            "volume": pl.Int64,
+            "volume": pl.Int64(),
         },
         orient="row",
     )

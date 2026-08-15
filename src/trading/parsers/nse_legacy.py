@@ -8,8 +8,19 @@ from trading.contracts import ParseError, RawPayload
 from trading.parsers.udiff import _extract_csv, _header_of
 
 LEGACY_COLUMNS: tuple[str, ...] = (
-    "SYMBOL", "SERIES", "OPEN", "HIGH", "LOW", "CLOSE", "LAST", "PREVCLOSE",
-    "TOTTRDQTY", "TOTTRDVAL", "TIMESTAMP", "TOTALTRADES", "ISIN",
+    "SYMBOL",
+    "SERIES",
+    "OPEN",
+    "HIGH",
+    "LOW",
+    "CLOSE",
+    "LAST",
+    "PREVCLOSE",
+    "TOTTRDQTY",
+    "TOTTRDVAL",
+    "TIMESTAMP",
+    "TOTALTRADES",
+    "ISIN",
 )
 
 

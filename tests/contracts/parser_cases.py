@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from trading.contracts import Parser
+from trading.parsers.amfi import AmfiNavParser
+from trading.parsers.amfi_history import AmfiNavHistoryParser
 from trading.parsers.nse_legacy import NseLegacyCmParser
 from trading.parsers.udiff import UdiffParser
 
@@ -80,6 +82,55 @@ PARSER_CASES.append(
             "CLOSE": "38.95",
             "TIMESTAMP": "14-MAR-2019",
             "ISIN": "INE144J01027",
+        },
+    )
+)
+
+PARSER_CASES.append(
+    ParserCase(
+        name="amfi",
+        parser=AmfiNavParser(),
+        fixture=FIXTURE_ROOT / "amfi" / "navall.txt",
+        source_key="amfi_nav",
+        # Set this to the exact data-row count your trimmed fixture produces.
+        exact_rows=40,
+        required_columns=("scheme_code", "nav", "nav_date", "amc_name", "scheme_type"),
+        golden_row_index=0,
+        # Real values from the live file. amc_name is asserted because it is
+        # *carried down* from a section header rather than read off the row —
+        # if the stateful scan is wrong, this is the field that shows it.
+        golden_row={
+            "scheme_code": "119551",
+            "isin_growth": "INF209KA12Z1",
+            "scheme_name": ("Aditya Birla Sun Life Banking & PSU Debt Fund  - DIRECT - IDCW"),
+            "nav": "107.2564",
+            "nav_date": "13-Aug-2026",
+            "amc_name": "Aditya Birla Sun Life Mutual Fund",
+        },
+    )
+)
+
+PARSER_CASES.append(
+    ParserCase(
+        name="amfi_history",
+        parser=AmfiNavHistoryParser(),
+        fixture=FIXTURE_ROOT / "amfi" / "navhistory.txt",
+        source_key="amfi_nav_history",
+        exact_rows=64,
+        required_columns=("scheme_code", "nav", "nav_date", "amc_name", "scheme_type"),
+        golden_row_index=0,
+        # Real values from the live 2019-03-14 historical report. scheme_name is
+        # asserted because it moves from 4th to 2nd position between the two AMFI
+        # formats — a parser that reuses the latest-format offsets puts the ISIN
+        # here, and this is the assertion that catches it.
+        golden_row={
+            "scheme_code": "120373",
+            "scheme_name": "SAHARA BANKING & FINANCIAL SERVICES FUND- GROWTH - Direct",
+            "isin_growth": "INF515L01AJ6",
+            "nav": "74.2258",
+            "nav_date": "14-Mar-2019",
+            "scheme_type": "Open Ended Schemes ( Growth )",
+            "amc_name": "Sahara Mutual Fund",
         },
     )
 )

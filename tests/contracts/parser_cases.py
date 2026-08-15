@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from trading.contracts import Parser
+from trading.parsers.nse_legacy import NseLegacyCmParser
 from trading.parsers.udiff import UdiffParser
 
 FIXTURE_ROOT = Path(__file__).parent.parent / "fixtures"
@@ -54,6 +55,31 @@ PARSER_CASES.append(
             "ClsPric": "19.45",
             "NewBrdLotQty": "3100",
             "UndrlygPric": "407.70",
+        },
+    )
+)
+
+PARSER_CASES.append(
+    ParserCase(
+        name="nse_legacy",
+        parser=NseLegacyCmParser(),
+        fixture=FIXTURE_ROOT / "nse_legacy" / "cm_legacy.zip",
+        source_key="nse_cm_legacy",
+        exact_rows=50,
+        required_columns=("SYMBOL", "SERIES", "CLOSE", "TIMESTAMP", "ISIN"),
+        golden_row_index=0,
+        # Real values from the live 2019-03-14 file. OPEN/HIGH/LOW/CLOSE are all
+        # asserted because a transposition among them is the classic legacy-parser
+        # bug and no other test in the suite would see it.
+        golden_row={
+            "SYMBOL": "20MICRONS",
+            "SERIES": "EQ",
+            "OPEN": "39.5",
+            "HIGH": "40",
+            "LOW": "38.5",
+            "CLOSE": "38.95",
+            "TIMESTAMP": "14-MAR-2019",
+            "ISIN": "INE144J01027",
         },
     )
 )

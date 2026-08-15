@@ -10,7 +10,19 @@ class ParserRegistry:
         self._parsers = parsers
 
     def select(self, payload: RawPayload) -> Parser:
-        matches = [p for p in self._parsers if p.can_parse(payload)]
+        matches: list[Parser] = []
+        for p in self._parsers:
+            try:
+                owns_payload = p.can_parse(payload)
+            except Exception:
+                # can_parse is contractually required never to raise (enforced
+                # by the parser conformance suite for every registered
+                # parser), but a defective parser must not be allowed to take
+                # dispatch down for every parser that follows it in the list.
+                # Treat a raising can_parse as "does not own this payload".
+                continue
+            if owns_payload:
+                matches.append(p)
         if not matches:
             raise ParseError(f"no parser accepts {payload.source_key} {payload.business_date}")
         if len(matches) > 1:

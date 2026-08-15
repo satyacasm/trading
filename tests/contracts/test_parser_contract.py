@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import zipfile
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -77,10 +79,53 @@ def test_parse_maps_columns_correctly_on_a_known_row(case: ParserCase) -> None:
         )
 
 
+def _make_stored_zip_bytes(content: bytes = b"a,b\n1,2\n", filename: str = "x.csv") -> bytearray:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr(filename, content)
+    return bytearray(buf.getvalue())
+
+
+def _encrypted_zip_bytes() -> bytes:
+    """A well-formed zip with the encryption bit set in both header copies.
+
+    zipfile.ZipFile.read() raises RuntimeError for this, not
+    zipfile.BadZipFile, so a parser whose except clause only names
+    BadZipFile lets it escape uncaught (finding F1 fix-round 1).
+    """
+    data = _make_stored_zip_bytes()
+    for magic, flag_offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        i = data.find(magic)
+        flags = int.from_bytes(data[i + flag_offset : i + flag_offset + 2], "little")
+        flags |= 0x1  # general-purpose bit 0: "file is encrypted"
+        data[i + flag_offset : i + flag_offset + 2] = flags.to_bytes(2, "little")
+    return bytes(data)
+
+
+def _unsupported_compression_zip_bytes() -> bytes:
+    """A well-formed zip whose compression method zipfile cannot decode.
+
+    zipfile.ZipFile.read() raises NotImplementedError for this, not
+    zipfile.BadZipFile, for the same reason as above.
+    """
+    data = _make_stored_zip_bytes()
+    for magic, method_offset in ((b"PK\x03\x04", 8), (b"PK\x01\x02", 10)):
+        i = data.find(magic)
+        data[i + method_offset : i + method_offset + 2] = (99).to_bytes(2, "little")
+    return bytes(data)
+
+
 @pytest.mark.parametrize(
     "garbage",
-    [b"\x00\xff\xfe\x01" * 64, b"col_a,col_b\n1,2\n", b"   \n\n  \n"],
-    ids=["binary", "foreign-csv", "whitespace"],
+    [
+        b"\x00\xff\xfe\x01" * 64,
+        b"col_a,col_b\n1,2\n",
+        b"   \n\n  \n",
+        b"PK\x03\x04" + b"\x00" * 64,  # zip magic, truncated
+        _encrypted_zip_bytes(),  # zip magic, encrypted flag set
+        _unsupported_compression_zip_bytes(),  # zip magic, compression method 99
+    ],
+    ids=["binary", "foreign-csv", "whitespace", "zip-truncated", "zip-encrypted", "zip-badmethod"],
 )
 def test_can_parse_never_raises_on_hostile_input(
     case: ParserCase, garbage: bytes, tmp_path: Path

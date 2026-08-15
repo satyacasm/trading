@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import struct
 import zipfile
 
 import polars as pl
@@ -57,7 +58,7 @@ def _extract_csv(content: bytes) -> bytes:
             if not names:
                 raise ParseError("zip contains no .csv member")
             return archive.read(names[0])
-    except zipfile.BadZipFile as exc:
+    except (zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError, struct.error) as exc:
         raise ParseError("payload is not a readable zip") from exc
 
 

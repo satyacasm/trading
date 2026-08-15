@@ -53,7 +53,11 @@ class ArchivingClient:
     ) -> tuple[bytes, Path, str] | None:
         """Return (body, archive_path, sha256), or None on a clean 404."""
         if prime is not None:
-            self._client.get(prime)  # populates cookies; failures are non-fatal
+            try:
+                self._client.get(prime)
+            except httpx.HTTPError:
+                log.debug("source.prime_failed", url=prime)  # cookies may be absent; the
+                # main request's own retry loop and error taxonomy handle what follows
 
         last: Exception | None = None
         for attempt in range(1, self._attempts + 1):

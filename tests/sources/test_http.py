@@ -78,3 +78,48 @@ def test_priming_request_is_made_before_the_real_one(tmp_path: Path) -> None:
     )
 
     assert seen == ["https://www.nseindia.com", "https://nsearchives.nseindia.com/x.zip"]
+
+
+def test_a_transport_level_priming_failure_does_not_abort_the_real_request(
+    tmp_path: Path,
+) -> None:
+    """A DNS blip or connection reset on the prime leg (nseindia.com is flaky) must not
+    escape as a bare httpx exception - it should be swallowed and the main request tried
+    anyway, per the taxonomy None/FetchError that the backfill's job ledger depends on.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://www.nseindia.com":
+            raise httpx.ConnectError("connection reset", request=request)
+        return httpx.Response(200, content=b"data")
+
+    client = ArchivingClient(root=tmp_path, transport=httpx.MockTransport(handler))
+    body, _, _ = client.get(
+        "https://nsearchives.nseindia.com/x.zip",
+        archive_name="x.zip",
+        prime="https://www.nseindia.com",
+    )
+
+    assert body == b"data"
+
+
+def test_transport_level_failure_on_both_legs_raises_fetch_error_not_a_bare_httpx_error(
+    tmp_path: Path,
+) -> None:
+    """The taxonomy only has None and FetchError; a raw httpx.HTTPError escaping would
+    crash a long backfill run instead of recording the job as FAILED and moving on.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection reset", request=request)
+
+    client = ArchivingClient(
+        root=tmp_path, transport=httpx.MockTransport(handler), backoff_seconds=0.0
+    )
+
+    with pytest.raises(FetchError):
+        client.get(
+            "https://nsearchives.nseindia.com/x.zip",
+            archive_name="x.zip",
+            prime="https://www.nseindia.com",
+        )

@@ -12,6 +12,23 @@ URL = (
     "{YYYY}/{MON}/cm{DD}{MON}{YYYY}bhav.csv.zip"
 )
 
+# strftime("%b") is locale-dependent; a non-English locale would silently
+# 404 every historical day rather than raise. Spell the mapping out instead.
+_MONTH_ABBR = {
+    1: "Jan",
+    2: "Feb",
+    3: "Mar",
+    4: "Apr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Aug",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
+    12: "Dec",
+}
+
 
 class NseLegacyCmSource:
     source_key = "nse_cm_legacy"
@@ -20,7 +37,7 @@ class NseLegacyCmSource:
         self._client = client or ArchivingClient(root=get_settings().raw_archive_root)
 
     def fetch(self, business_date: date) -> RawPayload | None:
-        mon = business_date.strftime("%b").upper()
+        mon = _MONTH_ABBR[business_date.month].upper()
         url = URL.format(
             YYYY=business_date.strftime("%Y"),
             MON=mon,

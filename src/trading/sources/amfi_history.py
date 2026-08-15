@@ -8,6 +8,23 @@ from trading.sources.http import ArchivingClient
 
 URL = "https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt={d}&todt={d}"
 
+# strftime("%b") is locale-dependent; a non-English locale would silently
+# 404 every historical day rather than raise. Spell the mapping out instead.
+_MONTH_ABBR = {
+    1: "Jan",
+    2: "Feb",
+    3: "Mar",
+    4: "Apr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Aug",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
+    12: "Dec",
+}
+
 
 class AmfiNavHistorySource:
     """Fetches AMFI's per-date historical NAV report.
@@ -31,7 +48,7 @@ class AmfiNavHistorySource:
         self._client = client or ArchivingClient(root=get_settings().raw_archive_root)
 
     def fetch(self, business_date: date) -> RawPayload | None:
-        d = business_date.strftime("%d-%b-%Y")
+        d = f"{business_date:%d}-{_MONTH_ABBR[business_date.month]}-{business_date:%Y}"
         url = URL.format(d=d)
         name = (
             f"{self.source_key}/{business_date:%Y}/{business_date:%m}/"

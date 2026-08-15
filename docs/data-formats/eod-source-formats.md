@@ -7,15 +7,16 @@ This document is the source of truth for parser implementations. If a parser dis
 
 ---
 
-## Summary: three parsers, not five
+## Summary: four parsers, not five
 
-The Phase 0 spec originally assumed five parser variants. Live inspection shows **three**:
+The Phase 0 spec originally assumed five parser variants. Live inspection shows **four** — three for prices, plus a second AMFI format discovered on 2026-08-15 (§4):
 
 | Parser | Covers | Why |
 |---|---|---|
 | `UdiffParser` | NSE CM · NSE FO · **BSE CM** | All three emit a byte-identical 34-column header |
 | `NseLegacyCmParser` | NSE CM before UDiFF (~pre-Jul 2024) | Completely different 13-column format |
-| `AmfiNavParser` | AMFI daily NAVs | Hierarchical semicolon-delimited text, not CSV |
+| `AmfiNavParser` | AMFI latest NAVs (`NAVAll.txt`) | Hierarchical semicolon-delimited text, not CSV |
+| `AmfiNavHistoryParser` | AMFI historical NAVs (§4) | Same shape, 8 fields in a different order |
 
 ---
 
@@ -193,6 +194,53 @@ Aditya Birla Sun Life Mutual Fund                   ← AMC name (no ';')
 - The file carries the **latest** NAV per scheme, so the business date is per-row, not per-file. Rows may legitimately carry different dates.
 
 Sample size on 2026-08-13: 17,779 lines.
+
+---
+
+## 4. AMFI historical NAV report
+
+**Verified 2026-08-15.** This endpoint was missed in the original reconnaissance, and its absence would have cost the backfill ten years of mutual-fund history.
+
+### Access
+
+```
+https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt={DD-Mon-YYYY}&todt={DD-Mon-YYYY}
+```
+
+Plain GET, no cookies, no user-agent games. Verified against 2019-03-14: HTTP 200, 1.2 MB, 10,339 data rows, every one carrying `14-Mar-2019`. Setting `frmdt == todt` returns exactly one day, which is what keeps one HTTP call aligned to one `ingest_jobs` row.
+
+### It is NOT the same format as `NAVAll.txt`
+
+This trips people up because both are semicolon-delimited AMFI NAV files with the same hierarchical structure. The schemas are different in three ways:
+
+| | Latest (`NAVAll.txt`) | Historical (`DownloadNAVHistoryReport_Po.aspx`) |
+|---|---|---|
+| Fields | **6** | **8** |
+| `Scheme Name` position | 4th | **2nd** |
+| Extra columns | — | `Repurchase Price`, `Sale Price` (usually empty) |
+| ISIN header text | `ISIN Div Payout/ ISIN Growth` (space after `/`) | `ISIN Div Payout/ISIN Growth` (**no space**) |
+
+```
+Scheme Code;Scheme Name;ISIN Div Payout/ISIN Growth;ISIN Div Reinvestment;Net Asset Value;Repurchase Price;Sale Price;Date
+```
+
+Sample data row (2019-03-14):
+```
+120373;SAHARA BANKING & FINANCIAL SERVICES FUND- GROWTH - Direct;INF515L01AJ6;;74.2258;;;14-Mar-2019
+```
+
+The differing header text makes the two formats **cleanly separable by `can_parse`**, which is exactly what the parser registry is designed for. They need two parsers, not one parser with a branch — and the conformance suite's mutual-exclusivity test will verify they never claim each other's payloads.
+
+### Same stateful-scan rules apply
+
+Blank lines, scheme-type headers and AMC name lines are interleaved exactly as in §3. The only differences are the field count (7 semicolons, not 5) and the column order. Empty `Repurchase Price` / `Sale Price` are normal, not corruption.
+
+### Consequence for source design
+
+`NAVAll.txt` is a **latest-snapshot** source: it ignores whatever date you ask for. Used for a historical backfill it would archive today's file under a past date and mark that date SUCCESS — corrupting the job ledger rather than the bars. So:
+
+- **`AmfiNavSource`** (latest) is the *forward* daily source and must refuse any date that is not today.
+- **`AmfiNavHistorySource`** (this endpoint) is the *backfill* source and is genuinely per-date.
 
 ---
 

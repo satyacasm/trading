@@ -1,19 +1,28 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 from trading.config import get_settings
 from trading.contracts import RawPayload
 from trading.sources.http import ArchivingClient
 
 URL = "https://portal.amfiindia.com/spages/NAVAll.txt"
+IST = ZoneInfo("Asia/Kolkata")
 
 
 class AmfiNavSource:
-    """Fetches AMFI's daily NAV file.
+    """Fetches AMFI's daily *latest-snapshot* NAV file.
 
-    The file carries the *latest* NAV per scheme rather than one date's worth
-    of history, so every call hits the same URL regardless of business_date.
+    This is the forward-only daily source: the file carries the latest NAV per
+    scheme rather than one date's worth of history, so it cannot answer for a
+    past business date. Every call hits the same URL, and there is no way to
+    tell from the response alone which date it belongs to — so `fetch` refuses
+    (returns None) for any business_date that is not "today" in IST, the
+    market's calendar day. Without this guard, a backfill run would archive
+    today's snapshot under a past date and mark that date's ingest job
+    SUCCESS, silently corrupting the job ledger that drives backfill
+    resumption. For historical dates, use `AmfiNavHistorySource` instead.
     """
 
     source_key = "amfi_nav"
@@ -22,6 +31,8 @@ class AmfiNavSource:
         self._client = client or ArchivingClient(root=get_settings().raw_archive_root)
 
     def fetch(self, business_date: date) -> RawPayload | None:
+        if business_date != datetime.now(IST).date():
+            return None
         name = (
             f"{self.source_key}/{business_date:%Y}/{business_date:%m}/"
             f"{business_date.isoformat()}.txt"

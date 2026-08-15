@@ -1976,7 +1976,7 @@ git commit -m "feat(parsers): NSE legacy CM bhavcopy parser"
 
 ---
 
-## Task 8: AMFI NAV parser
+## Task 8: AMFI NAV parsers (latest + historical)
 
 **Assignee:** Sonnet (parallel with Tasks 6, 7) · **Depends on:** Task 3, Task 5
 
@@ -2189,16 +2189,87 @@ PARSER_CASES.append(
 )
 ```
 
-- [ ] **Step 6: Run the full parser and contract suite**
+- [ ] **Step 6: Implement `src/trading/parsers/amfi_history.py`** (added by Ruling A1)
 
-Run: `uv run pytest tests/parsers tests/contracts -v`
-Expected: PASS. All three parsers now participate; mutual exclusivity is verified across 3×2 cross-pairs.
+AMFI publishes a **second, different** NAV format for historical dates — see `docs/data-formats/eod-source-formats.md` §4. It is not a variant to branch on inside `AmfiNavParser`; it is its own parser, because the two are cleanly separable by header and the registry exists exactly for that.
 
-- [ ] **Step 7: Commit**
+Differences from the latest-snapshot format:
+
+| | Latest (§3) | Historical (§4) |
+|---|---|---|
+| Fields | 6 (5 semicolons) | **8 (7 semicolons)** |
+| `Scheme Name` | 4th | **2nd** |
+| Extra columns | — | `Repurchase Price`, `Sale Price` (usually empty) |
+| ISIN header | `ISIN Div Payout/ ISIN Growth` | `ISIN Div Payout/ISIN Growth` (**no space**) |
+
+That single missing space is the `can_parse` discriminator. Reuse the same stateful line-scan logic (blank lines, scheme-type headers, AMC names interleaved), changing only the field count and column order. Emit the **same output columns** as `AmfiNavParser` so one normalizer serves both:
+`scheme_code, isin_growth, isin_reinvest, scheme_name, nav, nav_date, scheme_type, amc_name`
+
+Drop `Repurchase Price` and `Sale Price` — nothing downstream consumes them.
+
+- [ ] **Step 7: Create the history fixture and register it**
 
 ```bash
-git add -A
-git commit -m "feat(parsers): AMFI NAV stateful line scanner"
+mkdir -p tests/fixtures/amfi
+python - <<'PY'
+from pathlib import Path
+lines = Path("data/raw/_recon/amfi_navhistory_20190314.txt").read_text(errors="replace").splitlines()
+keep, amcs, data = [lines[0]], 0, 0
+for line in lines[1:]:
+    keep.append(line)
+    s = line.strip()
+    if s and ";" not in s and not s.startswith(("Open Ended", "Close Ended", "Interval")):
+        amcs += 1
+    if line.count(";") == 7:
+        data += 1
+    if amcs >= 3 and data >= 40:
+        break
+Path("tests/fixtures/amfi/navhistory.txt").write_text("\n".join(keep) + "\n")
+print(f"fixture: {len(keep)} lines, {amcs} AMCs, {data} data rows")
+PY
+```
+
+Append to `tests/contracts/parser_cases.py` (set `exact_rows` to the data-row count the script reports):
+
+```python
+from trading.parsers.amfi_history import AmfiNavHistoryParser
+
+PARSER_CASES.append(
+    ParserCase(
+        name="amfi_history",
+        parser=AmfiNavHistoryParser(),
+        fixture=FIXTURE_ROOT / "amfi" / "navhistory.txt",
+        source_key="amfi_nav_history",
+        exact_rows=40,
+        required_columns=("scheme_code", "nav", "nav_date", "amc_name", "scheme_type"),
+        golden_row_index=0,
+        # Real values from the live 2019-03-14 historical report. scheme_name is
+        # asserted because it moves from 4th to 2nd position between the two AMFI
+        # formats — a parser that reuses the latest-format offsets puts the ISIN
+        # here, and this is the assertion that catches it.
+        golden_row={
+            "scheme_code": "120373",
+            "scheme_name": "SAHARA BANKING & FINANCIAL SERVICES FUND- GROWTH - Direct",
+            "isin_growth": "INF515L01AJ6",
+            "nav": "74.2258",
+            "nav_date": "14-Mar-2019",
+            "scheme_type": "Open Ended Schemes ( Growth )",
+            "amc_name": "Sahara Mutual Fund",
+        },
+    )
+)
+```
+
+- [ ] **Step 8: Run the full parser and contract suite**
+
+Run: `uv run pytest tests/parsers tests/contracts -v`
+Expected: PASS. All four parsers now participate; mutual exclusivity is verified across 4×3 cross-pairs — including the two AMFI formats, which is the pair most likely to collide.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/trading/parsers tests/parsers tests/fixtures tests/contracts/parser_cases.py
+git commit -m "feat(parsers): AMFI latest and historical NAV scanners"
 ```
 
 ---

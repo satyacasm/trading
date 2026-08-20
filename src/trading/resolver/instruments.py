@@ -1,0 +1,171 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from datetime import date
+
+import structlog
+from psycopg import Connection
+
+from trading.contracts import AssetClass, InstrumentRef, ValidationAbort
+
+log = structlog.get_logger(__name__)
+
+
+def _asset_class_for(ref: InstrumentRef) -> str:
+    if ref.option_type is not None:
+        return AssetClass.OPTION.value
+    if ref.expiry is not None:
+        return AssetClass.FUTURE.value
+    if ref.segment == "MF":
+        return AssetClass.MF.value
+    return AssetClass.EQUITY.value
+
+
+class DbInstrumentResolver:
+    """Maps natural keys to instrument_ids, creating unseen instruments.
+
+    The only stage that both reads and writes instrument state: every
+    trading day can mint new option strikes, so unseen refs must be
+    created, but a batch that would mint an absurd number of them is
+    refused (`max_new_per_batch`) since that almost always means a parser
+    fault rather than a genuinely new universe of contracts.
+    """
+
+    def __init__(self, max_new_per_batch: int = 5000) -> None:
+        self._max_new = max_new_per_batch
+        self._cache: dict[str, int] = {}
+
+    def resolve(
+        self, refs: set[InstrumentRef], conn: Connection, *, bootstrap: bool = False
+    ) -> dict[InstrumentRef, int]:
+        by_key = {r.canonical_key: r for r in refs}
+        resolved = {k: self._cache[k] for k in by_key if k in self._cache}
+
+        unknown = [k for k in by_key if k not in resolved]
+        if unknown:
+            rows = conn.execute(
+                "SELECT canonical_key, instrument_id FROM instruments "
+                "WHERE canonical_key = ANY(%s)",
+                (unknown,),
+            ).fetchall()
+            for key, iid in rows:
+                resolved[key] = iid
+                self._cache[key] = iid
+
+        missing = [k for k in by_key if k not in resolved]
+        if missing:
+            if not bootstrap and len(missing) > self._max_new:
+                raise ValidationAbort(
+                    f"batch would create {len(missing)} new instruments "
+                    f"(limit {self._max_new}); suspected parser fault"
+                )
+            resolved.update(self._create(missing, by_key, conn))
+
+            # Ruling I3: a row can be silently dropped by `_create`'s
+            # ON CONFLICT DO NOTHING (e.g. it collides with an existing row
+            # on the *natural* key rather than the canonical one). Surface
+            # that as a clear abort instead of letting the dict lookup
+            # below die with an opaque KeyError.
+            unresolved = [k for k in missing if k not in resolved]
+            if unresolved:
+                raise ValidationAbort(
+                    f"failed to resolve {len(unresolved)} instrument key(s) after "
+                    f"creation, likely colliding with an existing row on the "
+                    f"natural key under a different canonical_key: {unresolved}"
+                )
+
+        return {by_key[k]: resolved[k] for k in by_key}
+
+    def _create(
+        self, keys: list[str], by_key: dict[str, InstrumentRef], conn: Connection
+    ) -> dict[str, int]:
+        payload = []
+        for k in keys:
+            ref = by_key[k]
+            payload.append(
+                (
+                    _asset_class_for(ref),
+                    ref.exchange,
+                    ref.segment,
+                    ref.symbol,
+                    ref.expiry,
+                    ref.strike,
+                    ref.option_type.value if ref.option_type is not None else None,
+                    "INR",
+                    "ACTIVE",
+                    k,
+                )
+            )
+        with conn.cursor() as cur:
+            # No conflict target: a row can legitimately collide on either
+            # uq_instrument_canonical (already resolved by someone else) or
+            # uq_instrument_natural (Ruling I3 above handles that case by
+            # checking, after this returns, that every key actually
+            # resolved). Naming just `canonical_key` here would instead let
+            # a natural-key collision raise a raw UniqueViolation.
+            cur.executemany(
+                "INSERT INTO instruments (asset_class, exchange, segment, symbol, expiry,"
+                " strike, option_type, currency, status, canonical_key)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                " ON CONFLICT DO NOTHING",
+                payload,
+            )
+        rows = conn.execute(
+            "SELECT canonical_key, instrument_id FROM instruments WHERE canonical_key = ANY(%s)",
+            (keys,),
+        ).fetchall()
+        created: dict[str, int] = dict(rows)
+        self._cache.update(created)
+        log.info("instruments.created", count=len(created))
+        return created
+
+    def record_lot_sizes(self, conn: Connection, lot_rows: list[tuple[int, date, int]]) -> int:
+        """Append a lot-history row only when the lot size actually changed.
+
+        Set-based rather than one round trip per instrument (Ruling I1):
+        NSE F&O alone carries ~35,000 contracts a day, so a per-instrument
+        SELECT+INSERT would be tens of millions of round trips across a
+        multi-year backfill.
+
+        The comparison is against the lot size in effect ON each row's own
+        `effective_from` date, not the latest row ever recorded for that
+        instrument (Ruling I2) — the latter is only correct while days are
+        loaded in strict chronological order, and a retried out-of-order
+        day would otherwise write a spurious "change" row and corrupt the
+        history that F&O notional value depends on.
+        """
+        if not lot_rows:
+            return 0
+
+        by_date: dict[date, list[tuple[int, int]]] = defaultdict(list)
+        for instrument_id, effective_from, lot_size in lot_rows:
+            by_date[effective_from].append((instrument_id, lot_size))
+
+        to_insert: list[tuple[int, date, int]] = []
+        for effective_from, rows in by_date.items():
+            instrument_ids = [instrument_id for instrument_id, _ in rows]
+            current: dict[int, int] = dict(
+                conn.execute(
+                    "SELECT DISTINCT ON (instrument_id) instrument_id, lot_size "
+                    "FROM instrument_lot_history "
+                    "WHERE instrument_id = ANY(%s) AND effective_from <= %s "
+                    "ORDER BY instrument_id, effective_from DESC",
+                    (instrument_ids, effective_from),
+                ).fetchall()
+            )
+            for instrument_id, lot_size in rows:
+                if current.get(instrument_id) == lot_size:
+                    continue
+                to_insert.append((instrument_id, effective_from, lot_size))
+
+        if not to_insert:
+            return 0
+
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO instrument_lot_history (instrument_id, effective_from,"
+                " lot_size, source) VALUES (%s,%s,%s,'udiff')"
+                " ON CONFLICT (instrument_id, effective_from) DO NOTHING",
+                to_insert,
+            )
+        return len(to_insert)

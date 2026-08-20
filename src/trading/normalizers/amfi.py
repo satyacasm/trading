@@ -43,9 +43,17 @@ class AmfiNormalizer:
             expiry=pl.lit(None, dtype=pl.Date),
             strike=pl.lit(None, dtype=pl.Decimal(18, 4)),
             option_type=pl.lit(None, dtype=pl.String),
-            # Growth-plan ISIN is populated far more often than the reinvestment
-            # one (12 vs 30 nulls in the committed historical fixture); fall back
-            # to isin_reinvest only when isin_growth is absent.
+            # Ruling N5 (task-10-fix-1.md, binding): a row can carry TWO distinct,
+            # both-populated, real ISINs — one for the growth/payout plan, one for
+            # the reinvestment plan (the normal shape for IDCW schemes, not an edge
+            # case; see scheme_code 119551 in tests/fixtures/amfi/navall.txt). This
+            # coalesce keeps isin_growth and IRRECOVERABLY DROPS isin_reinvest when
+            # both are present. That is deliberate, not an oversight: the canonical
+            # schema has exactly one isin slot per row, scheme_code is the real
+            # natural key for an AMFI row, and isin is not read by any downstream
+            # consumer today (not persisted by the loader, not part of
+            # InstrumentRef.canonical_key). Do not "fix" this by widening the
+            # schema without a consumer that needs the second ISIN.
             isin=pl.coalesce(pl.col("isin_growth"), pl.col("isin_reinvest")),
             name=pl.col("scheme_name"),
             # Ruling N3: ts is built PER ROW from that row's own nav_date, never

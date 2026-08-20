@@ -101,6 +101,29 @@ def test_na_nav_yields_null_close_not_zero_or_dropped():
     assert out["open"][0] is None
 
 
+def test_isin_coalesce_drops_reinvest_isin_when_both_present():
+    """Ruling N5 (task-10-fix-1.md, binding): pin the deliberate ISIN drop.
+
+    Scheme code 119551 in the committed fixture carries TWO distinct, both-
+    populated, real ISINs (isin_growth=INF209KA12Z1, isin_reinvest=INF209KA13Z9)
+    -- the normal shape for an IDCW scheme, not an edge case. The parser layer
+    must expose both; the normalizer must keep only isin_growth and drop
+    isin_reinvest with no trace. If this ever silently changes -- e.g. the
+    coalesce order flips, or a future edit tries to "recover" the second ISIN
+    -- this test must fail.
+    """
+    payload = make_payload(FIXTURES / "navall.txt", "amfi_nav", date(2026, 8, 13))
+    parsed = AmfiNavParser().parse(payload)
+    raw_row = parsed.filter(pl.col("scheme_code") == "119551").row(0, named=True)
+    assert raw_row["isin_growth"] == "INF209KA12Z1"
+    assert raw_row["isin_reinvest"] == "INF209KA13Z9"
+    assert raw_row["isin_growth"] != raw_row["isin_reinvest"]  # both real, both distinct
+
+    normalized = AmfiNormalizer().normalize(parsed, payload).frame
+    row = normalized.filter(pl.col("symbol") == "119551").row(0, named=True)
+    assert row["isin"] == "INF209KA12Z1"  # isin_reinvest (INF209KA13Z9) is dropped
+
+
 def test_unrecognised_source_key_raises_with_key_in_message():
     payload = make_payload(FIXTURES / "navall.txt", "not_a_real_source", date(2026, 8, 13))
     frame = AmfiNavParser().parse(payload)

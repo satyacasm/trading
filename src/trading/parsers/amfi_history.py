@@ -61,8 +61,8 @@ class AmfiNavHistoryParser:
             rows.append(
                 {
                     "scheme_code": code,
-                    "isin_growth": None if isin_g == "-" else isin_g,
-                    "isin_reinvest": None if isin_r == "-" else isin_r,
+                    "isin_growth": None if isin_g in ("-", "") else isin_g,
+                    "isin_reinvest": None if isin_r in ("-", "") else isin_r,
                     "scheme_name": name,
                     "nav": nav,
                     "nav_date": nav_date,

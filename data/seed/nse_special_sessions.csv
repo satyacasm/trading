@@ -15,6 +15,18 @@
 # Probe run: 2026-08-20. 14 special sessions found (7 weekday, 7 weekend), 0
 # fetch errors, 0 ambiguous/error-biased entries.
 #
+# This file is verified-only by design (task-9-fix-1.md, Ruling H5 point 3):
+# no future/unproven date is added here speculatively, even when the
+# Diwali-window pattern in nse_holidays.csv's header makes a future special
+# session likely. A likely-but-unverified date stays a `holiday` (or is
+# removed to seed as an ordinary trading day, per Ruling H5) until the
+# archive actually proves it has data.
+#
+# MAINTENANCE: re-probe upcoming dates with `scripts/probe_trading_days.py`
+# once they are in the past, and add any newly-verified special session here
+# (removing it from nse_holidays.csv if it was previously listed there as an
+# `unverified` holiday).
+#
 # Sorted by date, no duplicates.
 2016-10-30,weekend special session (data present via legacy)
 2017-10-19,special session (data present via legacy)

@@ -34,6 +34,12 @@ SEED_ROOT = Path(__file__).resolve().parents[3] / "data" / "seed"
 HOLIDAYS_CSV = SEED_ROOT / "nse_holidays.csv"
 SPECIAL_SESSIONS_CSV = SEED_ROOT / "nse_special_sessions.csv"
 
+# Date the Task 9 addendum verification probe (and its Ruling H5 follow-up,
+# task-9-fix-1.md) ran. Every holiday row dated after this in the CSVs above
+# was not checked against the live archive and must be marked `unverified`;
+# see tests/calendar/test_seed_csvs.py, which pins that invariant.
+PROBE_DATE = date(2026, 8, 20)
+
 
 def _load_dates(path: Path) -> set[date]:
     """Parse a `YYYY-MM-DD,description` CSV, skipping `#`-prefixed provenance lines."""

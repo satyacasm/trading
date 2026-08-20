@@ -25,6 +25,26 @@
 # nse_special_sessions.csv) + 6 future-dated candidates (2026-08-20 or later)
 # that could not be probed, carried below marked `unverified`.
 #
+# Fix round 1 (task-9-fix-1.md, Ruling H5, controller-binding): two of those
+# six future-dated candidates, 2026-10-20 and 2026-11-10, fell in the
+# Diwali/Muhurat window (15 Oct - 20 Nov) and were REMOVED from this file so
+# they seed as ordinary trading days. Every single probed year 2016-2025 has
+# exactly one Diwali-window date that both calendar libraries called a
+# holiday but the live archive proved was a trading day (2016-10-30,
+# 2017-10-19, 2018-11-07, 2019-10-27, 2020-11-14, 2021-11-04, 2022-10-24,
+# 2023-11-12, 2024-11-01, 2025-10-21 — ten for ten); library agreement on the
+# holiday designation is exactly the condition that held in all ten of those
+# years, so per Ruling H4's asymmetry (a wrongly-closed day is a silent hole,
+# a wrongly-open day costs one 404) both are biased toward trading rather
+# than guessed at individually. The other four unverified future dates
+# (2026-09-14, 2026-10-02, 2026-11-24, 2026-12-25) are fixed-date national
+# holidays outside the Muhurat window with no history of a special session,
+# so they are kept as holidays.
+#
+# MAINTENANCE: re-probe every `unverified` row below with
+# `scripts/probe_trading_days.py` once its date is in the past, and correct
+# this file (and nse_special_sessions.csv) against the result.
+#
 # Sorted by date, no duplicates.
 2016-01-26,holiday (verified: no data from udiff or legacy)
 2016-03-07,holiday (verified: no data from udiff or legacy)
@@ -178,7 +198,5 @@
 2026-06-26,holiday (verified: no data from udiff or legacy)
 2026-09-14,unverified (future-dated, from calendar-library union; not probed)
 2026-10-02,unverified (future-dated, from calendar-library union; not probed)
-2026-10-20,unverified (future-dated, from calendar-library union; not probed)
-2026-11-10,unverified (future-dated, from calendar-library union; not probed)
 2026-11-24,unverified (future-dated, from calendar-library union; not probed)
 2026-12-25,unverified (future-dated, from calendar-library union; not probed)

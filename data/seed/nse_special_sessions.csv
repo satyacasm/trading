@@ -1,0 +1,32 @@
+# NSE trading-calendar special-session seed — Task 9 (phase-0-data-foundations)
+#
+# Provenance: same probe run as nse_holidays.csv (see that file's header for
+# library versions and verification method). This file holds two kinds of
+# date NSE published a bhavcopy for despite not being an ordinary weekday
+# trading day:
+#   - Muhurat/Diwali-type sessions: a weekday that both calendar libraries
+#     list as a holiday, but the live archive has data for.
+#   - weekend special sessions: a Saturday or Sunday in the Oct/Nov Muhurat
+#     window or the Jan/Feb budget-session window that the live archive has
+#     data for. All Sat/Sun in those windows for 2016-2026 were probed
+#     (285 dates, past only); ordinary weekends with no data are not listed
+#     here (is_trading_day() already defaults a weekend to non-trading).
+#
+# Probe run: 2026-08-20. 14 special sessions found (7 weekday, 7 weekend), 0
+# fetch errors, 0 ambiguous/error-biased entries.
+#
+# Sorted by date, no duplicates.
+2016-10-30,weekend special session (data present via legacy)
+2017-10-19,special session (data present via legacy)
+2018-11-07,special session (data present via legacy)
+2019-10-27,weekend special session (data present via legacy)
+2020-02-01,weekend special session (data present via legacy)
+2020-07-31,special session (data present via legacy)
+2020-11-14,weekend special session (data present via legacy)
+2021-11-04,special session (data present via legacy)
+2022-10-24,special session (data present via legacy)
+2023-11-12,weekend special session (data present via legacy)
+2024-01-20,weekend special session (data present via udiff)
+2024-11-01,special session (data present via udiff)
+2025-02-01,weekend special session (data present via udiff)
+2025-10-21,special session (data present via udiff)

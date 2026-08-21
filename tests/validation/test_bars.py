@@ -93,3 +93,54 @@ def test_equity_row_with_null_close_stays_close_missing() -> None:
     outcome = _validate(_frame(asset_class="EQUITY", close=None))
     assert outcome.valid.height == 0
     assert outcome.quarantined[0].reason == "close_missing"
+
+
+def test_null_volume_row_with_high_below_low_is_quarantined() -> None:
+    """Ruling V4 — a null volume must not bypass the OHLC-consistency check."""
+    outcome = _validate(_frame(volume=None, high=Decimal("90"), low=Decimal("95")))
+    assert outcome.valid.height == 0
+    assert outcome.quarantined[0].reason == "ohlc_inconsistent"
+
+
+def test_mf_shaped_row_with_null_volume_passes() -> None:
+    """Ruling V4 — AMFI rows carry null volume with open=high=low=close=NAV."""
+    outcome = _validate(
+        _frame(
+            asset_class="MF",
+            open=Decimal("19.45"),
+            high=Decimal("19.45"),
+            low=Decimal("19.45"),
+            close=Decimal("19.45"),
+            volume=None,
+        )
+    )
+    assert outcome.valid.height == 1
+    assert outcome.quarantined == []
+
+
+def test_null_open_is_quarantined_as_ohlc_missing() -> None:
+    """Ruling L1a — bars_daily declares open/high/low NOT NULL, same as close."""
+    outcome = _validate(_frame(open=None))
+    assert outcome.valid.height == 0
+    assert outcome.quarantined[0].reason == "ohlc_missing"
+
+
+def test_fully_populated_row_still_passes_ohlc_missing_check() -> None:
+    """Ruling L1a — the new gate must not false-positive on a complete row."""
+    outcome = _validate(_frame())
+    assert outcome.valid.height == 1
+    assert outcome.quarantined == []
+
+
+def test_option_type_without_strike_is_quarantined() -> None:
+    """Ruling L1b — instruments CHECK requires strike whenever option_type is set."""
+    outcome = _validate(_frame(option_type="CE"))
+    assert outcome.valid.height == 0
+    assert outcome.quarantined[0].reason == "option_fields_incomplete"
+
+
+def test_strike_without_option_type_passes() -> None:
+    """Ruling L1b — this combination classifies as FUTURE/EQUITY and is not a violation."""
+    outcome = _validate(_frame(strike=Decimal("24500")))
+    assert outcome.valid.height == 1
+    assert outcome.quarantined == []

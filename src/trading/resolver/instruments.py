@@ -79,6 +79,21 @@ class DbInstrumentResolver:
     def _create(
         self, keys: list[str], by_key: dict[str, InstrumentRef], conn: Connection
     ) -> dict[str, int]:
+        # Ruling I4: InstrumentRef itself allows option_type set with
+        # strike=None (it is shared contract surface we must not tighten
+        # here), but `instruments.ck_option_fields` forbids that
+        # combination. Catching it before the insert keeps a single
+        # malformed ref from surfacing a raw CheckViolation and aborting
+        # the whole executemany batch's transaction.
+        malformed = [
+            k for k in keys if by_key[k].option_type is not None and by_key[k].strike is None
+        ]
+        if malformed:
+            raise ValidationAbort(
+                f"{len(malformed)} instrument ref(s) have option_type set without a "
+                f"strike, which violates ck_option_fields: {malformed}"
+            )
+
         payload = []
         for k in keys:
             ref = by_key[k]

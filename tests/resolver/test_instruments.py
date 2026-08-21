@@ -158,3 +158,25 @@ def test_natural_key_collision_raises_validation_abort_not_keyerror(db_conn):
         )
     with pytest.raises(ValidationAbort, match="failed to resolve"):
         DbInstrumentResolver().resolve({ref}, db_conn)
+
+
+# --- Task 11 fix round 1, Ruling I4: option_type without strike must not
+# reach the DB as a raw CheckViolation ---
+
+
+def test_option_type_without_strike_raises_validation_abort_not_checkviolation(db_conn):
+    """`InstrumentRef` itself permits option_type set with strike=None (it's
+    shared contract surface the resolver must not tighten), but the DB's
+    ck_option_fields CHECK forbids that combination. The resolver must catch
+    it before inserting and raise ValidationAbort, not let a raw
+    psycopg.errors.CheckViolation escape and abort the whole batch."""
+    ref = InstrumentRef(
+        exchange="NSE",
+        segment="FO",
+        symbol="NIFTY",
+        expiry=date(2026, 8, 27),
+        option_type=OptionType.CE,
+        # strike deliberately omitted (None)
+    )
+    with pytest.raises(ValidationAbort, match="option_type"):
+        DbInstrumentResolver().resolve({ref}, db_conn)

@@ -58,6 +58,13 @@ class BarLoader:
         self._resolver = resolver
         self._source = source
 
+    @property
+    def source(self) -> DataSource:
+        """Ruling P3x (task-14 addendum): lets the pipeline verify, before
+        loading, that the normalizer's `batch.source` agrees with what this
+        loader was configured to stamp every row with."""
+        return self._source
+
     def load(self, outcome: ValidationOutcome, conn: Connection) -> LoadResult:
         frame = outcome.valid
         if frame.height == 0:

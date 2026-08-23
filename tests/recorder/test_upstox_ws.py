@@ -10,13 +10,12 @@ graceful `until` exit are exercised deterministically and instantly.
 from __future__ import annotations
 
 import asyncio
-import gzip
 import json
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from trading.recorder.session import RecordingSession
+from trading.recorder.session import RecordingSession, read_frames
 from trading.recorder.upstox_ws import Frame, run_recording_loop
 
 
@@ -122,8 +121,7 @@ def test_frames_are_captured_and_the_loop_exits_cleanly_at_until(tmp_path: Path)
     assert feed.closed is True
 
     frame_file = next((tmp_path / "upstox_chain" / "2026-08-13").glob("*.frames.gz"))
-    with gzip.open(frame_file, "rb") as handle:
-        assert handle.read() == b"f1\n"
+    assert list(read_frames(frame_file)) == [b"f1"]
 
 
 def test_disconnect_triggers_backoff_then_a_recorded_reconnect(tmp_path: Path) -> None:
@@ -231,8 +229,5 @@ def test_a_frame_the_handler_cannot_interpret_is_kept_raw_and_flagged(tmp_path: 
     assert manifest["anomalies"][0]["at"]
 
     frame_file = next((tmp_path / "upstox_chain" / "2026-08-13").glob("*.frames.gz"))
-    with gzip.open(frame_file, "rb") as handle:
-        body = handle.read()
-    assert b"good-1" in body
-    assert b"good-2" in body
-    assert b"12345" in body  # repr() of the malformed frame, preserved verbatim
+    recovered = list(read_frames(frame_file))
+    assert recovered == [b"good-1", b"12345", b"good-2"]  # repr() of the malformed frame

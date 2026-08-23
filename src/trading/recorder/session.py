@@ -1,4 +1,4 @@
-"""Durable recording session: gzip frame capture plus a truthful manifest.
+"""Durable recording session: length-prefixed frame capture plus a truthful manifest.
 
 Governing principle (spec 5.6): record raw, parse later. This module never
 interprets a frame — it only stores bytes and records *when things happened*
@@ -8,6 +8,15 @@ stream can always be told apart from three minutes of genuine silence.
 The manifest is flushed to disk on every mutation, atomically (write to a
 temp file in the session directory, then `os.replace`), so a process killed
 mid-write never leaves a truncated or empty `session.json` (ruling R3x).
+
+Framing (ruling R4x): each frame is stored as a 4-byte big-endian unsigned
+length prefix followed by exactly that many bytes, with no delimiter and no
+escaping. A newline-delimited format silently corrupts any frame that
+happens to contain a `b"\n"` byte -- and Upstox V3 frames are binary
+protobuf, where `0x0A` (the tag byte for field 1, wire type 2) is about as
+common as bytes get. `format_version` in the manifest records which framing
+a given session used, so a reader years from now does not have to guess.
+`iter_frames` below is the canonical, and only, way to read this format back.
 """
 
 from __future__ import annotations
@@ -17,14 +26,60 @@ import gzip
 import json
 import os
 import tempfile
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import TracebackType
+from typing import Protocol
+
+FORMAT_VERSION = 1
+
+_LENGTH_PREFIX_BYTES = 4
+_MAX_FRAME_LENGTH = 2**32 - 1
+
+
+class _ReadableBinary(Protocol):
+    """The one method `iter_frames` needs. `gzip.GzipFile` satisfies this
+    structurally without being a nominal `typing.IO[bytes]`."""
+
+    def read(self, size: int = ..., /) -> bytes: ...
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def iter_frames(handle: _ReadableBinary) -> Iterator[bytes]:
+    """Read back frames written by `RecordingSession.write_frame`.
+
+    The format (ruling R4x) is: a 4-byte big-endian unsigned length prefix,
+    followed by exactly that many bytes, repeated until EOF. No delimiter,
+    no escaping -- "read 4 bytes, read that many bytes" can never
+    misinterpret a frame boundary, unlike a newline-delimited format where a
+    frame containing `b"\n"` is silently torn in two.
+
+    Raises `ValueError` if the stream ends mid-frame (a truncated length
+    prefix or a payload shorter than its declared length), since that means
+    the file itself was cut short, not that there are no more frames.
+    """
+    while True:
+        header = handle.read(_LENGTH_PREFIX_BYTES)
+        if not header:
+            return
+        if len(header) < _LENGTH_PREFIX_BYTES:
+            raise ValueError(f"truncated frame length prefix: got {len(header)} of 4 bytes")
+        length = int.from_bytes(header, "big")
+        payload = handle.read(length)
+        if len(payload) < length:
+            raise ValueError(f"truncated frame payload: got {len(payload)} of {length} bytes")
+        yield payload
+
+
+def read_frames(path: Path) -> Iterator[bytes]:
+    """Convenience wrapper: `iter_frames` over a gzip-compressed frame file."""
+    with gzip.open(path, "rb") as handle:
+        yield from iter_frames(handle)
 
 
 @dataclass
@@ -53,6 +108,7 @@ class SessionManifest:
     source_key: str
     session_date: str
     started_at: str
+    format_version: int = FORMAT_VERSION
     ended_at: str | None = None
     frame_count: int = 0
     subscriptions: dict[str, list[str]] = field(default_factory=dict)
@@ -112,10 +168,16 @@ class RecordingSession:
         "record raw, parse later". Callers (including the malformed-frame
         path in `upstox_ws.py`) are expected to call this unconditionally,
         even for frames they could not otherwise interpret.
+
+        Written as a 4-byte big-endian length prefix followed by the bytes
+        themselves (ruling R4x) — read back with `iter_frames`/`read_frames`,
+        never by scanning for a delimiter.
         """
+        if len(frame) > _MAX_FRAME_LENGTH:
+            raise ValueError(f"frame of {len(frame)} bytes exceeds the 4-byte length prefix")
         handle = self._rotate_if_needed()
+        handle.write(len(frame).to_bytes(_LENGTH_PREFIX_BYTES, "big"))
         handle.write(frame)
-        handle.write(b"\n")
         self._manifest.frame_count += 1
         if self._manifest.frame_count % 500 == 0:
             handle.flush()

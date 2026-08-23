@@ -3,7 +3,7 @@ import json
 from datetime import date
 from pathlib import Path
 
-from trading.recorder.session import RecordingSession
+from trading.recorder.session import FORMAT_VERSION, RecordingSession, read_frames
 
 
 def _session(tmp_path: Path) -> RecordingSession:
@@ -125,3 +125,57 @@ def test_manifest_flush_is_atomic_no_temp_files_left_behind(tmp_path: Path) -> N
     leftovers = list(session_dir.glob(".session.json.*.tmp"))
     assert leftovers == []
     assert (session_dir / "session.json").exists()
+
+
+def test_a_frame_containing_the_old_delimiter_byte_round_trips_exactly(tmp_path: Path) -> None:
+    """Ruling R4x: a newline-delimited format tears this frame in two. The
+    length-prefixed format must not."""
+    session = _session(tmp_path)
+    session.open()
+    tricky = b"\x01\x02\n\x03\x04"
+    session.write_frame(tricky)
+    session.write_frame(b"\x05\x06\x07")
+    session.close()
+
+    files = sorted((tmp_path / "upstox_chain" / "2026-08-13").glob("*.frames.gz"))
+    recovered = list(read_frames(files[0]))
+    assert recovered == [tricky, b"\x05\x06\x07"]
+
+
+def test_a_frame_that_looks_like_a_length_prefix_round_trips_exactly(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    session.open()
+    # Four bytes that would decode as a large big-endian length if a reader
+    # mistook frame contents for another length prefix.
+    look_alike = b"\x00\x00\x00\x2a" + b"payload"
+    session.write_frame(look_alike)
+    session.close()
+
+    files = sorted((tmp_path / "upstox_chain" / "2026-08-13").glob("*.frames.gz"))
+    recovered = list(read_frames(files[0]))
+    assert recovered == [look_alike]
+
+
+def test_a_zero_length_frame_round_trips(tmp_path: Path) -> None:
+    """A socket can legitimately hand back an empty message."""
+    session = _session(tmp_path)
+    session.open()
+    session.write_frame(b"")
+    session.write_frame(b"not-empty")
+    session.close()
+
+    files = sorted((tmp_path / "upstox_chain" / "2026-08-13").glob("*.frames.gz"))
+    recovered = list(read_frames(files[0]))
+    assert recovered == [b"", b"not-empty"]
+
+    manifest = json.loads((tmp_path / "upstox_chain" / "2026-08-13" / "session.json").read_text())
+    assert manifest["frame_count"] == 2
+
+
+def test_format_version_is_recorded_in_the_manifest(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    session.open()
+    session.close()
+
+    manifest = json.loads((tmp_path / "upstox_chain" / "2026-08-13" / "session.json").read_text())
+    assert manifest["format_version"] == FORMAT_VERSION == 1

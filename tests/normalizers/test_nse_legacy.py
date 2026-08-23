@@ -83,3 +83,59 @@ def test_series_is_carried_through_from_the_series_column():
     assert by_symbol["A2ZINFRA"] == "BE"
     assert by_symbol["AAKASH"] == "SM"
     assert frame["series"].null_count() == 0
+
+
+# ---------------------------------------------------------------------------
+# NSE served 2020-07-13's bhavcopy with a TWO-DIGIT year in TIMESTAMP
+# ("13-Jul-20") inside a file named cm13JUL2020bhav.csv, while every other day
+# uses "13-JUL-2020". polars' "%d-%b-%Y" parses "20" as the year 20 AD without
+# complaint even under strict=True, so that day silently landed 2,001 rows at
+# 0020-07-13 in the live warehouse -- found by min(ts) reading year 0020.
+# ---------------------------------------------------------------------------
+
+_LEGACY_HEADER = (
+    "SYMBOL,SERIES,OPEN,HIGH,LOW,CLOSE,LAST,PREVCLOSE,TOTTRDQTY,TOTTRDVAL,"
+    "TIMESTAMP,TOTALTRADES,ISIN"
+)
+
+
+def _legacy_zip(tmp_path: Path, timestamp: str, name: str = "cm13JUL2020bhav.csv") -> Path:
+    """A one-row legacy bhavcopy whose TIMESTAMP spelling is under test."""
+    import zipfile
+
+    row = (
+        f"20MICRONS,EQ,32.85,33.85,31.85,33.45,33.85,32.3,187303,6187285.7,"
+        f"{timestamp},1382,INE144J01027"
+    )
+    dest = tmp_path / "legacy.zip"
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(name, f"{_LEGACY_HEADER}\n{row}\n")
+    return dest
+
+
+def _normalize_zip(archive: Path, business_date: date):
+    payload = make_payload(archive, "nse_cm_legacy", business_date)
+    return NseLegacyNormalizer().normalize(NseLegacyCmParser().parse(payload), payload)
+
+
+def test_a_two_digit_year_resolves_to_the_full_year(tmp_path: Path):
+    batch = _normalize_zip(_legacy_zip(tmp_path, "13-Jul-20"), date(2020, 7, 13))
+    assert batch.frame["ts"].dt.date().to_list() == [date(2020, 7, 13)]
+
+
+def test_a_four_digit_year_still_parses(tmp_path: Path):
+    batch = _normalize_zip(_legacy_zip(tmp_path, "13-JUL-2020"), date(2020, 7, 13))
+    assert batch.frame["ts"].dt.date().to_list() == [date(2020, 7, 13)]
+
+
+def test_a_row_date_disagreeing_with_the_business_date_is_refused(tmp_path: Path):
+    """The guard that would have caught the year-0020 corruption at ingest.
+    One legacy bhavcopy covers exactly one session, so a row dated anything
+    else means the date was misread or the wrong file was served."""
+    with pytest.raises(ValueError, match="0020-07-13"):
+        _normalize_zip(_legacy_zip(tmp_path, "13-Jul-0020"), date(2020, 7, 13))
+
+
+def test_an_unparseable_timestamp_is_refused(tmp_path: Path):
+    with pytest.raises(ValueError):
+        _normalize_zip(_legacy_zip(tmp_path, "not-a-date"), date(2020, 7, 13))

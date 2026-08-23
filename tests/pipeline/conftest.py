@@ -44,35 +44,57 @@ def _payload(source_key: str, content: bytes, business_date: date = BUSINESS_DAT
 
 class _StubSource:
     """A `Source` that returns a fixed payload (or None) instead of hitting
-    the network -- the no-network-in-tests constraint is absolute."""
+    the network -- the no-network-in-tests constraint is absolute.
+
+    Counts `fetch` calls so tests can prove a genuinely-complete day is
+    never refetched (task-14 fix-round-1, Ruling P4x)."""
 
     def __init__(self, source_key: str, payload: RawPayload | None) -> None:
         self.source_key = source_key
         self._payload = payload
+        self.fetch_calls = 0
 
     def fetch(self, business_date: date) -> RawPayload | None:
+        self.fetch_calls += 1
         return self._payload
 
 
-def _udiff_pipeline_for(payload: RawPayload | None, source_key: str = "nse_cm_udiff") -> Pipeline:
+def _udiff_pipeline_and_source_for(
+    payload: RawPayload | None, source_key: str = "nse_cm_udiff"
+) -> tuple[Pipeline, _StubSource]:
     """Wires the real UDiFF stages -- parser, normalizer, resolver,
-    validator, loader -- against a stub source returning `payload`."""
+    validator, loader -- against a stub source returning `payload`, and
+    also hands back that stub so a test can inspect it (e.g. fetch_calls)
+    without reaching into Pipeline's private `_source`."""
     resolver = DbInstrumentResolver()
     loader = BarLoader(resolver, DataSource.NSE_CM_UDIFF)
-    return Pipeline(
-        source=_StubSource(source_key, payload),
+    source = _StubSource(source_key, payload)
+    pipeline = Pipeline(
+        source=source,
         registry=ParserRegistry([UdiffParser()]),
         normalizer=UdiffNormalizer(),
         resolver=resolver,
         validator=BarValidator(),
         loader=loader,
     )
+    return pipeline, source
+
+
+def _udiff_pipeline_for(payload: RawPayload | None, source_key: str = "nse_cm_udiff") -> Pipeline:
+    pipeline, _ = _udiff_pipeline_and_source_for(payload, source_key)
+    return pipeline
 
 
 @pytest.fixture
 def udiff_pipeline() -> Pipeline:
     content = (FIXTURES / "nse_cm_udiff.zip").read_bytes()
     return _udiff_pipeline_for(_payload("nse_cm_udiff", content))
+
+
+@pytest.fixture
+def udiff_pipeline_with_source() -> tuple[Pipeline, _StubSource]:
+    content = (FIXTURES / "nse_cm_udiff.zip").read_bytes()
+    return _udiff_pipeline_and_source_for(_payload("nse_cm_udiff", content))
 
 
 @pytest.fixture

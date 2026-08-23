@@ -19,7 +19,7 @@ from trading.contracts import (
     Validator,
 )
 from trading.parsers.registry import ParserRegistry
-from trading.pipeline.ledger import claim_job, complete_job
+from trading.pipeline.ledger import JobHeld, claim_job, complete_job
 from trading.resolver.instruments import DbInstrumentResolver
 
 log = structlog.get_logger(__name__)
@@ -77,7 +77,17 @@ class Pipeline:
 
     def run(self, conn: Connection, business_date: date) -> JobStatus:
         key = self._source.source_key
-        job_id = claim_job(conn, key, business_date)
+
+        # Ruling P4x: JobHeld must be caught here, before the day's stage
+        # work even starts, and must NOT fall into the catch-all below --
+        # this process does not own that job's ledger row, so it must
+        # touch nothing and simply report that someone else is on it.
+        try:
+            job_id = claim_job(conn, key, business_date)
+        except JobHeld:
+            log.info("pipeline.job_held", source=key, date=business_date)
+            return JobStatus.RUNNING
+
         if job_id is None:
             log.info("pipeline.skipped_already_done", source=key, date=business_date)
             return JobStatus.SUCCESS

@@ -7,6 +7,9 @@ CANONICAL_BAR_SCHEMA: dict[str, pl.DataType] = {
     "exchange": pl.String(),
     "segment": pl.String(),
     "symbol": pl.String(),
+    # Ruling S1 (task-18-brief.md): the CM series (EQ, BE, N2, GB, ...).
+    # None where the source carries no meaningful series (F&O, AMFI).
+    "series": pl.String(),
     "asset_class": pl.String(),
     "expiry": pl.Date(),
     "strike": pl.Decimal(18, 4),

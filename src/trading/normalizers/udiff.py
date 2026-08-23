@@ -65,6 +65,14 @@ class UdiffNormalizer:
             exchange=pl.col("Src"),
             segment=pl.col("Sgmt"),
             symbol=pl.col("TckrSymb"),
+            # Ruling S1 (task-18-brief.md): SctySrs carries the CM series
+            # (EQ, BE, N2, GB, ...) and is empty for FO rows (verified in
+            # docs/data-formats/eod-source-formats.md and against the FO
+            # fixture), so this single expression correctly yields a real
+            # series for CM and None for FO without segment-conditional
+            # logic. The same symbol can legitimately appear more than once
+            # a day under different CM series -- each is a distinct security.
+            series=_blank_to_null("SctySrs"),
             # Ruling N1: replace_strict with no default -> raises on an unmapped
             # FinInstrmTp instead of silently mislabelling it EQUITY.
             asset_class=pl.col("FinInstrmTp").replace_strict(ASSET_CLASS_BY_TYPE),

@@ -84,6 +84,105 @@ def test_equity_natural_key_is_actually_unique(db_conn):
         )
 
 
+# --- Task 18, Ruling S1: series joins uq_instrument_natural ---
+
+
+def test_instruments_has_a_series_column(db_conn):
+    row = db_conn.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name='instruments' AND column_name='series'"
+    ).fetchone()
+    assert row is not None
+
+
+def test_same_symbol_different_series_does_not_collide(db_conn):
+    """The DHFL case at the constraint level: EQ and N2 under the same
+    symbol must be allowed to coexist -- proves adding `series` to
+    uq_instrument_natural actually loosens the constraint as intended,
+    not just that InstrumentRef/the resolver happen to agree not to try."""
+    db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, series, currency,"
+        " status, canonical_key) VALUES "
+        "('EQUITY','NSE','CM','DHFL','EQ','INR','ACTIVE','NSE:CM:DHFL:EQ')"
+    )
+    db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, series, currency,"
+        " status, canonical_key) VALUES "
+        "('EQUITY','NSE','CM','DHFL','N2','INR','ACTIVE','NSE:CM:DHFL:N2')"
+    )  # must not raise
+    count = db_conn.execute("SELECT count(*) FROM instruments WHERE symbol='DHFL'").fetchone()[0]
+    assert count == 2
+
+
+def test_same_symbol_same_series_still_collides(db_conn):
+    """The constraint must still catch a genuine duplicate once series is
+    part of it -- adding a column must not accidentally widen every group
+    to be distinct."""
+    from psycopg.errors import UniqueViolation
+
+    db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, series, currency,"
+        " status, canonical_key) VALUES "
+        "('EQUITY','NSE','CM','SERIESDUP','EQ','INR','ACTIVE','NSE:CM:SERIESDUP:EQ')"
+    )
+    with pytest.raises(UniqueViolation):
+        db_conn.execute(
+            "INSERT INTO instruments (asset_class, exchange, segment, symbol, series, currency,"
+            " status, canonical_key) VALUES "
+            "('EQUITY','NSE','CM','SERIESDUP','EQ','INR','ACTIVE','other-key')"
+        )
+
+
+def test_same_symbol_null_series_still_collides(db_conn):
+    """NULLS NOT DISTINCT must still apply to the new column: two rows with
+    no series at all (F&O/AMFI-shaped) must collide exactly like before
+    series existed."""
+    from psycopg.errors import UniqueViolation
+
+    db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, status,"
+        " canonical_key) VALUES "
+        "('EQUITY','NSE','FO','NULLSERIESDUP','INR','ACTIVE','NSE:FO:NULLSERIESDUP')"
+    )
+    with pytest.raises(UniqueViolation):
+        db_conn.execute(
+            "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, status,"
+            " canonical_key) VALUES "
+            "('EQUITY','NSE','FO','NULLSERIESDUP','INR','ACTIVE','other-key')"
+        )
+
+
+def test_null_series_and_a_real_series_do_not_collide(db_conn):
+    """A row with no series recorded and a row explicitly series='EQ' for
+    the same symbol are different natural identities -- NULLS NOT DISTINCT
+    only equates NULL with NULL, never with a real value."""
+    db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, status,"
+        " canonical_key) VALUES "
+        "('EQUITY','NSE','CM','MIXEDSERIES','INR','ACTIVE','NSE:CM:MIXEDSERIES')"
+    )
+    db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, series, currency,"
+        " status, canonical_key) VALUES "
+        "('EQUITY','NSE','CM','MIXEDSERIES','EQ','INR','ACTIVE','NSE:CM:MIXEDSERIES:EQ')"
+    )  # must not raise
+    count = db_conn.execute(
+        "SELECT count(*) FROM instruments WHERE symbol='MIXEDSERIES'"
+    ).fetchone()[0]
+    assert count == 2
+
+
+# --- Task 18, Ruling S2: bars_daily gains underlying_price ---
+
+
+def test_bars_daily_has_an_underlying_price_column(db_conn):
+    row = db_conn.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name='bars_daily' AND column_name='underlying_price'"
+    ).fetchone()
+    assert row is not None
+
+
 def test_data_sources_match_the_python_enum(db_conn):
     from trading.contracts import DataSource
 

@@ -144,3 +144,43 @@ def test_strike_without_option_type_passes() -> None:
     outcome = _validate(_frame(strike=Decimal("24500")))
     assert outcome.valid.height == 1
     assert outcome.quarantined == []
+
+
+# --- Ruling S1 (task-18-brief.md): series joins the duplicate-key check ---
+
+
+def test_same_symbol_different_series_is_not_a_duplicate() -> None:
+    """The DHFL case: same SYMBOL, different SERIES, distinct securities.
+
+    Before series joined `_KEY`, this was indistinguishable from a same-day
+    restatement and the second row was quarantined as duplicate_key --
+    measured at ~4% of a real legacy day (task-18-brief.md, Ruling S1).
+    """
+    frame = pl.concat(
+        [
+            _frame(series="EQ"),
+            _frame(series="N2", open=Decimal("101"), high=Decimal("109"), close=Decimal("103")),
+            _frame(series="N4", open=Decimal("102"), high=Decimal("108"), close=Decimal("104")),
+        ]
+    )
+    outcome = _validate(frame)
+    assert outcome.valid.height == 3
+    assert outcome.quarantined == []
+
+
+def test_same_symbol_same_series_is_still_a_duplicate() -> None:
+    """Series joining the key must not defeat the original duplicate check."""
+    frame = pl.concat([_frame(series="EQ"), _frame(series="EQ", close=Decimal("106"))])
+    outcome = _validate(frame)
+    assert outcome.valid.height == 1
+    assert outcome.quarantined[0].reason == "duplicate_key"
+
+
+def test_same_symbol_null_series_twice_is_still_a_duplicate() -> None:
+    """NULLS NOT DISTINCT-shaped: two rows with no series at all must still
+    collide, matching pre-Ruling-S1 behaviour for sources with no series
+    concept (F&O, AMFI)."""
+    frame = pl.concat([_frame(), _frame(close=Decimal("106"))])
+    outcome = _validate(frame)
+    assert outcome.valid.height == 1
+    assert outcome.quarantined[0].reason == "duplicate_key"

@@ -58,9 +58,9 @@ log = structlog.get_logger(__name__)
 DEFAULT_DELAY = 1.0
 
 
-def _pipeline_nse_cm_udiff() -> Pipeline:
+def _pipeline_nse_cm_udiff() -> tuple[Pipeline, DbInstrumentResolver]:
     resolver = DbInstrumentResolver()
-    return Pipeline(
+    pipeline = Pipeline(
         source=NseUdiffSource(segment="cm"),
         registry=ParserRegistry([UdiffParser()]),
         normalizer=UdiffNormalizer(),
@@ -68,20 +68,22 @@ def _pipeline_nse_cm_udiff() -> Pipeline:
         validator=BarValidator(),
         loader=BarLoader(resolver, DataSource.NSE_CM_UDIFF),
     )
+    return pipeline, resolver
 
 
-def _pipeline_nse_fo_udiff() -> Pipeline:
-    # `DbInstrumentResolver`'s default `max_new_per_batch=5000` guards against
-    # a parser fault minting an absurd number of instruments (ruling I-series,
-    # src/trading/resolver/instruments.py). Verified live (task-17-report.md):
+def _pipeline_nse_fo_udiff() -> tuple[Pipeline, DbInstrumentResolver]:
+    # Ruling S3 (task-18-brief.md): `max_new_per_batch` stays at its 5,000
+    # default here -- it is a real guard against a parser fault minting an
+    # absurd number of instruments on any of the ~2,500 days this pipeline
+    # will run over, not just the first. Verified live (task-17-report.md):
     # the very first F&O day ever loaded creates ~35,750 new instruments --
-    # the entire live NSE F&O contract universe, all genuinely new on day one
-    # -- which trips that guard on every single day (the savepoint rolls back
-    # on failure, so zero progress is ever retained and every subsequent day
-    # hits the identical wall). A higher cap here is scoped to this one
-    # pipeline; CM/legacy/AMFI keep the tighter default.
-    resolver = DbInstrumentResolver(max_new_per_batch=50_000)
-    return Pipeline(
+    # the entire live NSE F&O contract universe, all genuinely new on day
+    # one -- which the default guard correctly refuses to bulk-create; the
+    # `--bootstrap` CLI flag (main(), below) bypasses the guard for exactly
+    # that first day via `resolver.bootstrap_next_call()`, not by permanently
+    # raising the limit for every day after it.
+    resolver = DbInstrumentResolver()
+    pipeline = Pipeline(
         source=NseUdiffSource(segment="fo"),
         registry=ParserRegistry([UdiffParser()]),
         normalizer=UdiffNormalizer(),
@@ -89,16 +91,16 @@ def _pipeline_nse_fo_udiff() -> Pipeline:
         validator=BarValidator(),
         loader=BarLoader(resolver, DataSource.NSE_FO_UDIFF),
     )
+    return pipeline, resolver
 
 
-def _pipeline_bse_cm_udiff() -> Pipeline:
-    # Verified live (task-17-report.md): the first BSE CM day created exactly
-    # 5,000 new instruments -- the default max_new_per_batch cap, hit right
-    # at its boundary. A slightly larger universe on a different first day
-    # would trip the same guard the FO pipeline above hit outright, so this
-    # gets the same defensive headroom.
-    resolver = DbInstrumentResolver(max_new_per_batch=10_000)
-    return Pipeline(
+def _pipeline_bse_cm_udiff() -> tuple[Pipeline, DbInstrumentResolver]:
+    # Ruling S3: same reasoning as `_pipeline_nse_fo_udiff` above -- the
+    # first BSE CM day created exactly 5,000 new instruments (right at the
+    # default boundary; task-17-report.md), so it also needs `--bootstrap`
+    # on its first invocation rather than a permanently raised cap.
+    resolver = DbInstrumentResolver()
+    pipeline = Pipeline(
         source=BseUdiffSource(),
         registry=ParserRegistry([UdiffParser()]),
         normalizer=UdiffNormalizer(),
@@ -106,11 +108,12 @@ def _pipeline_bse_cm_udiff() -> Pipeline:
         validator=BarValidator(),
         loader=BarLoader(resolver, DataSource.BSE_CM_UDIFF),
     )
+    return pipeline, resolver
 
 
-def _pipeline_nse_cm_legacy() -> Pipeline:
+def _pipeline_nse_cm_legacy() -> tuple[Pipeline, DbInstrumentResolver]:
     resolver = DbInstrumentResolver()
-    return Pipeline(
+    pipeline = Pipeline(
         source=NseLegacyCmSource(),
         registry=ParserRegistry([NseLegacyCmParser()]),
         normalizer=NseLegacyNormalizer(),
@@ -118,11 +121,12 @@ def _pipeline_nse_cm_legacy() -> Pipeline:
         validator=BarValidator(),
         loader=BarLoader(resolver, DataSource.NSE_CM_LEGACY),
     )
+    return pipeline, resolver
 
 
-def _pipeline_amfi_nav_history() -> Pipeline:
+def _pipeline_amfi_nav_history() -> tuple[Pipeline, DbInstrumentResolver]:
     resolver = DbInstrumentResolver()
-    return Pipeline(
+    pipeline = Pipeline(
         source=AmfiNavHistorySource(),
         registry=ParserRegistry([AmfiNavHistoryParser()]),
         normalizer=AmfiNormalizer(),
@@ -130,11 +134,12 @@ def _pipeline_amfi_nav_history() -> Pipeline:
         validator=BarValidator(),
         loader=BarLoader(resolver, DataSource.AMFI_NAV),
     )
+    return pipeline, resolver
 
 
-def _pipeline_amfi_nav() -> Pipeline:
+def _pipeline_amfi_nav() -> tuple[Pipeline, DbInstrumentResolver]:
     resolver = DbInstrumentResolver()
-    return Pipeline(
+    pipeline = Pipeline(
         source=AmfiNavSource(),
         registry=ParserRegistry([AmfiNavParser()]),
         normalizer=AmfiNormalizer(),
@@ -142,6 +147,7 @@ def _pipeline_amfi_nav() -> Pipeline:
         validator=BarValidator(),
         loader=BarLoader(resolver, DataSource.AMFI_NAV),
     )
+    return pipeline, resolver
 
 
 @dataclass(frozen=True)
@@ -156,7 +162,7 @@ class SourceSpec:
     assumption, not a verified AMFI-specific calendar (see task-17-report.md).
     """
 
-    build: Callable[[], Pipeline]
+    build: Callable[[], tuple[Pipeline, DbInstrumentResolver]]
     exchange: str
     segment: str
 
@@ -187,13 +193,27 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Print the days that would be fetched and exit without any network call.",
     )
+    parser.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help=(
+            "Bypass the instrument-creation abort guard (DbInstrumentResolver."
+            "max_new_per_batch) for this run's FIRST day only (Ruling S3, "
+            "task-18-brief.md). A source's real first day can legitimately mint "
+            "tens of thousands of new instruments (e.g. the entire live NSE F&O "
+            "universe); every subsequent day keeps the default 5,000-instrument "
+            "guard, which is exactly what should catch a parser fault. Pass this "
+            "on a source's first-ever invocation only -- never on a resumed or "
+            "re-run of a later range, where an absurd batch is a real bug."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     spec = SOURCE_SPECS[args.source]
-    pipeline = spec.build()
+    pipeline, resolver = spec.build()
     # `Pipeline.source_key` is a read-only @property; `_PipelineLike` (a
     # pipeline-local Protocol in trading.pipeline.backfill, out of this
     # task's scope to widen) declares it as a plain settable attribute, so
@@ -221,6 +241,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"[{args.start.isoformat()} .. {args.end.isoformat()}], delay={args.delay}s",
             flush=True,
         )
+
+        # Ruling S3: arm the resolver's abort-guard bypass for exactly the
+        # first day this process runs (not "day 1 of the source's full
+        # history" -- a resumed run's first pending day may be day 300).
+        # `bootstrap_next_call` disarms itself after the one `resolve()`
+        # call inside that day's `loader.load()`, so every later day in
+        # this same loop keeps the real guard.
+        if args.bootstrap and days:
+            resolver.bootstrap_next_call()
 
         counts: Counter[JobStatus] = Counter()
         for index, day in enumerate(days, start=1):

@@ -52,6 +52,11 @@ class NseLegacyNormalizer:
             exchange=pl.lit("NSE"),
             segment=pl.lit("CM"),
             symbol=pl.col("SYMBOL"),
+            # Ruling S1 (task-18-brief.md): the same SYMBOL can legitimately
+            # appear more than once a day under different SERIES values
+            # (e.g. DHFL EQ vs. several DHFL NCD series) -- each is a
+            # distinct security, not a duplicate.
+            series=_blank_to_null("SERIES"),
             asset_class=pl.lit(AssetClass.EQUITY.value),
             expiry=pl.lit(None, dtype=pl.Date),
             strike=pl.lit(None, dtype=pl.Decimal(18, 4)),

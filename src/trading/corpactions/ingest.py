@@ -228,6 +228,14 @@ def parse_nse_corporate_actions(
     same `DbInstrumentResolver` production ingestion uses, as `NSE`/`CM`
     equities (this endpoint's `series` is always `EQ` in the verified
     sample).
+
+    Ruling S1 (task-18-brief.md): `InstrumentRef` now carries `series`, and
+    the real `NSE`/`CM` equity instrument this endpoint's rows must land on
+    is created with `series="EQ"` (Ruling S1's normalizer requirement). An
+    `InstrumentRef` built here without `series="EQ"` would carry a different
+    `canonical_key` than that real instrument and resolve to a phantom
+    duplicate instead of colliding onto it -- so `series="EQ"` is pinned
+    here to match, not left to default to `None`.
     """
     records: list[dict[str, object]] = json.loads(payload)
 
@@ -244,7 +252,9 @@ def parse_nse_corporate_actions(
             log.debug("corpactions.skipped_subject", subject=subject, symbol=record.get("symbol"))
             continue
         classified.append((record, action_type, ratio_from, ratio_to, amount))
-        refs.add(InstrumentRef(exchange="NSE", segment="CM", symbol=str(record["symbol"])))
+        refs.add(
+            InstrumentRef(exchange="NSE", segment="CM", symbol=str(record["symbol"]), series="EQ")
+        )
 
     if not classified:
         return ParseResult(rows=[], skipped=skipped)
@@ -253,7 +263,7 @@ def parse_nse_corporate_actions(
 
     rows: list[CorporateActionRow] = []
     for record, action_type, ratio_from, ratio_to, amount in classified:
-        ref = InstrumentRef(exchange="NSE", segment="CM", symbol=str(record["symbol"]))
+        ref = InstrumentRef(exchange="NSE", segment="CM", symbol=str(record["symbol"]), series="EQ")
         ex_date = _parse_nse_date(str(record.get("exDate")) if record.get("exDate") else None)
         if ex_date is None:
             skipped += 1

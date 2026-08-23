@@ -34,10 +34,31 @@ class DbInstrumentResolver:
     def __init__(self, max_new_per_batch: int = 5000) -> None:
         self._max_new = max_new_per_batch
         self._cache: dict[str, int] = {}
+        self._bootstrap_next_call = False
+
+    def bootstrap_next_call(self) -> None:
+        """Arm `bootstrap=True` for exactly the next `resolve()` call.
+
+        Ruling S3 (task-18-brief.md): `scripts/backfill.py`'s `--bootstrap`
+        flag must apply to a run's FIRST day only -- `max_new_per_batch`
+        stays a real guard for every subsequent day, where an absurd batch
+        means a parser fault, not a genuine first-day universe. `Pipeline`
+        and `Loader` are out of this task's scope to widen with a `bootstrap`
+        parameter of their own (`Pipeline.run` calls `loader.load(outcome,
+        conn)` with no such argument, and `BarLoader.load` calls
+        `self._resolver.resolve(refs, conn)` the same way), so this one-shot
+        flag lets the caller that already constructs the resolver (`scripts/
+        backfill.py`) arm exactly one `resolve()` call -- the one inside the
+        first day's `loader.load()` -- without touching either of those.
+        """
+        self._bootstrap_next_call = True
 
     def resolve(
         self, refs: set[InstrumentRef], conn: Connection, *, bootstrap: bool = False
     ) -> dict[InstrumentRef, int]:
+        if self._bootstrap_next_call:
+            bootstrap = True
+            self._bootstrap_next_call = False
         by_key = {r.canonical_key: r for r in refs}
         resolved = {k: self._cache[k] for k in by_key if k in self._cache}
 
@@ -103,6 +124,7 @@ class DbInstrumentResolver:
                     ref.exchange,
                     ref.segment,
                     ref.symbol,
+                    ref.series,
                     ref.expiry,
                     ref.strike,
                     ref.option_type.value if ref.option_type is not None else None,
@@ -119,9 +141,9 @@ class DbInstrumentResolver:
             # resolved). Naming just `canonical_key` here would instead let
             # a natural-key collision raise a raw UniqueViolation.
             cur.executemany(
-                "INSERT INTO instruments (asset_class, exchange, segment, symbol, expiry,"
-                " strike, option_type, currency, status, canonical_key)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                "INSERT INTO instruments (asset_class, exchange, segment, symbol, series,"
+                " expiry, strike, option_type, currency, status, canonical_key)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
                 " ON CONFLICT DO NOTHING",
                 payload,
             )

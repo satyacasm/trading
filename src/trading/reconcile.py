@@ -348,39 +348,15 @@ KNOWN_VALUES: tuple[KnownValue, ...] = (
 # ---------------------------------------------------------------------------
 
 
-def _bars_daily_has_column(conn: Connection, column: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM information_schema.columns WHERE table_name='bars_daily' AND column_name=%s",
-        (column,),
-    ).fetchone()
-    return row is not None
-
-
 def check_cross_source_agreement(
     conn: Connection, start: date, end: date, tolerance: Decimal = Decimal("0.05")
 ) -> CheckResult:
-    # Discovered running this check for real (see task-17-report.md): the
-    # UDiFF normalizer computes `underlying_price` into every canonical F&O
-    # row (CANONICAL_BAR_SCHEMA carries it), but `bars_daily` has no such
-    # column and `BarLoader.STAGING_COLUMNS` never writes it -- the value is
-    # silently dropped between normalize and load. Ruling B5's substitution
-    # is unimplementable against the persisted schema until a migration adds
-    # the column and the loader is updated to populate it; both are outside
-    # this task's scope (only scripts/, reconcile.py, tests, docs). Report
-    # that loudly rather than crash on UndefinedColumn or query nothing.
-    if not _bars_daily_has_column(conn, "underlying_price"):
-        return CheckResult(
-            "cross_source_agreement",
-            CheckStatus.NOT_APPLICABLE,
-            "bars_daily has no underlying_price column: UdiffNormalizer computes it into every "
-            "F&O canonical row, but BarLoader.STAGING_COLUMNS (src/trading/loaders/bars.py) never "
-            "writes it and the bars_daily migration never declared it, so the value is silently "
-            "dropped before storage. Ruling B5's cross-source substitution cannot run until a "
-            "schema migration adds the column and the loader populates it -- this is a real gap "
-            "found while building this check, out of Task 17's scope to fix. See "
-            "task-17-report.md.",
-        )
-
+    # Task 17 found `bars_daily` had no `underlying_price` column at all, so
+    # this check could only report NOT_APPLICABLE (see task-17-report.md
+    # finding F3). Task 18, Ruling S2 fixed the gap: a migration
+    # (migrations/versions/0002_instrument_series_and_underlying_price.py)
+    # adds the column and `BarLoader` (src/trading/loaders/bars.py) now
+    # writes it, so the comparison below runs against real data.
     lower, upper = _range_bounds(start, end)
     rows = conn.execute(
         """

@@ -53,6 +53,7 @@ def _bar_row(
     exchange: str = "NSE",
     segment: str = "CM",
     symbol: str = "RECONTEST",
+    series: str | None = None,
     asset_class: str = "EQUITY",
     ts: datetime,
     close: str,
@@ -66,6 +67,7 @@ def _bar_row(
         exchange=exchange,
         segment=segment,
         symbol=symbol,
+        series=series,
         asset_class=asset_class,
         expiry=expiry,
         ts=ts,
@@ -320,32 +322,12 @@ def test_known_values_rejects_an_unsupported_field(db_conn):
 # ---------------------------------------------------------------------------
 
 
-def test_cross_source_agreement_not_applicable_without_the_column(db_conn):
-    """Real finding (see check_cross_source_agreement's comment,
-    task-17-report.md): bars_daily has no underlying_price column today, so
-    against the actual schema this check must say so loudly, not crash or
-    silently report nothing."""
-    result = check_cross_source_agreement(db_conn, date(2026, 8, 13), date(2026, 8, 13))
-    assert result.status == CheckStatus.NOT_APPLICABLE
-    assert "underlying_price column" in result.detail
-
-
-def _add_underlying_price_column(conn) -> None:
-    """Simulates the schema migration this check needs but is out of scope
-    to write (only scripts/, reconcile.py, tests, docs) -- proves the
-    check's actual comparison logic once that column exists. Rolled back
-    with everything else `db_conn` does at teardown."""
-    conn.execute("ALTER TABLE bars_daily ADD COLUMN IF NOT EXISTS underlying_price NUMERIC(18,4)")
-
-
 def test_cross_source_agreement_not_applicable_with_no_data(db_conn):
-    _add_underlying_price_column(db_conn)
     result = check_cross_source_agreement(db_conn, date(2026, 8, 13), date(2026, 8, 13))
     assert result.status == CheckStatus.NOT_APPLICABLE
 
 
 def test_cross_source_agreement_passes_within_tolerance(db_conn):
-    _add_underlying_price_column(db_conn)
     ts = datetime(2026, 8, 13, 10, 0, tzinfo=UTC)
     _load(db_conn, [_bar_row(exchange="NSE", segment="CM", symbol="XSRC", ts=ts, close="100.00")])
     _load(
@@ -376,7 +358,6 @@ def test_cross_source_agreement_passes_within_tolerance(db_conn):
 
 
 def test_cross_source_agreement_fails_beyond_tolerance(db_conn):
-    _add_underlying_price_column(db_conn)
     ts = datetime(2026, 8, 13, 10, 0, tzinfo=UTC)
     _load(
         db_conn, [_bar_row(exchange="NSE", segment="CM", symbol="XSRCBAD", ts=ts, close="100.00")]
@@ -561,9 +542,23 @@ def test_idempotency_fails_when_db_had_drifted_from_the_archive(db_conn):
     # via the real loader (so ck_ohlc_order/ck_close_positive stay satisfied
     # -- open=high=low=close all equal, exactly like `_bar_row`), so it no
     # longer matches what re-reading the archive will produce.
+    #
+    # series="GB" is required (Ruling S1, task-18-brief.md): the archive-
+    # driven load above creates SGBJUN28 with series="GB" (its real SctySrs,
+    # a gold bond), so this InstrumentRef must carry the same series to
+    # collide onto that same instrument_id/ts row via ON CONFLICT rather
+    # than resolving to a different (phantom) instrument and inserting an
+    # unrelated extra row that leaves the real one un-drifted.
     _load(
         db_conn,
-        [_bar_row(symbol="SGBJUN28", ts=datetime(2026, 8, 13, 10, 0, tzinfo=UTC), close="1.00")],
+        [
+            _bar_row(
+                symbol="SGBJUN28",
+                series="GB",
+                ts=datetime(2026, 8, 13, 10, 0, tzinfo=UTC),
+                close="1.00",
+            )
+        ],
     )
 
     result = check_idempotency(

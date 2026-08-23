@@ -129,3 +129,9 @@ def test_unrecognised_source_key_raises_with_key_in_message():
     frame = AmfiNavParser().parse(payload)
     with pytest.raises(ValueError, match="not_a_real_source"):
         AmfiNormalizer().normalize(frame, payload)
+
+
+def test_series_is_always_null():
+    """Ruling S1 (task-18-brief.md): AMFI carries no meaningful series."""
+    frame = _batch("navall.txt", "amfi_nav", AmfiNavParser()).frame
+    assert frame["series"].null_count() == frame.height

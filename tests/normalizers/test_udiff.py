@@ -94,3 +94,21 @@ def test_unrecognised_source_key_raises_with_key_in_message():
     frame = UdiffParser().parse(payload)
     with pytest.raises(ValueError, match="not_a_real_source"):
         UdiffNormalizer().normalize(frame, payload)
+
+
+# --- Task 18, Ruling S1: SctySrs carries through as `series` ---
+
+
+def test_cm_series_is_carried_through_from_sctysrs():
+    """The CM fixture carries GB (gold bond) and EQ rows."""
+    frame = _batch("nse_cm_udiff.zip", "nse_cm_udiff").frame
+    assert set(frame["series"].unique()) == {"GB", "EQ"}
+    assert frame["series"].null_count() == 0
+
+
+def test_fo_series_is_null_because_sctysrs_is_blank_for_fo():
+    """docs/data-formats/eod-source-formats.md: SctySrs is CM-only; the FO
+    fixture's SctySrs is blank on every row, so series must come through as
+    None rather than an empty string."""
+    frame = _batch("nse_fo_udiff.zip", "nse_fo_udiff").frame
+    assert frame["series"].null_count() == frame.height

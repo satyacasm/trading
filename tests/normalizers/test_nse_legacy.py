@@ -68,3 +68,18 @@ def test_unrecognised_source_key_raises_with_key_in_message():
     frame = NseLegacyCmParser().parse(payload)
     with pytest.raises(ValueError, match="wrong_key"):
         NseLegacyNormalizer().normalize(frame, payload)
+
+
+# --- Task 18, Ruling S1: SERIES carries through as `series` ---
+
+
+def test_series_is_carried_through_from_the_series_column():
+    """The fixture carries EQ, BE, SM and BZ rows -- confirm SERIES maps
+    straight through rather than being dropped (task-17-report.md finding
+    F4, fixed by Ruling S1)."""
+    frame = _batch("cm_legacy.zip", "nse_cm_legacy").frame
+    by_symbol = dict(zip(frame["symbol"], frame["series"], strict=True))
+    assert by_symbol["20MICRONS"] == "EQ"
+    assert by_symbol["A2ZINFRA"] == "BE"
+    assert by_symbol["AAKASH"] == "SM"
+    assert frame["series"].null_count() == 0

@@ -39,6 +39,8 @@ class AmfiNormalizer:
             exchange=pl.lit("AMFI"),
             segment=pl.lit("MF"),
             symbol=pl.col("scheme_code"),
+            # Ruling S1 (task-18-brief.md): AMFI carries no meaningful series.
+            series=pl.lit(None, dtype=pl.String),
             asset_class=pl.lit(AssetClass.MF.value),
             expiry=pl.lit(None, dtype=pl.Date),
             strike=pl.lit(None, dtype=pl.Decimal(18, 4)),

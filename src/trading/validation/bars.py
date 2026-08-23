@@ -8,7 +8,15 @@ from trading.contracts import NormalizedBatch, QuarantineRow, ValidationOutcome
 # resolution, so no instrument_id exists yet — this is the key the brief's
 # prose calls "(instrument_id, ts)" but is actually the pre-resolution
 # natural key plus ts (Ruling V2).
-_KEY = ("exchange", "segment", "symbol", "expiry", "strike", "option_type", "ts")
+#
+# `series` joined this key under Ruling S1 (task-18-brief.md): the same
+# `SYMBOL`/`SctySrs` pair can legitimately appear more than once a day under
+# different series (e.g. DHFL EQ vs. DHFL's several listed NCD series, each
+# a distinct ISIN). Without `series` here, every row after the first for
+# such a symbol looked like a same-day duplicate and was silently
+# quarantined -- measured at ~4% of a legacy NSE CM day (task-18-brief.md,
+# Ruling S1) -- even though each row is a genuinely different instrument.
+_KEY = ("exchange", "segment", "symbol", "series", "expiry", "strike", "option_type", "ts")
 
 
 class BarValidator:

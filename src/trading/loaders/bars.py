@@ -27,6 +27,7 @@ STAGING_COLUMNS = (
     "turnover",
     "trades",
     "settle_price",
+    "underlying_price",
     "open_interest",
     "oi_change",
     "delivery_qty",
@@ -77,12 +78,13 @@ class BarLoader:
                 exchange=r["exchange"],
                 segment=r["segment"],
                 symbol=r["symbol"],
+                series=r["series"],
                 expiry=r["expiry"],
                 strike=r["strike"],
                 option_type=r["option_type"],
             )
             for r in frame.select(
-                "exchange", "segment", "symbol", "expiry", "strike", "option_type"
+                "exchange", "segment", "symbol", "series", "expiry", "strike", "option_type"
             ).to_dicts()
         }
 
@@ -107,6 +109,7 @@ class BarLoader:
                 exchange=record["exchange"],
                 segment=record["segment"],
                 symbol=record["symbol"],
+                series=record["series"],
                 expiry=record["expiry"],
                 strike=record["strike"],
                 option_type=record["option_type"],
@@ -137,6 +140,7 @@ class BarLoader:
                 "close=EXCLUDED.close, prev_close=EXCLUDED.prev_close, "
                 "volume=EXCLUDED.volume, turnover=EXCLUDED.turnover, "
                 "trades=EXCLUDED.trades, settle_price=EXCLUDED.settle_price, "
+                "underlying_price=EXCLUDED.underlying_price, "
                 "open_interest=EXCLUDED.open_interest, oi_change=EXCLUDED.oi_change, "
                 # Ruling: delivery_* arrives from a separate NSE file and must
                 # not be nulled by a later UDiFF upsert of the same row.

@@ -44,6 +44,11 @@ def seeded_instrument(db_conn: Connection) -> Iterator[SeededInstrument]:
                 exchange="NSE",
                 segment="CM",
                 symbol=sym,
+                # Matches `parse_nse_corporate_actions`'s own `series="EQ"`
+                # (Ruling S1, task-18-brief.md) so a resolved corp-action
+                # InstrumentRef collides onto this seeded instrument instead
+                # of a phantom duplicate with a different canonical_key.
+                series="EQ",
                 asset_class="EQUITY",
                 ts=datetime(day.year, day.month, day.day, 10, 0, tzinfo=UTC),
                 open=close_dec,

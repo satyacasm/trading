@@ -31,6 +31,14 @@ class InstrumentRef(BaseModel):
     exchange: str
     segment: str
     symbol: str
+    # Ruling S1 (task-18-brief.md): the CM series (EQ, BE, N2, GB, ...).
+    # Distinct series under the same symbol are DIFFERENT securities (an
+    # equity and an unrelated NCD can share a ticker) -- see the DHFL case
+    # in task-18-brief.md. None for instruments where the source carries no
+    # meaningful series (F&O, AMFI, and any pre-existing CM row of that
+    # shape), which keeps `canonical_key` byte-identical to its pre-Ruling-S1
+    # form whenever series is absent.
+    series: str | None = None
     expiry: date | None = None
     strike: Decimal | None = None
     option_type: OptionType | None = None
@@ -38,6 +46,8 @@ class InstrumentRef(BaseModel):
     @property
     def canonical_key(self) -> str:
         parts = [self.exchange, self.segment, self.symbol]
+        if self.series is not None:
+            parts.append(self.series)
         if self.expiry is not None:
             parts.append(self.expiry.isoformat())
         if self.strike is not None:

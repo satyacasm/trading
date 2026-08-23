@@ -75,3 +75,39 @@ def test_assert_canonical_rejects_a_missing_column():
     frame = empty_canonical_frame().drop("close")
     with pytest.raises(ValueError, match="missing canonical columns"):
         assert_canonical(frame)
+
+
+# --- Ruling S1 (task-18-brief.md): series joins the natural key ---
+
+
+def test_canonical_key_without_series_is_unchanged():
+    """Existing keys for instruments WITHOUT a series must not churn."""
+    ref = InstrumentRef(exchange="NSE", segment="CM", symbol="RELIANCE", series=None)
+    assert ref.canonical_key == "NSE:CM:RELIANCE"
+
+
+def test_canonical_key_with_series_includes_it_after_symbol():
+    ref = InstrumentRef(exchange="NSE", segment="CM", symbol="DHFL", series="N2")
+    assert ref.canonical_key == "NSE:CM:DHFL:N2"
+
+
+def test_canonical_key_distinguishes_series_for_the_same_symbol():
+    """The DHFL case: same symbol, different series, must be different keys."""
+    keys = {
+        InstrumentRef(exchange="NSE", segment="CM", symbol="DHFL", series=s).canonical_key
+        for s in ("EQ", "N2", "N4")
+    }
+    assert keys == {"NSE:CM:DHFL:EQ", "NSE:CM:DHFL:N2", "NSE:CM:DHFL:N4"}
+
+
+def test_canonical_key_for_option_with_series_orders_series_before_expiry():
+    ref = InstrumentRef(
+        exchange="NSE",
+        segment="FO",
+        symbol="NIFTY",
+        series="OP",
+        expiry=date(2026, 8, 27),
+        strike=Decimal("24500"),
+        option_type=OptionType.CE,
+    )
+    assert ref.canonical_key == "NSE:FO:NIFTY:OP:2026-08-27:24500:CE"

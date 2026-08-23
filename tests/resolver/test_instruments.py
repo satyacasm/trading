@@ -82,6 +82,60 @@ def test_bootstrap_flag_bypasses_the_abort_guard(db_conn):
     assert len(mapping) == 11
 
 
+# --- Task 18, Ruling S3: `bootstrap_next_call` arms exactly one `resolve()` ---
+
+
+def test_bootstrap_next_call_bypasses_the_guard_for_one_call(db_conn):
+    resolver = DbInstrumentResolver(max_new_per_batch=10)
+    resolver.bootstrap_next_call()
+    refs = {_ref(f"ARMED{i}") for i in range(11)}
+    mapping = resolver.resolve(refs, db_conn)
+    assert len(mapping) == 11
+
+
+def test_bootstrap_next_call_does_not_apply_to_a_later_call(db_conn):
+    """The arm must be consumed by exactly the next resolve() -- proves
+    Ruling S3's 'first day only' requirement rather than assuming it."""
+    resolver = DbInstrumentResolver(max_new_per_batch=10)
+    resolver.bootstrap_next_call()
+    first = {_ref(f"ARMEDONCE{i}") for i in range(11)}
+    resolver.resolve(first, db_conn)
+
+    second = {_ref(f"UNARMED{i}") for i in range(11)}
+    with pytest.raises(ValidationAbort, match="new instruments"):
+        resolver.resolve(second, db_conn)
+
+
+def test_without_bootstrap_next_call_the_guard_still_aborts(db_conn):
+    resolver = DbInstrumentResolver(max_new_per_batch=10)
+    refs = {_ref(f"NEVERARMED{i}") for i in range(11)}
+    with pytest.raises(ValidationAbort, match="new instruments"):
+        resolver.resolve(refs, db_conn)
+
+
+# --- Task 18, Ruling S1: series identity, at the resolver ---
+
+
+def test_dhfl_shaped_refs_resolve_to_three_distinct_instruments(db_conn):
+    """Same symbol, three series, three distinct securities -- the exact
+    shape task-18-brief.md's Ruling S1 requires a test for."""
+    refs = {
+        InstrumentRef(exchange="NSE", segment="CM", symbol="DHFL", series="EQ"),
+        InstrumentRef(exchange="NSE", segment="CM", symbol="DHFL", series="N2"),
+        InstrumentRef(exchange="NSE", segment="CM", symbol="DHFL", series="N4"),
+    }
+    mapping = DbInstrumentResolver().resolve(refs, db_conn)
+    assert len(mapping) == 3
+    assert len(set(mapping.values())) == 3
+
+
+def test_series_is_written_on_create(db_conn):
+    ref = InstrumentRef(exchange="NSE", segment="CM", symbol="SERIESCREATE", series="BE")
+    DbInstrumentResolver().resolve({ref}, db_conn)
+    row = db_conn.execute("SELECT series FROM instruments WHERE symbol='SERIESCREATE'").fetchone()
+    assert row == ("BE",)
+
+
 def test_lot_history_records_only_changes(db_conn):
     resolver = DbInstrumentResolver()
     iid = resolver.resolve({_ref("LOTTEST")}, db_conn)[_ref("LOTTEST")]

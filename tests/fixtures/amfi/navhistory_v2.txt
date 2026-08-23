@@ -1,0 +1,80 @@
+Scheme Code;NAV Name;Plan;Option;ISIN Div Payout/ISIN Growth;ISIN Div Reinvestment;Net Asset Value;Date
+
+Open Ended Schemes ( Growth )
+
+
+Sahara Mutual Fund
+120373;SAHARA BANKING & FINANCIAL SERVICES FUND- GROWTH - Direct;;;INF515L01AJ6;;74.2258;14-Mar-2019
+109493;SAHARA BANKING & FINANCIAL SERVICES FUND- GROWTH OPTION;;;INF515L01494;;69.7782;14-Mar-2019
+120374;SAHARA BANKING & FINANCIAL SERVICES FUND-DIVIDEND - Direct;;;INF515L01AH0;INF515L01AI8;25.1531;14-Mar-2019
+109494;SAHARA BANKING & FINANCIAL SERVICES FUND-DIVIDEND OPTION;;;INF515L01478;INF515L01486;24.6678;14-Mar-2019
+101529;Sahara Growth Fund-Dividend;;;INF515L01155;INF515L01163;41.9991;14-Mar-2019
+120288;Sahara Growth Fund-Dividend- Direct;;;INF515L01759;INF515L01767;42.8193;14-Mar-2019
+101528;Sahara Growth Fund-Growth;;;INF515L01171;;144.6358;14-Mar-2019
+120289;Sahara Growth Fund-Growth- Direct;;;INF515L01775;;162.1377;14-Mar-2019
+120352;Sahara Infrastructure Fund ---FIXED PRICING -Direct-Dividend;;;INF515L01924;INF515L01932;20.328;14-Mar-2019
+120353;Sahara Infrastructure Fund ---FIXED PRICING OPTION-Direct-Growth;;;INF515L01940;;28.2305;14-Mar-2019
+103730;Sahara Infrastructure Fund ---FIXED PRICING OPTION-Dividend Option;;;INF515L01320;INF515L01338;18.9269;14-Mar-2019
+103731;Sahara Infrastructure Fund ---FIXED PRICING OPTION-Growth Option;;;INF515L01346;;25.9188;14-Mar-2019
+120354;Sahara Infrastructure Fund ---VARIABLE PRICING OPTION-Direct-Dividend;;;INF515L01957;INF515L01965;22.3093;14-Mar-2019
+120355;Sahara Infrastructure Fund ---VARIABLE PRICING OPTION-Direct-Growth;;;INF515L01973;;30.8676;14-Mar-2019
+103732;Sahara Infrastructure Fund ---VARIABLE PRICING OPTION-Dividend Option;;;INF515L01353;INF515L01361;22.1412;14-Mar-2019
+103733;Sahara Infrastructure Fund ---VARIABLE PRICING OPTION-Growth Option;;;INF515L01379;;30.0983;14-Mar-2019
+100798;Sahara Midcap Fund-Auto Payout;;;INF515L01247;;78.9983;14-Mar-2019
+120295;Sahara Midcap Fund-Auto Payout- Direct;;;INF515L01841;;84.6726;14-Mar-2019
+100799;Sahara Midcap Fund-Bonus;;;INF515L01254;;78.9983;14-Mar-2019
+120296;Sahara Midcap Fund-Bonus- Direct;;;INF515L01858;;84.6726;14-Mar-2019
+120298;Sahara Midcap Fund-Dividend -Direct;;;INF515L01817;INF515L01825;35.3991;14-Mar-2019
+100797;Sahara Midcap Fund-Dividend Plan;;;INF515L01213;INF515L01221;34.8409;14-Mar-2019
+120297;Sahara Midcap Fund-Growth Option - Direct;;;INF515L01833;;84.6726;14-Mar-2019
+100796;Sahara Midcap Fund-Growth Plan;;;INF515L01239;;78.9983;14-Mar-2019
+108320;Sahara Power & Natural Resources Fund - Dividend Option;;;INF515L01445;INF515L01452;17.8144;14-Mar-2019
+120371;Sahara Power & Natural resources Fund- Growth - Direct;;;INF515L01AG2;;22.5844;14-Mar-2019
+108321;Sahara Power & Natural resources Fund- Growth Option;;;INF515L01460;;20.8863;14-Mar-2019
+120370;Sahara Power & Natural Resources Fund-Dividend - Direct;;;INF515L01AE7;INF515L01AF4;16.0357;14-Mar-2019
+106744;Sahara R.E.A.L Fund - Dividend Option;;;INF515L01387;INF515L01395;20.6046;14-Mar-2019
+120360;Sahara R.E.A.L Fund - Dividend Option- Direct;;;INF515L01981;INF515L01999;21.0426;14-Mar-2019
+106745;Sahara R.E.A.L Fund - Growth  Fund;;;INF515L01403;;20.6012;14-Mar-2019
+120361;Sahara R.E.A.L Fund - Growth  Fund- Direct;;;INF515L01AA5;;22.7885;14-Mar-2019
+120387;Sahara Star Value Fund-Dividend - Direct;;;INF515L01AS7;INF515L01AT5;18.6203;14-Mar-2019
+112104;Sahara Star Value Fund-Dividend Option;;;INF515L01585;INF515L01593;18.2989;14-Mar-2019
+120386;Sahara Star Value Fund-Growth - Direct;;;INF515L01AU3;;25.4515;14-Mar-2019
+112105;Sahara Star Value Fund-Growth Option;;;INF515L01601;;23.6653;14-Mar-2019
+120383;Sahara Super 20 Fund - Dividend - Direct;;;INF515L01AP3;INF515L01AQ1;16.3573;14-Mar-2019
+112036;Sahara Super 20 Fund - Dividend Option;;;INF515L01551;INF515L01569;20.4961;14-Mar-2019
+120382;Sahara Super 20 Fund - Growth - Direct;;;INF515L01AR9;;22.3609;14-Mar-2019
+112037;Sahara Super 20 Fund - Growth Option;;;INF515L01577;;20.516;14-Mar-2019
+120341;Sahara Wealth Plus Fund-Fixed Pricing Option-Direct-Dividend Option;;;INF515L01866;INF515L01874;31.0354;14-Mar-2019
+120340;Sahara Wealth Plus Fund-Fixed Pricing Option-Direct-Growth;;;INF515L01882;;43.8429;14-Mar-2019
+103119;Sahara Wealth Plus Fund-Fixed Pricing Option-Dividend Option;;;INF515L01262;INF515L01270;30.5014;14-Mar-2019
+103120;Sahara Wealth Plus Fund-Fixed Pricing Option-Growth Option;;;INF515L01288;;42.827;14-Mar-2019
+120344;Sahara Wealth Plus Fund-Variable Pricing Option-Direct -Dividend;;;INF515L01890;INF515L01908;36.7627;14-Mar-2019
+120345;Sahara Wealth Plus Fund-Variable Pricing Option-Direct-Growth;;;INF515L01916;;51.2966;14-Mar-2019
+103121;Sahara Wealth Plus Fund-Variable Pricing Option-Dividend Option;;;INF515L01296;INF515L01304;36.2093;14-Mar-2019
+103122;Sahara Wealth Plus Fund-Variable Pricing Option-Growth Option;;;INF515L01312;;49.9441;14-Mar-2019
+
+Open Ended Schemes ( Liquid )
+
+
+Sahara Mutual Fund
+101397;Sahara Liquid Fund-Fixed Pricing -  Weekly Dividend Option;;;;INF515L01064;1027.4373;14-Mar-2019
+101393;Sahara Liquid Fund-Fixed Pricing - Daily Dividend Option;;;;INF515L01049;1273.9923;14-Mar-2019
+120265;Sahara Liquid Fund-Fixed Pricing - Direct - Weekly Dividend Option;;;;INF515L01668;1027.4373;14-Mar-2019
+120262;Sahara Liquid Fund-Fixed Pricing - Direct -Growth option;;;INF515L01650;;3024.287;14-Mar-2019
+101394;Sahara Liquid Fund-Fixed Pricing - Growth option;;;INF515L01056;;3117.6311;14-Mar-2019
+101398;Sahara Liquid Fund-Fixed Pricing - Monthly Dividend Option;;;;INF515L01072;1043.3721;14-Mar-2019
+120253;Sahara Liquid Fund-Fixed Pricing -Direct - Daily Dividend Option- Direct;;;;INF515L01643;1273.9923;14-Mar-2019
+120266;Sahara Liquid Fund-Fixed Pricing -Direct - Monthly Dividend Option;;;;INF515L01676;1043.3721;14-Mar-2019
+101399;Sahara Liquid Fund-Variable Pricing - Daily Dividend option;;;;INF515L01080;1285.9821;14-Mar-2019
+101402;Sahara Liquid Fund-Variable Pricing - Growth option;;;INF515L01114;;3189.5292;14-Mar-2019
+101400;Sahara Liquid Fund-Variable Pricing - Weekly Dividend Option;;;;INF515L01098;1297.5263;14-Mar-2019
+120271;Sahara Liquid Fund-Variable Pricing -Direct - Daily Dividend option;;;;INF515L01684;1038.8267;14-Mar-2019
+120280;Sahara Liquid Fund-Variable Pricing -Direct - Growth option;;;INF515L01718;;3196.2451;14-Mar-2019
+120272;Sahara Liquid Fund-Variable Pricing -Direct - Weekly Dividend Option;;;;INF515L01692;1297.5263;14-Mar-2019
+120273;Sahara Liquid Fund-Variable Pricing- Direct - Monthly Dividend Option;;;;INF515L01700;1055.8972;14-Mar-2019
+101401;Sahara Liquid Fund-Variable Pricing- Monthly Dividend Option;;;;INF515L01106;1309.9577;14-Mar-2019
+
+Open Ended Schemes ( Money Market )
+
+
+Taurus Mutual Fund

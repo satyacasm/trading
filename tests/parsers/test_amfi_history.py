@@ -74,3 +74,87 @@ def test_rejects_a_csv_file(parser: AmfiNavHistoryParser, tmp_path: Path) -> Non
     assert parser.can_parse(payload) is False
     with pytest.raises(ParseError):
         parser.parse(payload)
+
+
+# ---------------------------------------------------------------------------
+# AMFI reordered this report's columns (F1, task-17-report.md). Both layouts
+# carry 8 fields, so positional unpacking parsed the new one without error
+# while writing the Plan value into the ISIN column and the ISIN into the NAV
+# column. Values are therefore read by column NAME, and both layouts are
+# supported -- the archived bytes are the source of truth for
+# check_idempotency, and old-format files may already sit in data/raw.
+# ---------------------------------------------------------------------------
+
+FIXTURE_V2 = Path(__file__).parent.parent / "fixtures" / "amfi" / "navhistory_v2.txt"
+
+CURRENT_HEADER = (
+    "Scheme Code;NAV Name;Plan;Option;ISIN Div Payout/ISIN Growth;"
+    "ISIN Div Reinvestment;Net Asset Value;Date"
+)
+
+
+def test_can_parse_accepts_the_current_header(parser: AmfiNavHistoryParser) -> None:
+    assert parser.can_parse(make_payload(FIXTURE_V2, "amfi_nav_history", date(2019, 3, 14)))
+
+
+def test_parses_the_current_column_layout(parser: AmfiNavHistoryParser) -> None:
+    frame = parser.parse(make_payload(FIXTURE_V2, "amfi_nav_history", date(2019, 3, 14)))
+    assert frame.height == 64
+    assert frame["scheme_code"].str.contains(r"^\d+$").all()
+
+
+def test_both_layouts_parse_to_identical_frames(parser: AmfiNavHistoryParser) -> None:
+    """The two fixtures are the same 64 schemes on the same date, captured in
+    AMFI's old and current column orders. Anything but equality means the
+    reorder is leaking into the parsed values."""
+    old = parser.parse(make_payload(FIXTURE, "amfi_nav_history", date(2019, 3, 14)))
+    new = parser.parse(make_payload(FIXTURE_V2, "amfi_nav_history", date(2019, 3, 14)))
+    assert old.equals(new)
+
+
+def test_current_layout_does_not_shift_isin_and_nav(parser: AmfiNavHistoryParser) -> None:
+    """The exact corruption positional unpacking would cause: 'Plan' landing
+    in isin_growth and the ISIN landing in nav, with no error raised."""
+    frame = parser.parse(make_payload(FIXTURE_V2, "amfi_nav_history", date(2019, 3, 14)))
+    isins = frame["isin_growth"].drop_nulls()
+    assert isins.len() > 0
+    assert isins.str.contains(r"^INF[0-9A-Z]+$").all()
+    assert frame["nav"].str.contains(r"^\d+(\.\d+)?$").all()
+    assert frame["nav_date"].str.contains(r"^\d{2}-[A-Z][a-z]{2}-\d{4}$").all()
+
+
+def test_a_header_missing_a_required_column_is_rejected(
+    parser: AmfiNavHistoryParser, tmp_path: Path
+) -> None:
+    """A future reorder that DROPS a column we depend on must fail loudly
+    rather than silently yielding nulls."""
+    content = (
+        "Scheme Code;NAV Name;Plan;Option;ISIN Div Payout/ISIN Growth;"
+        "ISIN Div Reinvestment;Date\n"
+        "\nOpen Ended Schemes ( Growth )\n\nSahara Mutual Fund\n"
+        "120373;SOME FUND;;;INF515L01AJ6;;14-Mar-2019\n"
+    )
+    with pytest.raises(ParseError, match="Net Asset Value"):
+        parser.parse(_synthetic_payload(content, tmp_path))
+
+
+def test_dash_isin_becomes_null_in_the_current_layout(
+    parser: AmfiNavHistoryParser, tmp_path: Path
+) -> None:
+    """AMFI encodes an absent ISIN as a literal '-' as well as an empty field,
+    in BOTH columns. Rows copied verbatim from a live 2019-03-14 fetch
+    (portal.amfiindia.com, lines 2243 and 12144) -- the committed fixtures
+    happen to contain only the empty-field spelling, so this case would
+    otherwise go untested and a literal '-' would reach the ISIN column.
+    """
+    content = (
+        f"{CURRENT_HEADER}\n"
+        "\nOpen Ended Schemes ( Growth )\n\nICICI Prudential Mutual Fund\n"
+        "145399;ICICI Prudential Ultra Short Term Fund - Daily IDCW;Regular Plan;"
+        "Daily IDCW;-;INF109KC1ND7;10.0014;14-Mar-2019\n"
+        "118804;Nippon India Annual Interval Fund - Series I;;;INF204K01B81;-;"
+        "18.9501;14-Mar-2019\n"
+    )
+    frame = parser.parse(_synthetic_payload(content, tmp_path))
+    assert frame["isin_growth"].to_list() == [None, "INF204K01B81"]
+    assert frame["isin_reinvest"].to_list() == ["INF109KC1ND7", None]

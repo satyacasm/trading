@@ -295,3 +295,29 @@ def test_record_identity_ignores_keys_that_do_not_exist(db_conn):
 
 def test_record_identity_with_nothing_to_record_is_a_no_op(db_conn):
     assert DbInstrumentResolver().record_identity(db_conn, {}) == 0
+
+
+def test_record_identity_stops_writing_once_nothing_is_left_to_fill(db_conn):
+    """An F&O contract has a name but genuinely no ISIN, so `isin IS NULL`
+    stays true for its whole life. A predicate that only asks "is either
+    column empty?" therefore re-updates every such row on every later day:
+    the live repair logged 3,435,784 writes in its first 100 archives against
+    536,032 instruments, and would have done ~18 million over the full run
+    while changing nothing after the first pass.
+    """
+    resolver = DbInstrumentResolver()
+    ref = InstrumentRef(
+        exchange="NSE",
+        segment="FO",
+        symbol="NOISIN",
+        expiry=date(2026, 8, 27),
+        strike=Decimal("100"),
+        option_type=OptionType.CE,
+    )
+    resolver.resolve({ref}, db_conn)
+
+    first = resolver.record_identity(db_conn, {ref.canonical_key: ("NOISIN 26AUG 100 CE", None)})
+    second = resolver.record_identity(db_conn, {ref.canonical_key: ("NOISIN 26AUG 100 CE", None)})
+
+    assert first == 1
+    assert second == 0

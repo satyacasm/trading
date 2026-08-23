@@ -214,8 +214,14 @@ class DbInstrumentResolver:
                 " FROM (SELECT unnest(%s::text[]) AS key, unnest(%s::text[]) AS name,"
                 " unnest(%s::text[]) AS isin) v"
                 " WHERE i.canonical_key = v.key"
-                " AND (i.name IS NULL OR i.isin IS NULL)"
-                " AND (v.name IS NOT NULL OR v.isin IS NOT NULL)",
+                # Only where this would actually change something. Asking
+                # merely "is either column empty?" never goes false for an
+                # F&O contract, which has a name but genuinely no ISIN, so
+                # every later day would rewrite all ~536,000 of them
+                # unchanged -- 3,435,784 writes in the live repair's first
+                # 100 archives alone.
+                " AND ((i.name IS NULL AND v.name IS NOT NULL)"
+                " OR (i.isin IS NULL AND v.isin IS NOT NULL))",
                 (keys, [meta[k][0] for k in keys], [meta[k][1] for k in keys]),
             )
             return cur.rowcount if cur.rowcount > 0 else 0

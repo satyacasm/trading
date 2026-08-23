@@ -46,13 +46,21 @@ _BAR_QUERY = """
 """
 
 # announced_at IS NULL is treated as "always known" (see module docstring).
+#
+# Ruling A6 (task-16 fix round 1): `announced_at` is TIMESTAMPTZ, so it is
+# compared directly against a timezone-aware UTC bound -- never `::date`,
+# which is exactly the session-TimeZone defect Ruling A2 already removed
+# from `ts` above, just left on its sibling column. `announced_at < %s`
+# with an exclusive upper bound one day after `as_of` (computed in Python,
+# same pattern as `_BAR_QUERY`'s `upper`) makes an action "known as of
+# as_of" iff it was announced any time on or before that UTC calendar day.
 _ACTION_QUERY = """
     SELECT ex_date, ratio_from, ratio_to
     FROM corporate_actions
     WHERE instrument_id = %s
       AND action_type IN ('SPLIT', 'BONUS')
       AND ex_date <= %s
-      AND (announced_at IS NULL OR announced_at::date <= %s)
+      AND (announced_at IS NULL OR announced_at < %s)
     ORDER BY ex_date
 """
 
@@ -71,7 +79,8 @@ def adjustment_factors(
     making `as_of` keyword-only so no caller can transpose it with a date
     bound.
     """
-    rows = conn.execute(_ACTION_QUERY, (instrument_id, as_of, as_of)).fetchall()
+    known_before = datetime(as_of.year, as_of.month, as_of.day, tzinfo=UTC) + timedelta(days=1)
+    rows = conn.execute(_ACTION_QUERY, (instrument_id, as_of, known_before)).fetchall()
     return [
         (ex_date, Decimal(ratio_from) / Decimal(ratio_to))
         for ex_date, ratio_from, ratio_to in rows

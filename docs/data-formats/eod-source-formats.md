@@ -293,9 +293,15 @@ only embedded in the free-text `subject` string. Across a 1,318-record sample sp
 
 `ratio_from`/`ratio_to` (`corporate_actions` columns, spec §4.3) are derived as:
 - **Bonus X:Y** → `ratio_from = Y`, `ratio_to = X + Y` (holder had Y, now has X+Y).
-- **Split "From X To Y"** → `ratio_from = Y`, `ratio_to = X` (X/Y as many shares after).
+- **Split "From X To Y"** → the raw face values reduced to the canonical share-count
+  ratio, in lowest terms: `ratio_from = Y/gcd(X,Y)`, `ratio_to = X/gcd(X,Y)`. "From Rs
+  10/- To Rs 2/-" is stored as `(1, 5)`, **not** `(2, 10)` — the migration's own inline
+  comment (`-- SPLIT 1:5 => from=1, to=5`) and the brief's fixtures both use the reduced
+  form, and `ratio_to` participates in `uq_corp_action`'s uniqueness expression: storing
+  the unreduced face-value pair would let the same real-world split entered once by this
+  parser and once canonically by another source hold two rows and be applied twice.
 
-Both reduce to the brief's convention (`factor = ratio_from/ratio_to` multiplies
+This matches the brief's convention directly (`factor = ratio_from/ratio_to` multiplies
 pre-action prices into post-action terms — a 1:5 split is `ratio_from=1, ratio_to=5`).
 
 `parse_nse_corporate_actions` recognises **only** the three patterns above (`ind`,

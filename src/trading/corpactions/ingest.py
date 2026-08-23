@@ -40,6 +40,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from fractions import Fraction
 
 import structlog
 from psycopg import Connection
@@ -197,8 +198,19 @@ def _classify(
         new, held = Decimal(m.group(1)), Decimal(m.group(2))
         return "BONUS", held, held + new, None
     if m := _SPLIT_RE.match(subject):
-        new_fv, old_fv = Decimal(m.group(2)), Decimal(m.group(1))
-        return "SPLIT", new_fv, old_fv, None
+        old_fv, new_fv = Decimal(m.group(1)), Decimal(m.group(2))
+        # Ruling A7 (task-16 fix round 1): store the canonical share-count
+        # ratio, reduced to lowest terms -- not the raw face values. "From
+        # Rs 10 To Rs 2" is a 1:5 split, exactly like the migration's own
+        # comment (`-- SPLIT 1:5 => from=1, to=5`) and the brief's fixtures
+        # say, not (2, 10). `ratio_to` participates in `uq_corp_action`'s
+        # uniqueness expression: the unreduced form would let the same
+        # real-world split entered once here and once canonically by
+        # another source hold two rows and be applied twice. `Fraction`
+        # reduces exactly (works for non-integer face values too, not just
+        # via integer gcd).
+        ratio = Fraction(new_fv) / Fraction(old_fv)
+        return "SPLIT", Decimal(ratio.numerator), Decimal(ratio.denominator), None
     if m := _DIVIDEND_RE.match(subject):
         return "DIVIDEND", None, None, Decimal(m.group(1))
     return None, None, None, None

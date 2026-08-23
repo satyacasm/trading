@@ -86,3 +86,26 @@ def test_query_is_immune_to_session_timezone(db_conn, seeded_instrument):
     )
     seen_dates = {r["ts"].date() for r in frame.to_dicts()}
     assert seen_dates == {date(2026, 8, 11), date(2026, 8, 13)}
+
+
+def test_announced_at_is_also_immune_to_session_timezone(db_conn, seeded_instrument):
+    """Ruling A6 (task-16 fix round 1): `announced_at::date` had the exact
+    session-timezone defect Ruling A2 already fixed on `ts` -- left on its
+    sibling column in the same query. An action announced
+    2026-08-15T02:00:00Z, queried as_of=2026-08-14 (strictly before the
+    announcement in UTC), must stay invisible under every session timezone,
+    not just UTC -- under `America/Los_Angeles` the old `::date` cast made
+    it VISIBLE instead, leaking a split the market had not yet announced.
+    """
+    iid = seeded_instrument(closes={date(2026, 8, 11): 500})
+    db_conn.execute(
+        "INSERT INTO corporate_actions (instrument_id, action_type, ex_date, ratio_from,"
+        " ratio_to, announced_at, source)"
+        " VALUES (%s,'SPLIT','2026-08-12',1,5,'2026-08-15T02:00:00Z','test')",
+        (iid,),
+    )
+    db_conn.execute("SET LOCAL TimeZone = 'America/Los_Angeles'")
+    frame = adjusted_bars(
+        db_conn, iid, date(2026, 8, 11), date(2026, 8, 11), as_of=date(2026, 8, 14)
+    )
+    assert frame["close"][0] == Decimal("500.0000")

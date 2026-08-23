@@ -55,6 +55,24 @@ _SAMPLE = json.dumps(
             "bcEndDate": "-",
             "bcStartDate": "-",
             "caBroadcastDate": None,
+            "comp": "SKM Egg Products Export (India) Limited",
+            "exDate": "12-Jan-2026",
+            "faceVal": "5",
+            "ind": "-",
+            "isin": "INE411D01015",
+            "ndEndDate": "-",
+            "ndStartDate": "-",
+            "recDate": "12-Jan-2026",
+            "series": "EQ",
+            "subject": (
+                "Face Value Split (Sub-Division) - From Rs 10/- Per Share To Rs 5/- Per Share"
+            ),
+            "symbol": "SKMEGGPROD",
+        },
+        {
+            "bcEndDate": "-",
+            "bcStartDate": "-",
+            "caBroadcastDate": None,
             "comp": "National Aluminium Company Limited",
             "exDate": "24-Aug-2026",
             "faceVal": "5",
@@ -89,12 +107,33 @@ _SAMPLE = json.dumps(
 
 def test_parses_the_recognised_subject_patterns(db_conn):
     result = parse_nse_corporate_actions(_SAMPLE, DbInstrumentResolver(), db_conn)
-    by_type = {r.action_type: r for r in result.rows}
-    assert by_type["BONUS"].ratio_from == Decimal("2")
-    assert by_type["BONUS"].ratio_to == Decimal("3")
-    assert by_type["SPLIT"].ratio_from == Decimal("2")
-    assert by_type["SPLIT"].ratio_to == Decimal("10")
-    assert by_type["DIVIDEND"].amount == Decimal("1")
+    by_symbol = {r.raw["symbol"]: r for r in result.rows}
+    assert by_symbol["BESTAGRO"].action_type == "BONUS"
+    assert by_symbol["BESTAGRO"].ratio_from == Decimal("2")
+    assert by_symbol["BESTAGRO"].ratio_to == Decimal("3")
+    assert by_symbol["NATIONALUM"].action_type == "DIVIDEND"
+    assert by_symbol["NATIONALUM"].amount == Decimal("1")
+
+
+def test_split_ratios_are_stored_canonically_reduced_to_lowest_terms(db_conn):
+    """Ruling A7 (task-16 fix round 1): the canonical share-count ratio,
+    reduced to lowest terms -- not the raw face values. `ratio_to`
+    participates in `uq_corp_action`'s uniqueness expression, so storing the
+    unreduced face-value pair would let the same real-world split entered
+    once here and once canonically by another source hold two rows and be
+    applied twice. Pinned against two real subject strings from the live
+    sample.
+    """
+    result = parse_nse_corporate_actions(_SAMPLE, DbInstrumentResolver(), db_conn)
+    by_symbol = {r.raw["symbol"]: r for r in result.rows}
+    # "From Rs 10/- To Rs 2/-" -> (2, 10) unreduced -> (1, 5) canonical.
+    assert by_symbol["MCX"].action_type == "SPLIT"
+    assert by_symbol["MCX"].ratio_from == Decimal("1")
+    assert by_symbol["MCX"].ratio_to == Decimal("5")
+    # "From Rs 10/- To Rs 5/-" -> (5, 10) unreduced -> (1, 2) canonical.
+    assert by_symbol["SKMEGGPROD"].action_type == "SPLIT"
+    assert by_symbol["SKMEGGPROD"].ratio_from == Decimal("1")
+    assert by_symbol["SKMEGGPROD"].ratio_to == Decimal("2")
 
 
 def test_an_unrecognised_subject_is_skipped_not_guessed(db_conn):
@@ -103,7 +142,12 @@ def test_an_unrecognised_subject_is_skipped_not_guessed(db_conn):
     means -- it must be skipped, not guessed."""
     result = parse_nse_corporate_actions(_SAMPLE, DbInstrumentResolver(), db_conn)
     assert result.skipped == 1
-    assert {r.raw["symbol"] for r in result.rows} == {"BESTAGRO", "MCX", "NATIONALUM"}
+    assert {r.raw["symbol"] for r in result.rows} == {
+        "BESTAGRO",
+        "MCX",
+        "SKMEGGPROD",
+        "NATIONALUM",
+    }
 
 
 def test_ex_dates_are_parsed_from_dd_mon_yyyy(db_conn):

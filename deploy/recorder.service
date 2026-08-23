@@ -1,0 +1,15 @@
+[Unit]
+Description=Trading raw market recorder
+After=network-online.target
+
+[Service]
+Type=simple
+User=trading
+WorkingDirectory=/opt/trading
+EnvironmentFile=/opt/trading/.env.local
+ExecStart=/opt/trading/.venv/bin/python -m trading.recorder
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

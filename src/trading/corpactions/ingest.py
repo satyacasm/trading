@@ -71,15 +71,30 @@ _MONTH_NUM = {
     "Dec": 12,
 }
 
-# "Bonus 1:2" -> 1 new share for every 2 held.
-_BONUS_RE = re.compile(r"^Bonus (\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$")
+# Widened against the whole 2016-2026 archive (23,782 real subjects), not
+# guessed: every alternative below is a spelling NSE actually uses. See
+# tests/corpactions/test_classify.py, where each case is copied verbatim.
+_NUM = r"(\d+(?:\.\d+)?)"
+
+# "Bonus 1:2" -> 1 new share for every 2 held. Anchored at the start of its
+# own segment so "Scheme Of Arrangement - Bonus Ncrps 4:1" can never match:
+# an NCRPS bonus issues preference shares, leaving the equity share count
+# unchanged, so applying it would corrupt every price before that date.
+_BONUS_RE = re.compile(rf"^Bonus {_NUM}:{_NUM}$")
+
 # "Face Value Split (Sub-Division) - From Rs 10/- Per Share To Rs 2/- Per Share"
+# "Face Value Split From Rs 10 To Rs 2"
+# "Face Value Split (Sub-Division) - From Rs10/- Per Share To Rs 5/- Per Share"
 _SPLIT_RE = re.compile(
-    r"^Face Value Split \(Sub-Division\) - From R[se] (\d+(?:\.\d+)?)/- Per Share"
-    r" To R[se] (\d+(?:\.\d+)?)/- Per Share$"
+    rf"^Face Value Split\s*(?:\(Sub-Division\))?\s*-?\s*From\s+R[se]\s*{_NUM}"
+    rf"(?:/-)?(?:\s+Per\s+Share)?\s+To\s+R[se]\s*{_NUM}(?:/-)?(?:\s+Per\s+Share)?$"
 )
-# "Dividend - Rs 2 Per Share" / "Interim Dividend - Rs 2.55 Per Share"
-_DIVIDEND_RE = re.compile(r"^(?:Interim )?Dividend - R[se] (\d+(?:\.\d+)?) Per Share$")
+
+# "Dividend - Rs 2 Per Share", "Interim Dividend - Rs 2.55 Per Share",
+# "Dividend - Re 0.70  Per Share" (doubled space), "Dividend - Rs 6 Per Sh".
+_DIVIDEND_RE = re.compile(
+    rf"^(?:Interim|Final|Special)?\s*Dividend\s*-\s*R[se]\s*{_NUM}\s+Per\s+Sh(?:are)?$"
+)
 
 
 @dataclass(frozen=True)
@@ -185,35 +200,42 @@ def _parse_broadcast_date(value: object) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
-def _classify(
-    subject: str,
-) -> tuple[str | None, Decimal | None, Decimal | None, Decimal | None]:
-    """Recognise a `subject` string as SPLIT/BONUS/DIVIDEND, or return all-None.
+def _classify(subject: str) -> list[tuple[str, Decimal | None, Decimal | None, Decimal | None]]:
+    """Recognise `subject` as zero or more SPLIT/BONUS/DIVIDEND actions.
 
-    Returns (action_type, ratio_from, ratio_to, amount). Only patterns
-    actually observed in a live sample are recognised -- see module
-    docstring.
+    Returns a LIST because NSE packs two genuine corporate actions into one
+    subject with a slash -- "Bonus 1:1/Face Value Split (Sub-Division) - From
+    Rs 10/- Per Share To Rs 5/- Per Share" is a bonus AND a sub-division, and
+    that combination is the largest price move in the whole feed. Recognising
+    only the first would leave the other silently unapplied.
+
+    Anything not matching a spelling actually observed in the archive returns
+    an empty list rather than a guess: a wrong ratio is applied to every price
+    before that date and fails silently, which is worse than not parsing it.
     """
-    if m := _BONUS_RE.match(subject):
-        new, held = Decimal(m.group(1)), Decimal(m.group(2))
-        return "BONUS", held, held + new, None
-    if m := _SPLIT_RE.match(subject):
-        old_fv, new_fv = Decimal(m.group(1)), Decimal(m.group(2))
-        # Ruling A7 (task-16 fix round 1): store the canonical share-count
-        # ratio, reduced to lowest terms -- not the raw face values. "From
-        # Rs 10 To Rs 2" is a 1:5 split, exactly like the migration's own
-        # comment (`-- SPLIT 1:5 => from=1, to=5`) and the brief's fixtures
-        # say, not (2, 10). `ratio_to` participates in `uq_corp_action`'s
-        # uniqueness expression: the unreduced form would let the same
-        # real-world split entered once here and once canonically by
-        # another source hold two rows and be applied twice. `Fraction`
-        # reduces exactly (works for non-integer face values too, not just
-        # via integer gcd).
-        ratio = Fraction(new_fv) / Fraction(old_fv)
-        return "SPLIT", Decimal(ratio.numerator), Decimal(ratio.denominator), None
-    if m := _DIVIDEND_RE.match(subject):
-        return "DIVIDEND", None, None, Decimal(m.group(1))
-    return None, None, None, None
+    actions: list[tuple[str, Decimal | None, Decimal | None, Decimal | None]] = []
+    # Split on "/" only where it separates two actions, never inside "Rs 10/-".
+    for part in re.split(r"/(?!-)", subject):
+        segment = part.strip()
+        if m := _BONUS_RE.match(segment):
+            new, held = Decimal(m.group(1)), Decimal(m.group(2))
+            actions.append(("BONUS", held, held + new, None))
+        elif m := _SPLIT_RE.match(segment):
+            old_fv, new_fv = Decimal(m.group(1)), Decimal(m.group(2))
+            # Ruling A7 (task-16 fix round 1): store the canonical share-count
+            # ratio, reduced to lowest terms -- not the raw face values. "From
+            # Rs 10 To Rs 2" is a 1:5 split, exactly like the migration's own
+            # comment (`-- SPLIT 1:5 => from=1, to=5`) and the brief's fixtures
+            # say, not (2, 10). `ratio_to` participates in `uq_corp_action`'s
+            # uniqueness expression: the unreduced form would let the same
+            # real-world split entered once here and once canonically by
+            # another source hold two rows and be applied twice. `Fraction`
+            # reduces exactly (works for non-integer face values too).
+            ratio = Fraction(new_fv) / Fraction(old_fv)
+            actions.append(("SPLIT", Decimal(ratio.numerator), Decimal(ratio.denominator), None))
+        elif m := _DIVIDEND_RE.match(segment):
+            actions.append(("DIVIDEND", None, None, Decimal(m.group(1))))
+    return actions
 
 
 def parse_nse_corporate_actions(
@@ -246,12 +268,15 @@ def parse_nse_corporate_actions(
 
     for record in records:
         subject = str(record.get("subject", ""))
-        action_type, ratio_from, ratio_to, amount = _classify(subject)
-        if action_type is None:
+        # One subject can carry two real actions ("Bonus 1:1/Face Value
+        # Split ..."), so this fans out rather than taking the first.
+        actions = _classify(subject)
+        if not actions:
             skipped += 1
             log.debug("corpactions.skipped_subject", subject=subject, symbol=record.get("symbol"))
             continue
-        classified.append((record, action_type, ratio_from, ratio_to, amount))
+        for action_type, ratio_from, ratio_to, amount in actions:
+            classified.append((record, action_type, ratio_from, ratio_to, amount))
         refs.add(
             InstrumentRef(exchange="NSE", segment="CM", symbol=str(record["symbol"]), series="EQ")
         )

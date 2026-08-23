@@ -244,6 +244,87 @@ Blank lines, scheme-type headers and AMC name lines are interleaved exactly as i
 
 ---
 
+## 5. NSE corporate actions
+
+**Verified 2026-08-20** by a live GET (task 16). Not part of the "four parsers" summary
+above — those are the EOD price/NAV formats; this is a separate, JSON, feed used for
+`corporate_actions`, and its parser (`parse_nse_corporate_actions` in
+`src/trading/corpactions/ingest.py`) is deliberately conservative — see below.
+
+### Access
+
+```
+https://www.nseindia.com/api/corporates-corporateActions?index=equities
+```
+
+Optionally `&from_date={DD-MM-YYYY}&to_date={DD-MM-YYYY}` to widen the window (default
+appears to be a forward-looking slice of a few weeks). Same cookie-priming sequence as
+§1 — a bare request to `nseindia.com` itself returned 403 in the verified session, but
+the priming `GET` still set enough cookies for the subsequent API call to return `200`.
+Response is a JSON array, not CSV/zip.
+
+### Schema — 14 fields per record, all strings (or `null`)
+
+```
+bcEndDate  bcStartDate  caBroadcastDate  comp  exDate  faceVal  ind
+isin  ndEndDate  ndStartDate  recDate  series  subject  symbol
+```
+
+Sample record (verified live, 2026-08-20):
+```json
+{"bcEndDate":"-","bcStartDate":"-","caBroadcastDate":null,"comp":"National Aluminium
+Company Limited","exDate":"24-Aug-2026","faceVal":"5","ind":"-",
+"isin":"INE139A01026","ndEndDate":"-","ndStartDate":"-","recDate":"24-Aug-2026",
+"series":"EQ","subject":"Dividend - Re 1 Per Share","symbol":"NATIONALUM"}
+```
+
+### There is no structured ratio or amount field
+
+Split/bonus ratios and dividend amounts are **not** exposed as numeric fields —
+only embedded in the free-text `subject` string. Across a 1,318-record sample spanning
+2026 (`from_date=01-01-2026&to_date=31-12-2026`), the observed `subject` shapes were:
+
+| Pattern | Example | Meaning |
+|---|---|---|
+| `Bonus X:Y` | `Bonus 1:2` | X new shares issued for every Y held |
+| `Face Value Split (Sub-Division) - From R[se] X/- Per Share To R[se] Y/- Per Share` | `...From Rs 10/- Per Share To Rs 2/- Per Share` | face value split from Rs X to Rs Y per share |
+| `(Interim )Dividend - R[se] X Per Share` | `Dividend - Rs 2 Per Share` | cash dividend of Rs X per share |
+| `Scheme Of Arrangement - Bonus Ncrps X:Y` | `Scheme Of Arrangement - Bonus Ncrps 4:1` | **not parsed** — this is a bonus issue of NCRPS (non-convertible redeemable preference shares), a different security class; its ratio has no verified meaning for an equity price series |
+
+`ratio_from`/`ratio_to` (`corporate_actions` columns, spec §4.3) are derived as:
+- **Bonus X:Y** → `ratio_from = Y`, `ratio_to = X + Y` (holder had Y, now has X+Y).
+- **Split "From X To Y"** → `ratio_from = Y`, `ratio_to = X` (X/Y as many shares after).
+
+Both reduce to the brief's convention (`factor = ratio_from/ratio_to` multiplies
+pre-action prices into post-action terms — a 1:5 split is `ratio_from=1, ratio_to=5`).
+
+`parse_nse_corporate_actions` recognises **only** the three patterns above (`ind`,
+`faceVal` and the rest are not used to derive the ratio). Any other `subject` —
+rights issues, mergers, demergers, symbol changes, "Scheme Of Arrangement" bonus
+variants, or a phrasing this parser has not been shown a live example of — is
+skipped and counted, never guessed at.
+
+### Dates and announcement timestamp
+
+- `exDate`/`recDate` — `DD-Mon-YYYY` (e.g. `24-Aug-2026`), or `-` for absent. Parsed
+  with an explicit month-abbreviation table (never `%b`/locale-dependent `strptime`,
+  per the same lesson as `AmfiNavHistorySource`).
+- `caBroadcastDate` — presumably the announcement timestamp, but was **`null` on every
+  one of the 1,318 sampled records**. `announced_at` is left `null` in every row this
+  parser produces as a result, which — per the `announced_at IS NULL` = "always known"
+  convention (`adjust.py`) — is the conservative choice: an unannounced action is
+  visible to every `as_of` query rather than none.
+- `series` was `EQ` on every sampled record; the parser resolves symbols as `NSE`/`CM`
+  equities unconditionally.
+
+### Regenerating this sample
+
+No script fetches this endpoint (fetch_recon_samples.sh only covers §1/§3); it was
+pulled with a one-off `curl` using the same cookie-priming sequence as §1 during task 16.
+Re-run that sequence against the URL above if this parser starts rejecting real feed data.
+
+---
+
 ## Regenerating samples
 
 `scripts/fetch_recon_samples.sh` re-downloads all five sample files into `data/raw/_recon/`. Run it if a parser test starts failing for reasons this document does not explain — the exchange may have changed the format again.

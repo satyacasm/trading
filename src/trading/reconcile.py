@@ -134,6 +134,18 @@ def check_calendar_completeness(conn: Connection, windows: Sequence[SourceWindow
 
     if gaps:
         return CheckResult("calendar_completeness", CheckStatus.FAIL, "; ".join(gaps))
+    if total_expected == 0:
+        # Ruling B8: a window whose expected trading-day set is empty (an
+        # unseeded exchange/segment, or a range entirely outside the seeded
+        # calendar) has nothing to be complete *about*. Reporting PASS there
+        # states "zero gaps" about a comparison that never ran.
+        return CheckResult(
+            "calendar_completeness",
+            CheckStatus.NOT_APPLICABLE,
+            f"0 trading day(s) expected across {len(windows)} source window(s) -- "
+            "the calendar is unseeded for every (exchange, segment, range) given, "
+            "so completeness is unverifiable",
+        )
     return CheckResult(
         "calendar_completeness",
         CheckStatus.PASS,
@@ -349,8 +361,29 @@ KNOWN_VALUES: tuple[KnownValue, ...] = (
 
 
 def check_cross_source_agreement(
-    conn: Connection, start: date, end: date, tolerance: Decimal = Decimal("0.05")
+    conn: Connection, start: date, end: date, tolerance: Decimal = Decimal("0.005")
 ) -> CheckResult:
+    """Compare each NSE stock future's stored `underlying_price` against the
+    same symbol's NSE CM close on the same session.
+
+    `tolerance` is RELATIVE (a fraction), not an absolute rupee amount. NSE's
+    `UndrlygPric` is a snapshot rather than the CM segment close, so the two
+    legitimately differ by a rounding-scale amount that grows with the price:
+    the first real run of this check flagged ABB at 7709.84 vs 7710.00 (0.16
+    rupees, 0.2 bp) beside 360ONE at 1179.38 vs 1180.00 (0.62 rupees, 5.3 bp)
+    as if they were different severities. They are the same defect-free
+    rounding; an absolute threshold cannot express that, so 564 of 1,866 rows
+    "disagreed" while nothing was actually wrong. A genuinely mismatched
+    underlying -- the failure this check exists to catch -- is off by percent,
+    not by basis points.
+
+    The 50 bp default sits above the widest close-versus-last-traded-price gap
+    seen across the first real days loaded (19.8 bp, PREMIERENE 1028.13 vs
+    1026.10) and one to two orders of magnitude below a real mismatch. It is
+    calibrated on days, not years, so it should be re-derived from the full
+    distribution once the backfill completes -- tightened if the tail stays
+    this narrow.
+    """
     # Task 17 found `bars_daily` had no `underlying_price` column at all, so
     # this check could only report NOT_APPLICABLE (see task-17-report.md
     # finding F3). Task 18, Ruling S2 fixed the gap: a migration
@@ -381,7 +414,9 @@ def check_cross_source_agreement(
         )
 
     violations = [
-        (symbol, ts, u, c) for symbol, ts, u, c in rows if abs(Decimal(u) - Decimal(c)) > tolerance
+        (symbol, ts, u, c)
+        for symbol, ts, u, c in rows
+        if Decimal(c) > 0 and abs(Decimal(u) - Decimal(c)) / Decimal(c) > tolerance
     ]
     if violations:
         sample = "; ".join(
@@ -392,15 +427,15 @@ def check_cross_source_agreement(
         return CheckResult(
             "cross_source_agreement",
             CheckStatus.FAIL,
-            f"{len(violations)}/{len(rows)} stock-future row(s) disagree with the NSE CM close by "
-            f"more than {tolerance} (substituted per Ruling B5 for the unavailable NIFTY-spot "
-            f"comparison -- see task-17-report.md for the empirical finding that NSE's own "
-            f"UndrlygPric does not always equal the CM segment close): {sample}{more}",
+            f"{len(violations)}/{len(rows)} stock-future row(s) disagree with the NSE CM close "
+            f"by more than {tolerance:.2%} (substituted per Ruling B5 for the unavailable "
+            f"NIFTY-spot comparison -- see task-17-report.md for the empirical finding that "
+            f"NSE's own UndrlygPric does not always equal the CM close): {sample}{more}",
         )
     return CheckResult(
         "cross_source_agreement",
         CheckStatus.PASS,
-        f"{len(rows)} stock-future/underlying pair(s) agree within {tolerance}",
+        f"{len(rows)} stock-future/underlying pair(s) agree within {tolerance:.2%}",
     )
 
 
@@ -411,33 +446,82 @@ def check_cross_source_agreement(
 _CORP_ACTION_TYPES = ("SPLIT", "BONUS", "DIVIDEND")
 
 
-def check_continuity(
-    conn: Connection, start: date, end: date, threshold: Decimal = Decimal("0.20")
-) -> CheckResult:
-    # Scoped to EQUITY only. Verified live (task-17-report.md): run
-    # unscoped against one real NSE FO day, ~8,000 option rows tripped this
-    # threshold -- options are leveraged/convex instruments for which a
-    # >20% single-day move is routine, not a data defect. Spec §8 item 4
-    # frames this check as the one that "catches split-adjustment bugs",
-    # which only ever happen on the underlying equity, so restricting to
-    # EQUITY keeps the check meaningful instead of drowning in options noise.
-    lower, upper = _range_bounds(start, end)
-    rows = conn.execute(
-        "SELECT b.instrument_id, i.exchange, i.segment, i.symbol, b.ts, b.close, b.prev_close "
-        "FROM bars_daily b JOIN instruments i ON i.instrument_id = b.instrument_id "
-        "WHERE i.asset_class = 'EQUITY' "
-        "AND b.prev_close IS NOT NULL AND b.prev_close > 0 "
-        "AND b.ts >= %s AND b.ts < %s "
-        "AND abs(b.close - b.prev_close) / b.prev_close > %s",
-        (lower, upper, threshold),
-    ).fetchall()
+_CONTINUITY_PAIRS = """
+WITH ordered AS (
+    SELECT b.instrument_id,
+           b.ts,
+           b.close,
+           LAG(b.close) OVER (PARTITION BY b.instrument_id ORDER BY b.ts) AS prev_close,
+           LAG(b.ts)    OVER (PARTITION BY b.instrument_id ORDER BY b.ts) AS prev_ts
+    FROM bars_daily b
+    JOIN instruments i ON i.instrument_id = b.instrument_id
+    WHERE i.asset_class = 'EQUITY' AND b.ts >= %s AND b.ts < %s
+),
+pairs AS (
+    SELECT * FROM ordered
+    WHERE prev_close IS NOT NULL AND prev_close > 0 AND ts - prev_ts <= %s
+)
+"""
 
-    if not rows:
+
+def check_continuity(
+    conn: Connection,
+    start: date,
+    end: date,
+    threshold: Decimal = Decimal("0.20"),
+    max_gap_days: int = 7,
+) -> CheckResult:
+    """Flag single-session equity moves beyond `threshold` that no corporate
+    action explains.
+
+    Scoped to EQUITY only. Verified live (task-17-report.md): run unscoped
+    against one real NSE FO day, ~8,000 option rows tripped this threshold --
+    options are leveraged/convex instruments for which a >20% single-day move
+    is routine, not a data defect. Spec §8 item 4 frames this check as the one
+    that "catches split-adjustment bugs", which only ever happen on the
+    underlying equity.
+
+    The move is computed from **our own previous stored bar**, never from the
+    source's `prev_close` column. The first real run of this check proved that
+    column untrustworthy on NSE's non-EQ series: METROPOLIS's block-deal (BL)
+    row carried `prev_close` 1944.00 against a 564.00 close (-71%), and
+    BURNPUR's BE row carried 1.00 against 21.35 (+2035%) -- both pure source
+    artifacts, neither a real move, and between them most of the check's first
+    ten "failures". A self-computed lag is also source-agnostic, so it keeps
+    working unchanged for BSE and MCX.
+
+    `max_gap_days` guards the other direction: a hole in the loaded history
+    (a partial backfill, an outage) would otherwise make two bars a month
+    apart look like one catastrophic session. Pairs further apart than this
+    are not single-day moves and are excluded from the comparison entirely --
+    counted as un-examined rather than silently passed.
+    """
+    lower, upper = _range_bounds(start, end)
+    max_gap = timedelta(days=max_gap_days)
+
+    examined_row = conn.execute(
+        _CONTINUITY_PAIRS + "SELECT count(*) FROM pairs", (lower, upper, max_gap)
+    ).fetchone()
+    examined = int(examined_row[0]) if examined_row else 0
+
+    if examined == 0:
+        # Ruling B8: PASS must mean "I looked at N pairs and found no
+        # violation", with N visible. Over zero pairs there is nothing to
+        # find, and a green row here is what someone points at when deciding
+        # the backfill can be trusted.
         return CheckResult(
             "continuity",
-            CheckStatus.PASS,
-            f"no single-day move beyond {threshold:.0%} in [{start}, {end}]",
+            CheckStatus.NOT_APPLICABLE,
+            f"0 bar pair(s) at most {max_gap_days} day(s) apart to compare in [{start}, {end}]",
         )
+
+    rows = conn.execute(
+        _CONTINUITY_PAIRS
+        + "SELECT p.instrument_id, i.exchange, i.segment, i.symbol, p.ts, p.close, p.prev_close "
+        "FROM pairs p JOIN instruments i ON i.instrument_id = p.instrument_id "
+        "WHERE abs(p.close - p.prev_close) / p.prev_close > %s",
+        (lower, upper, max_gap, threshold),
+    ).fetchall()
 
     unexplained: list[str] = []
     for instrument_id, exchange, segment, symbol, ts, close, prev_close in rows:
@@ -460,14 +544,14 @@ def check_continuity(
         return CheckResult(
             "continuity",
             CheckStatus.FAIL,
-            f"{len(unexplained)}/{len(rows)} move(s) beyond {threshold:.0%} have no matching "
-            f"corporate action: {sample}{more}",
+            f"{len(unexplained)}/{examined} examined pair(s) move beyond {threshold:.0%} with no "
+            f"matching corporate action: {sample}{more}",
         )
     return CheckResult(
         "continuity",
         CheckStatus.PASS,
-        f"{len(rows)} move(s) beyond {threshold:.0%} in [{start}, {end}], "
-        "all matched to a corporate action",
+        f"{examined} bar pair(s) examined in [{start}, {end}]; "
+        f"{len(rows)} move(s) beyond {threshold:.0%}, all matched to a corporate action",
     )
 
 
@@ -540,14 +624,38 @@ def check_idempotency(
             f"no completed {source_key} job with an archive in [{window_start}, {window_end}]",
         )
 
-    before_digest, before_count = _bars_checksum(conn, data_source, window_start, window_end)
+    # Archive existence is settled first, and outranks the empty-window guard
+    # below: a SUCCESS job whose raw bytes have vanished can never be
+    # re-verified by anyone, which is a failure whether or not the window
+    # currently holds rows.
+    missing_archives = [
+        f"{business_date}: archive missing at {archive_path}"
+        for business_date, archive_path in jobs
+        if not Path(archive_path).exists()
+    ]
+    if missing_archives:
+        return CheckResult(
+            "idempotency",
+            CheckStatus.FAIL,
+            f"{len(missing_archives)} archive file(s) missing, cannot verify: "
+            f"{'; '.join(missing_archives[:10])}",
+        )
 
-    missing_archives: list[str] = []
+    before_digest, before_count = _bars_checksum(conn, data_source, window_start, window_end)
+    if before_count == 0:
+        # Ruling B8: with no rows in the window, "re-loading changed nothing"
+        # is vacuously true -- both digests are the SHA-256 of an empty
+        # string. That is a green row proving nothing.
+        return CheckResult(
+            "idempotency",
+            CheckStatus.NOT_APPLICABLE,
+            f"0 row(s) in bars_daily for {source_key} in [{window_start}, {window_end}] -- "
+            f"{len(jobs)} SUCCESS job(s) claim this window, so a re-load has nothing to "
+            "compare against",
+        )
+
     for business_date, archive_path in jobs:
         path = Path(archive_path)
-        if not path.exists():
-            missing_archives.append(f"{business_date}: archive missing at {archive_path}")
-            continue
         content = path.read_bytes()
         payload = RawPayload(
             source_key=source_key,
@@ -561,14 +669,6 @@ def check_idempotency(
         batch = normalizer.normalize(parser.parse(payload), payload)
         outcome = validator.validate(batch)
         loader.load(outcome, conn)
-
-    if missing_archives:
-        return CheckResult(
-            "idempotency",
-            CheckStatus.FAIL,
-            f"{len(missing_archives)} archive file(s) missing, cannot verify: "
-            f"{'; '.join(missing_archives[:10])}",
-        )
 
     after_digest, after_count = _bars_checksum(conn, data_source, window_start, window_end)
 

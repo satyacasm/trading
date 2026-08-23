@@ -234,3 +234,64 @@ def test_option_type_without_strike_raises_validation_abort_not_checkviolation(d
     )
     with pytest.raises(ValidationAbort, match="option_type"):
         DbInstrumentResolver().resolve({ref}, db_conn)
+
+
+# ---------------------------------------------------------------------------
+# Descriptive identity (name, ISIN). Deliberately NOT part of InstrumentRef:
+# a company renaming must not mint a second instrument, so these are recorded
+# alongside the natural key rather than inside it -- the same separation
+# record_lot_sizes already makes for lot size.
+# ---------------------------------------------------------------------------
+
+
+def _stored(conn, canonical_key: str) -> tuple[str | None, str | None]:
+    row = conn.execute(
+        "SELECT name, isin FROM instruments WHERE canonical_key = %s", (canonical_key,)
+    ).fetchone()
+    assert row is not None
+    return row[0], row[1]
+
+
+def test_record_identity_fills_name_and_isin(db_conn):
+    resolver = DbInstrumentResolver()
+    ref = _ref("IDENTA")
+    resolver.resolve({ref}, db_conn)
+
+    resolver.record_identity(db_conn, {ref.canonical_key: ("Identa Industries", "INE001A01036")})
+
+    assert _stored(db_conn, ref.canonical_key) == ("Identa Industries", "INE001A01036")
+
+
+def test_record_identity_does_not_overwrite_what_is_already_stored(db_conn):
+    """First observation wins. The backfill walks each source's history in its
+    own order, so a later day must not flip a name back and forth; a genuine
+    rename needs point-in-time history, which this column cannot express."""
+    resolver = DbInstrumentResolver()
+    ref = _ref("IDENTB")
+    resolver.resolve({ref}, db_conn)
+    resolver.record_identity(db_conn, {ref.canonical_key: ("Original Name", "INE001A01036")})
+
+    resolver.record_identity(db_conn, {ref.canonical_key: ("Renamed Later", "INE999Z01011")})
+
+    assert _stored(db_conn, ref.canonical_key) == ("Original Name", "INE001A01036")
+
+
+def test_record_identity_fills_a_null_column_without_disturbing_a_filled_one(db_conn):
+    resolver = DbInstrumentResolver()
+    ref = _ref("IDENTC")
+    resolver.resolve({ref}, db_conn)
+    resolver.record_identity(db_conn, {ref.canonical_key: ("Known Name", None)})
+
+    resolver.record_identity(db_conn, {ref.canonical_key: ("Ignored Name", "INE555Q01019")})
+
+    assert _stored(db_conn, ref.canonical_key) == ("Known Name", "INE555Q01019")
+
+
+def test_record_identity_ignores_keys_that_do_not_exist(db_conn):
+    resolver = DbInstrumentResolver()
+    written = resolver.record_identity(db_conn, {"NSE:CM:NOSUCHTHING": ("Ghost", "INE000A01001")})
+    assert written == 0
+
+
+def test_record_identity_with_nothing_to_record_is_a_no_op(db_conn):
+    assert DbInstrumentResolver().record_identity(db_conn, {}) == 0

@@ -101,6 +101,38 @@ class BarLoader:
         mapping = self._resolver.resolve(refs, conn)
         created = len(refs) - existing
 
+        # Every normalizer already computes name and isin into the canonical
+        # frame; before this they were dropped here, leaving every instrument
+        # in the warehouse holding a bare ticker. Recorded separately from the
+        # natural key (see DbInstrumentResolver.record_identity) because a
+        # rename must not mint a second instrument. Later days fill gaps left
+        # by instruments created before a source carried either field.
+        identity: dict[str, tuple[str | None, str | None]] = {}
+        for r in frame.select(
+            "exchange",
+            "segment",
+            "symbol",
+            "series",
+            "expiry",
+            "strike",
+            "option_type",
+            "name",
+            "isin",
+        ).to_dicts():
+            if r["name"] is None and r["isin"] is None:
+                continue
+            key = InstrumentRef(
+                exchange=r["exchange"],
+                segment=r["segment"],
+                symbol=r["symbol"],
+                series=r["series"],
+                expiry=r["expiry"],
+                strike=r["strike"],
+                option_type=r["option_type"],
+            ).canonical_key
+            identity.setdefault(key, (r["name"], r["isin"]))
+        self._resolver.record_identity(conn, identity)
+
         source_id = int(self._source)
         rows = []
         lot_rows = []

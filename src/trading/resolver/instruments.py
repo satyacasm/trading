@@ -156,6 +156,48 @@ class DbInstrumentResolver:
         log.info("instruments.created", count=len(created))
         return created
 
+    def record_identity(
+        self, conn: Connection, meta: dict[str, tuple[str | None, str | None]]
+    ) -> int:
+        """Fill in each instrument's display name and ISIN.
+
+        Deliberately separate from `InstrumentRef`: these are descriptive,
+        not identifying. Folding them into the natural key would mint a
+        second instrument the day a company renames itself, and would make
+        `canonical_key` depend on a free-text field the exchange edits at
+        will. `record_lot_sizes` draws the same line for lot size.
+
+        First observation wins -- COALESCE only fills a column that is still
+        NULL. The backfill walks each source's history in its own order and
+        re-runs days freely, so last-write-wins would let a name flip back
+        and forth depending on which leg ran last. A genuine rename needs
+        point-in-time history the way lot size has it, in its own dated
+        table; a single mutable column cannot express one honestly, so it
+        does not try.
+
+        Returns the number of rows actually updated, which is zero once
+        every instrument in the batch is already described.
+        """
+        if not meta:
+            return 0
+        keys = list(meta)
+        with conn.cursor() as cur:
+            # One statement over arrays rather than an executemany: an F&O
+            # day resolves ~35,000 contracts, and the NULL predicate keeps
+            # this near-free on every day after the first time an instrument
+            # is described.
+            cur.execute(
+                "UPDATE instruments i SET"
+                " name = COALESCE(i.name, v.name), isin = COALESCE(i.isin, v.isin)"
+                " FROM (SELECT unnest(%s::text[]) AS key, unnest(%s::text[]) AS name,"
+                " unnest(%s::text[]) AS isin) v"
+                " WHERE i.canonical_key = v.key"
+                " AND (i.name IS NULL OR i.isin IS NULL)"
+                " AND (v.name IS NOT NULL OR v.isin IS NOT NULL)",
+                (keys, [meta[k][0] for k in keys], [meta[k][1] for k in keys]),
+            )
+            return cur.rowcount if cur.rowcount > 0 else 0
+
     def record_lot_sizes(self, conn: Connection, lot_rows: list[tuple[int, date, int]]) -> int:
         """Append a lot-history row only when the lot size actually changed.
 

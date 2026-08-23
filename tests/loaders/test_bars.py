@@ -21,6 +21,8 @@ def _outcome(
     segment: str = "CM",
     asset_class: str = "EQUITY",
     expiry: date | None = None,
+    name: str | None = None,
+    isin: str | None = None,
 ) -> ValidationOutcome:
     row: dict[str, object] = {c: None for c in CANONICAL_BAR_SCHEMA}
     row.update(
@@ -38,6 +40,8 @@ def _outcome(
         underlying_price=Decimal(underlying_price) if underlying_price is not None else None,
         volume=1000,
         lot_size=1,
+        name=name,
+        isin=isin,
     )
     return ValidationOutcome(valid=pl.DataFrame([row], schema=CANONICAL_BAR_SCHEMA))
 
@@ -193,3 +197,45 @@ def test_series_absent_leaves_the_column_null(db_conn):
     _loader().load(_outcome(symbol="NOSERIESTEST"), db_conn)
     row = db_conn.execute("SELECT series FROM instruments WHERE symbol='NOSERIESTEST'").fetchone()
     assert row == (None,)
+
+
+# ---------------------------------------------------------------------------
+# Every normalizer computes `name` and `isin` into the canonical frame, but
+# nothing carried them to the instruments table -- all 77,000 instruments in
+# the warehouse had a ticker and nothing else. For a mutual fund whose symbol
+# is the opaque scheme code 152111, the name and ISIN are the only way to tell
+# what the row even is.
+# ---------------------------------------------------------------------------
+
+
+def test_load_records_the_instrument_name_and_isin(db_conn):
+    _loader().load(
+        _outcome(symbol="NAMEDCO", name="Named Company Ltd", isin="INE001A01036"), db_conn
+    )
+    row = db_conn.execute(
+        "SELECT name, isin FROM instruments WHERE symbol = %s", ("NAMEDCO",)
+    ).fetchone()
+    assert row == ("Named Company Ltd", "INE001A01036")
+
+
+def test_load_leaves_identity_null_when_the_source_carries_none(db_conn):
+    _loader().load(_outcome(symbol="ANONCO"), db_conn)
+    row = db_conn.execute(
+        "SELECT name, isin FROM instruments WHERE symbol = %s", ("ANONCO",)
+    ).fetchone()
+    assert row == (None, None)
+
+
+def test_a_later_load_fills_identity_that_was_missing_before(db_conn):
+    """The backfill created most instruments before this existed, so a later
+    day touching the same instrument must be able to fill the gap in."""
+    loader = _loader()
+    loader.load(_outcome(symbol="LATEFILL"), db_conn)
+    loader.load(
+        _outcome(symbol="LATEFILL", close="106", name="Late Fill Ltd", isin="INE7Z"), db_conn
+    )
+
+    row = db_conn.execute(
+        "SELECT name, isin FROM instruments WHERE symbol = %s", ("LATEFILL",)
+    ).fetchone()
+    assert row == ("Late Fill Ltd", "INE7Z")

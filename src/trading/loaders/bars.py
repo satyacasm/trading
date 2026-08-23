@@ -42,6 +42,32 @@ STAGING_COLUMNS = (
 _REQUIRED_NOT_NULL = ("open", "high", "low", "close")
 
 
+def identity_map(frame: pl.DataFrame) -> dict[str, tuple[str | None, str | None]]:
+    """Extract canonical_key -> (name, isin) from a canonical bar frame.
+
+    Rows carrying neither field are skipped so they cannot mask a row that
+    does carry one. First row wins within a batch, matching
+    `DbInstrumentResolver.record_identity`'s first-observation-wins rule.
+    """
+    identity: dict[str, tuple[str | None, str | None]] = {}
+    for r in frame.select(
+        "exchange", "segment", "symbol", "series", "expiry", "strike", "option_type", "name", "isin"
+    ).to_dicts():
+        if r["name"] is None and r["isin"] is None:
+            continue
+        key = InstrumentRef(
+            exchange=r["exchange"],
+            segment=r["segment"],
+            symbol=r["symbol"],
+            series=r["series"],
+            expiry=r["expiry"],
+            strike=r["strike"],
+            option_type=r["option_type"],
+        ).canonical_key
+        identity.setdefault(key, (r["name"], r["isin"]))
+    return identity
+
+
 class BarLoader:
     """`Loader` for canonical bar rows: COPY to a staging table, one upsert.
 
@@ -107,31 +133,7 @@ class BarLoader:
         # natural key (see DbInstrumentResolver.record_identity) because a
         # rename must not mint a second instrument. Later days fill gaps left
         # by instruments created before a source carried either field.
-        identity: dict[str, tuple[str | None, str | None]] = {}
-        for r in frame.select(
-            "exchange",
-            "segment",
-            "symbol",
-            "series",
-            "expiry",
-            "strike",
-            "option_type",
-            "name",
-            "isin",
-        ).to_dicts():
-            if r["name"] is None and r["isin"] is None:
-                continue
-            key = InstrumentRef(
-                exchange=r["exchange"],
-                segment=r["segment"],
-                symbol=r["symbol"],
-                series=r["series"],
-                expiry=r["expiry"],
-                strike=r["strike"],
-                option_type=r["option_type"],
-            ).canonical_key
-            identity.setdefault(key, (r["name"], r["isin"]))
-        self._resolver.record_identity(conn, identity)
+        self._resolver.record_identity(conn, identity_map(frame))
 
         source_id = int(self._source)
         rows = []

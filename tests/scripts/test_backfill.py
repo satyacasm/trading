@@ -64,3 +64,53 @@ def test_without_bootstrap_a_later_day_still_aborts_on_an_absurd_batch(db_conn):
     refs = {_ref(f"NOFLAG{i}") for i in range(11)}
     with pytest.raises(ValidationAbort, match="new instruments"):
         resolver.resolve(refs, db_conn)
+
+
+# ---------------------------------------------------------------------------
+# --max-new (found live). --bootstrap covers only a run's FIRST day, which is
+# not enough for a from-empty F&O backfill: an ordinary expiry-rollover day
+# lists a whole new strike ladder across ~180 underlyings, and 42 days failed
+# with "batch would create 10,619 / 13,867 / 15,993 new instruments". Because
+# a failed day rolls back, the next day's count only grows, so one tripped
+# guard cascades into every day after it.
+# ---------------------------------------------------------------------------
+
+
+def test_max_new_flag_is_parsed():
+    args = backfill._parse_args(
+        [
+            "--source",
+            "nse_fo_udiff",
+            "--from",
+            "2024-07-01",
+            "--to",
+            "2024-07-01",
+            "--max-new",
+            "40000",
+        ]
+    )
+    assert args.max_new == 40000
+
+
+def test_max_new_defaults_to_none_so_the_guard_keeps_its_own_default():
+    args = backfill._parse_args(
+        ["--source", "nse_fo_udiff", "--from", "2024-07-01", "--to", "2024-07-01"]
+    )
+    assert args.max_new is None
+
+
+def test_raising_the_cap_admits_a_batch_the_default_would_refuse(db_conn):
+    _pipeline, resolver = backfill.SOURCE_SPECS["nse_fo_udiff"].build()
+    resolver.set_creation_cap(10)
+    refs = {_ref(f"CAPUP{i}") for i in range(11)}
+    with pytest.raises(ValidationAbort):
+        resolver.resolve(refs, db_conn)
+
+    resolver.set_creation_cap(50)
+    assert len(resolver.resolve(refs, db_conn)) == 11
+
+
+def test_the_cap_must_be_positive():
+    _pipeline, resolver = backfill.SOURCE_SPECS["nse_fo_udiff"].build()
+    with pytest.raises(ValueError, match="positive"):
+        resolver.set_creation_cap(0)

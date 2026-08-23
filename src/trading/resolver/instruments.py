@@ -36,6 +36,28 @@ class DbInstrumentResolver:
         self._cache: dict[str, int] = {}
         self._bootstrap_next_call = False
 
+    def set_creation_cap(self, limit: int) -> None:
+        """Set how many new instruments one batch may mint before aborting.
+
+        `--bootstrap` covers a run's FIRST day only, which is enough for a
+        source whose universe is then stable. It is NOT enough for a
+        from-empty F&O backfill: an ordinary expiry-rollover day lists a whole
+        new strike ladder across ~180 underlyings, so 42 days failed with
+        10,619 / 13,867 / 15,993 new instruments -- and because a failed day
+        rolls back, the next day's count only grows, cascading one tripped
+        guard into every day after it.
+
+        During a from-empty backfill this guard cannot actually discriminate:
+        a day's file holds ~34,000 contracts, so a parser fault minting one
+        garbage key per row looks exactly like a legitimate first day. Raising
+        the cap is therefore an explicit, per-run operator decision rather
+        than something a pipeline does for itself, and the 5,000 default
+        stays armed for daily incremental runs, where it means something.
+        """
+        if limit <= 0:
+            raise ValueError(f"instrument creation cap must be positive, got {limit}")
+        self._max_new = limit
+
     def bootstrap_next_call(self) -> None:
         """Arm `bootstrap=True` for exactly the next `resolve()` call.
 

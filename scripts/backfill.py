@@ -207,6 +207,19 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "re-run of a later range, where an absurd batch is a real bug."
         ),
     )
+    parser.add_argument(
+        "--max-new",
+        type=int,
+        default=None,
+        help=(
+            "Raise DbInstrumentResolver.max_new_per_batch for this run "
+            "(default: the resolver's own 5,000). --bootstrap covers only the "
+            "first day; a from-empty F&O backfill needs a higher cap on every "
+            "day, because an expiry rollover legitimately lists a whole new "
+            "strike ladder. Pass this for a historical backfill only -- for "
+            "daily incremental runs the 5,000 default is a real guard."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -214,6 +227,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     spec = SOURCE_SPECS[args.source]
     pipeline, resolver = spec.build()
+    if args.max_new is not None:
+        resolver.set_creation_cap(args.max_new)
     # `Pipeline.source_key` is a read-only @property; `_PipelineLike` (a
     # pipeline-local Protocol in trading.pipeline.backfill, out of this
     # task's scope to widen) declares it as a plain settable attribute, so

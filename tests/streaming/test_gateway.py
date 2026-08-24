@@ -78,3 +78,53 @@ def test_ws_does_not_forward_a_tick_for_an_unsubscribed_instrument(
 
         received = json.loads(ws.receive_text())
         assert received == {"instrument_id": other_id}
+
+
+def test_ws_skips_a_malformed_frame_and_stays_connected(
+    client: TestClient, seeded_instrument_id: int, redis_client: redis.Redis
+) -> None:
+    """A non-JSON frame must be logged and skipped, never crash the
+    connection -- `receive_json()` raises on it if unhandled."""
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text("not json")
+
+        ws.send_json({"action": "subscribe", "instrument_id": seeded_instrument_id})
+        published = {"instrument_id": seeded_instrument_id, "price": "1"}
+        redis_client.publish(f"ticks:{seeded_instrument_id}", json.dumps(published))
+
+        received = json.loads(ws.receive_text())
+        assert received == published
+
+
+def test_ws_skips_a_non_object_json_frame_and_stays_connected(
+    client: TestClient, seeded_instrument_id: int, redis_client: redis.Redis
+) -> None:
+    """Valid JSON that isn't an object (e.g. a bare array) must not crash
+    the connection -- `.get()` on a non-dict raises `AttributeError` if
+    unhandled."""
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json([1, 2, 3])
+
+        ws.send_json({"action": "subscribe", "instrument_id": seeded_instrument_id})
+        published = {"instrument_id": seeded_instrument_id, "price": "1"}
+        redis_client.publish(f"ticks:{seeded_instrument_id}", json.dumps(published))
+
+        received = json.loads(ws.receive_text())
+        assert received == published
+
+
+def test_ws_rejects_a_non_hashable_instrument_id_and_stays_connected(
+    client: TestClient, seeded_instrument_id: int, redis_client: redis.Redis
+) -> None:
+    """A non-hashable `instrument_id` (e.g. a JSON array) must not crash the
+    connection -- `subscribed.add(...)` raises `TypeError` on it if
+    unhandled."""
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"action": "subscribe", "instrument_id": [1, 2]})
+
+        ws.send_json({"action": "subscribe", "instrument_id": seeded_instrument_id})
+        published = {"instrument_id": seeded_instrument_id, "price": "1"}
+        redis_client.publish(f"ticks:{seeded_instrument_id}", json.dumps(published))
+
+        received = json.loads(ws.receive_text())
+        assert received == published

@@ -102,10 +102,22 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 
     try:
         while True:
-            message = await websocket.receive_json()
+            try:
+                message = await websocket.receive_json()
+            except WebSocketDisconnect:
+                raise
+            except Exception:  # noqa: BLE001 - one bad client frame is skipped, never fatal
+                log.warning("gateway.malformed_client_message", exc_info=True)
+                continue
+            if not isinstance(message, dict):
+                log.warning("gateway.malformed_client_message", reason="not a JSON object")
+                continue
             action = message.get("action")
             instrument_id = message.get("instrument_id")
-            if instrument_id is None:
+            # bool is a subclass of int in Python, so exclude it explicitly --
+            # otherwise `{"instrument_id": true}` would silently pass as 1.
+            if not isinstance(instrument_id, int) or isinstance(instrument_id, bool):
+                log.warning("gateway.bad_instrument_id", value=repr(instrument_id))
                 continue
             if action == "subscribe":
                 subscribed.add(instrument_id)

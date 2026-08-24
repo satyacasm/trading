@@ -465,8 +465,9 @@ WITH ordered AS (
     SELECT b.instrument_id,
            b.ts,
            b.close,
-           LAG(b.close) OVER (PARTITION BY b.instrument_id ORDER BY b.ts) AS prev_close,
-           LAG(b.ts)    OVER (PARTITION BY b.instrument_id ORDER BY b.ts) AS prev_ts
+           LAG(b.close)  OVER (PARTITION BY b.instrument_id ORDER BY b.ts) AS prev_close,
+           LAG(b.ts)     OVER (PARTITION BY b.instrument_id ORDER BY b.ts) AS prev_ts,
+           LEAD(b.close) OVER (PARTITION BY b.instrument_id ORDER BY b.ts) AS next_close
     FROM bars_daily b
     JOIN instruments i ON i.instrument_id = b.instrument_id
     WHERE i.asset_class = 'EQUITY' AND b.ts >= %s AND b.ts < %s
@@ -484,31 +485,46 @@ def check_continuity(
     end: date,
     threshold: Decimal = Decimal("0.20"),
     max_gap_days: int = 7,
+    tick_size: Decimal = Decimal("0.05"),
+    revert_tolerance: Decimal = Decimal("0.10"),
 ) -> CheckResult:
-    """Flag single-session equity moves beyond `threshold` that no corporate
-    action explains.
+    """Classify every large single-session equity move by its SHAPE.
 
     Scoped to EQUITY only. Verified live (task-17-report.md): run unscoped
     against one real NSE FO day, ~8,000 option rows tripped this threshold --
-    options are leveraged/convex instruments for which a >20% single-day move
-    is routine, not a data defect. Spec §8 item 4 frames this check as the one
-    that "catches split-adjustment bugs", which only ever happen on the
-    underlying equity.
+    options are leveraged instruments for which a >20% single-day move is
+    routine, not a data defect.
 
-    The move is computed from **our own previous stored bar**, never from the
-    source's `prev_close` column. The first real run of this check proved that
-    column untrustworthy on NSE's non-EQ series: METROPOLIS's block-deal (BL)
-    row carried `prev_close` 1944.00 against a 564.00 close (-71%), and
-    BURNPUR's BE row carried 1.00 against 21.35 (+2035%) -- both pure source
-    artifacts, neither a real move, and between them most of the check's first
-    ten "failures". A self-computed lag is also source-agnostic, so it keeps
-    working unchanged for BSE and MCX.
+    The move is computed from our own previous stored bar, never from the
+    source's `prev_close`. That column is untrustworthy on NSE's non-EQ
+    series: METROPOLIS's block-deal row carried `prev_close` 1944.00 against a
+    564.00 close (-71%), BURNPUR's BE row carried 1.00 against 21.35 (+2035%),
+    and between them they were most of this check's first ten "failures". A
+    self-computed lag is also source-agnostic, so it keeps working for BSE and
+    MCX. `max_gap_days` guards the other direction: a hole in the loaded
+    history would otherwise make two bars a month apart look like one
+    catastrophic session.
 
-    `max_gap_days` guards the other direction: a hole in the loaded history
-    (a partial backfill, an outage) would otherwise make two bars a month
-    apart look like one catastrophic session. Pairs further apart than this
-    are not single-day moves and are excluded from the comparison entirely --
-    counted as un-examined rather than silently passed.
+    A bare "moved more than `threshold`" rule is not enough, though, and the
+    full decade proved it. With every NSE corporate action loaded, 5,030 moves
+    still had no explanation -- and the largest of them was BIRLACOT going
+    from 5 paise to 10 paise. So each jump is classified instead:
+
+    - `tick`  -- the whole move is one tick or less. At 5 paise a single tick
+                 IS 100%, so no percentage threshold can call this a defect
+                 without condemning every penny stock. Counted, never failed.
+    - `spike` -- the price returns to roughly where it started next session.
+                 A bad print looks like this; a corporate action never does,
+                 because a split does not un-split. Always a failure, and
+                 deliberately NOT excusable by a corporate action on the same
+                 date, or a real defect could hide behind a coincidental
+                 ex-date.
+    - `step`  -- the price stays at its new level. This is the shape of the
+                 split-adjustment bug spec §8 item 4 is really about, so it
+                 fails unless a corporate action explains it.
+
+    Every pair lands in exactly one bucket and every bucket is counted in the
+    result, so nothing is quietly dropped on the way to a green check.
     """
     lower, upper = _range_bounds(start, end)
     max_gap = timedelta(days=max_gap_days)
@@ -531,42 +547,56 @@ def check_continuity(
 
     rows = conn.execute(
         _CONTINUITY_PAIRS
-        + "SELECT p.instrument_id, i.exchange, i.segment, i.symbol, p.ts, p.close, p.prev_close "
-        "FROM pairs p JOIN instruments i ON i.instrument_id = p.instrument_id "
+        + "SELECT p.instrument_id, i.exchange, i.segment, i.symbol, p.ts, p.close, p.prev_close,"
+        " p.next_close FROM pairs p JOIN instruments i ON i.instrument_id = p.instrument_id "
         "WHERE abs(p.close - p.prev_close) / p.prev_close > %s",
         (lower, upper, max_gap, threshold),
     ).fetchall()
 
-    unexplained: list[str] = []
-    for instrument_id, exchange, segment, symbol, ts, close, prev_close in rows:
+    ticks = explained = 0
+    failures: list[str] = []
+    spikes = steps = 0
+
+    for instrument_id, exchange, segment, symbol, ts, close, prev_close, next_close in rows:
+        move = abs(close - prev_close)
+        if move <= tick_size:
+            ticks += 1
+            continue
+
         row_date = ts.astimezone(IST).date()
+        pct = (close - prev_close) / prev_close
+        reverted = (
+            next_close is not None and abs(next_close - prev_close) / prev_close <= revert_tolerance
+        )
+
+        if reverted:
+            spikes += 1
+            failures.append(
+                f"{exchange}/{segment}/{symbol} {row_date}: {pct:+.1%} then back (spike)"
+            )
+            continue
+
         matched = conn.execute(
             "SELECT 1 FROM corporate_actions WHERE instrument_id=%s "
             "AND action_type = ANY(%s) AND ex_date = %s LIMIT 1",
             (instrument_id, list(_CORP_ACTION_TYPES), row_date),
         ).fetchone()
-        if matched is None:
-            pct = (close - prev_close) / prev_close
-            unexplained.append(
-                f"{exchange}/{segment}/{symbol} {row_date}: {pct:+.1%} "
-                "(no matching corporate action)"
-            )
+        if matched is not None:
+            explained += 1
+            continue
+        steps += 1
+        failures.append(f"{exchange}/{segment}/{symbol} {row_date}: {pct:+.1%} (step)")
 
-    if unexplained:
-        sample = "; ".join(unexplained[:10])
-        more = f" (+{len(unexplained) - 10} more)" if len(unexplained) > 10 else ""
-        return CheckResult(
-            "continuity",
-            CheckStatus.FAIL,
-            f"{len(unexplained)}/{examined} examined pair(s) move beyond {threshold:.0%} with no "
-            f"matching corporate action: {sample}{more}",
-        )
-    return CheckResult(
-        "continuity",
-        CheckStatus.PASS,
-        f"{examined} bar pair(s) examined in [{start}, {end}]; "
-        f"{len(rows)} move(s) beyond {threshold:.0%}, all matched to a corporate action",
+    census = (
+        f"{examined} pair(s) examined; {len(rows)} beyond {threshold:.0%} "
+        f"({ticks} tick, {explained} explained, {steps} step, {spikes} spike)"
     )
+
+    if failures:
+        sample = "; ".join(failures[:10])
+        more = f" (+{len(failures) - 10} more)" if len(failures) > 10 else ""
+        return CheckResult("continuity", CheckStatus.FAIL, f"{census}: {sample}{more}")
+    return CheckResult("continuity", CheckStatus.PASS, census)
 
 
 # ---------------------------------------------------------------------------

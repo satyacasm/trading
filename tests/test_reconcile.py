@@ -411,7 +411,7 @@ def test_continuity_passes_when_move_matches_a_corporate_action(db_conn):
 
     result = check_continuity(db_conn, date(1998, 8, 12), date(1998, 8, 13))
     assert result.status == CheckStatus.PASS
-    assert "matched" in result.detail
+    assert "1 explained" in result.detail
 
 
 # ---------------------------------------------------------------------------
@@ -1062,3 +1062,107 @@ def test_idempotency_lifts_the_decompression_cap_for_its_own_transaction(db_conn
 
     row = db_conn.execute("SHOW timescaledb.max_tuples_decompressed_per_dml_transaction").fetchone()
     assert row is not None and row[0] == "0"
+
+
+# ---------------------------------------------------------------------------
+# A flat "moved more than 20%" rule asks the wrong question. Now that a decade
+# of corporate actions is actually loaded, the 5,030 residual jumps are not
+# unrecorded splits -- they are a five-paisa stock moving one paisa, and
+# trade-to-trade series where a 20% day is ordinary. The useful distinction is
+# the SHAPE of the move:
+#
+#   step  -- the price stays at the new level. An unrecorded corporate action
+#            looks like this, and it is what spec §8 item 4 is really after.
+#   spike -- the price returns next session. A bad tick looks like this.
+#   tick  -- the move is a single tick on a price so low that one tick is
+#            already over the threshold. Arithmetic, not a defect.
+#
+# Every pair is classified and counted; none is silently dropped.
+# ---------------------------------------------------------------------------
+
+
+def _three_bars(db_conn, symbol: str, closes: tuple[str, str, str]) -> None:
+    _load(
+        db_conn,
+        [
+            _bar_row(
+                symbol=symbol, ts=datetime(1998, 8, d, 10, 0, tzinfo=UTC), close=c, series="EQ"
+            )
+            for d, c in zip((11, 12, 13), closes, strict=True)
+        ],
+    )
+
+
+def test_a_permanent_drop_with_no_corporate_action_still_fails(db_conn):
+    """The split-adjustment bug the check exists to catch: the price halves
+    and stays halved, and nothing on file explains it."""
+    _three_bars(db_conn, "CONTSTEP", ("100.00", "50.00", "51.00"))
+
+    result = check_continuity(db_conn, date(1998, 8, 11), date(1998, 8, 13))
+
+    assert result.status == CheckStatus.FAIL
+    assert "CONTSTEP" in result.detail
+    assert "step" in result.detail
+
+
+def test_a_price_that_returns_next_session_is_reported_as_a_spike(db_conn):
+    """A bad tick, not a corporate action -- a split never un-splits."""
+    _three_bars(db_conn, "CONTSPIKE", ("100.00", "50.00", "100.00"))
+
+    result = check_continuity(db_conn, date(1998, 8, 11), date(1998, 8, 13))
+
+    assert result.status == CheckStatus.FAIL
+    assert "CONTSPIKE" in result.detail
+    assert "spike" in result.detail
+
+
+def test_a_single_tick_on_a_sub_rupee_price_is_counted_not_failed(db_conn):
+    """BIRLACOT, the largest 'anomaly' in ten years: 0.05 -> 0.10 is one tick,
+    and arithmetically 100%. No threshold can call this a defect without
+    calling every penny stock one."""
+    _three_bars(db_conn, "CONTTICK", ("0.05", "0.10", "0.05"))
+
+    result = check_continuity(db_conn, date(1998, 8, 11), date(1998, 8, 13))
+
+    assert result.status == CheckStatus.PASS
+    assert "tick" in result.detail
+
+
+def test_tick_noise_is_counted_in_the_detail_rather_than_vanishing(db_conn):
+    _three_bars(db_conn, "CONTTICK2", ("0.05", "0.10", "0.05"))
+
+    result = check_continuity(db_conn, date(1998, 8, 11), date(1998, 8, 13))
+
+    assert "2 tick" in result.detail, result.detail
+
+
+def test_a_corporate_action_still_explains_a_step(db_conn):
+    _three_bars(db_conn, "CONTSPLIT2", ("100.00", "50.00", "51.00"))
+    iid = _instrument_id(db_conn, "NSE", "CM", "CONTSPLIT2")
+    db_conn.execute(
+        "INSERT INTO corporate_actions (instrument_id, action_type, ex_date, ratio_from, "
+        "ratio_to, source) VALUES (%s,'SPLIT',%s,1,2,'test')",
+        (iid, date(1998, 8, 12)),
+    )
+
+    result = check_continuity(db_conn, date(1998, 8, 11), date(1998, 8, 13))
+
+    assert result.status == CheckStatus.PASS
+
+
+def test_a_spike_is_never_excused_by_a_corporate_action(db_conn):
+    """A split does not reverse itself the next day. If the price came back,
+    the corporate action is not what moved it, and a real defect would
+    otherwise hide behind a coincidental ex-date."""
+    _three_bars(db_conn, "CONTFAKE", ("100.00", "50.00", "100.00"))
+    iid = _instrument_id(db_conn, "NSE", "CM", "CONTFAKE")
+    db_conn.execute(
+        "INSERT INTO corporate_actions (instrument_id, action_type, ex_date, ratio_from, "
+        "ratio_to, source) VALUES (%s,'SPLIT',%s,1,2,'test')",
+        (iid, date(1998, 8, 12)),
+    )
+
+    result = check_continuity(db_conn, date(1998, 8, 11), date(1998, 8, 13))
+
+    assert result.status == CheckStatus.FAIL
+    assert "spike" in result.detail

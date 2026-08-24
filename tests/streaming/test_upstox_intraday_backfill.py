@@ -9,6 +9,7 @@ import pytest
 from trading.contracts import DataSource
 from trading.streaming.upstox_intraday_backfill import (
     BackfillCandle,
+    backfill_symbol,
     fetch_candles,
     month_windows,
     parse_candle_response,
@@ -273,3 +274,116 @@ def test_write_backfill_candle_upserts_rather_than_duplicates(db_conn, fixture_i
 
     assert len(rows) == 1
     assert rows[0][0] == Decimal("2")
+
+
+def test_backfill_symbol_writes_candles_across_windows_and_reports_count(
+    db_conn, fixture_instrument_id
+):
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {"candles": [["2022-01-15T09:15:00+05:30", 1.0, 1.0, 1.0, 1.0, 1, 0]]},
+            },
+        )
+
+    client = _mock_client(handler)
+    sleeps: list[float] = []
+
+    report = backfill_symbol(
+        db_conn,
+        client,
+        instrument_key="NSE_EQ|INE002A01018",
+        instrument_id=fixture_instrument_id,
+        token="tok",
+        start=date(2022, 1, 1),
+        end=date(2022, 1, 31),
+        sleep=sleeps.append,
+    )
+
+    assert call_count["n"] == 1  # single-month window
+    assert report.candles_written == 1
+    assert report.skipped_windows == []
+    assert report.instrument_key == "NSE_EQ|INE002A01018"
+
+
+def test_backfill_symbol_retries_once_then_skips_on_persistent_transient_failure(
+    db_conn, fixture_instrument_id
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="server error")
+
+    client = _mock_client(handler)
+    sleeps: list[float] = []
+
+    report = backfill_symbol(
+        db_conn,
+        client,
+        instrument_key="NSE_EQ|INE002A01018",
+        instrument_id=fixture_instrument_id,
+        token="tok",
+        start=date(2022, 1, 1),
+        end=date(2022, 1, 31),
+        sleep=sleeps.append,
+    )
+
+    assert report.candles_written == 0
+    assert report.skipped_windows == [(date(2022, 1, 1), date(2022, 1, 31))]
+    assert 2.0 in sleeps  # the retry backoff
+
+
+def test_backfill_symbol_aborts_immediately_on_401(db_conn, fixture_instrument_id):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "bad token"})
+
+    client = _mock_client(handler)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        backfill_symbol(
+            db_conn,
+            client,
+            instrument_key="NSE_EQ|INE002A01018",
+            instrument_id=fixture_instrument_id,
+            token="badtoken",
+            start=date(2022, 1, 1),
+            end=date(2022, 3, 31),
+            sleep=lambda _: None,
+        )
+
+
+def test_backfill_symbol_continues_past_a_skipped_window_to_the_next(
+    db_conn, fixture_instrument_id
+):
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if "2022-01-31" in str(request.url):
+            return httpx.Response(500, text="server error")
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {"candles": [["2022-02-01T09:15:00+05:30", 1.0, 1.0, 1.0, 1.0, 1, 0]]},
+            },
+        )
+
+    client = _mock_client(handler)
+
+    report = backfill_symbol(
+        db_conn,
+        client,
+        instrument_key="NSE_EQ|INE002A01018",
+        instrument_id=fixture_instrument_id,
+        token="tok",
+        start=date(2022, 1, 1),
+        end=date(2022, 2, 28),
+        sleep=lambda _: None,
+    )
+
+    assert report.candles_written == 1
+    assert report.skipped_windows == [(date(2022, 1, 1), date(2022, 1, 31))]

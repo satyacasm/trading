@@ -16,16 +16,27 @@ Usage: uv run python -m trading.streaming.upstox_intraday_backfill
 from __future__ import annotations
 
 import calendar
-from dataclasses import dataclass
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 import httpx
+import psycopg
+import structlog
 from psycopg import Connection
 
+from trading.config import get_settings
 from trading.contracts import DataSource
 from trading.streaming.bar_aggregator import INTERVAL_SECONDS
+from trading.streaming.seed_upstox_instruments import seed_upstox_instrument_keys
+
+log = structlog.get_logger(__name__)
+
+REQUEST_DELAY_SECONDS = 0.3
+_RETRY_BACKOFF_SECONDS = 2.0
 
 
 def month_windows(start: date, end: date) -> list[tuple[date, date]]:
@@ -150,3 +161,132 @@ def write_backfill_candle(conn: Connection, candle: BackfillCandle) -> None:
             DataSource.UPSTOX_HISTORICAL_CANDLE,
         ),
     )
+
+
+@dataclass
+class BackfillReport:
+    instrument_key: str
+    candles_written: int = 0
+    skipped_windows: list[tuple[date, date]] = field(default_factory=list)
+
+
+def backfill_symbol(
+    conn: Connection,
+    client: httpx.Client,
+    instrument_key: str,
+    instrument_id: int,
+    token: str,
+    *,
+    start: date = date(2022, 1, 1),
+    end: date | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> BackfillReport:
+    """Backfill one symbol's history from `start` through `end` (default:
+    yesterday). Retries a transient per-window failure once after a 2s
+    backoff, then skips that window and continues. A 401/403 aborts the
+    whole run immediately (propagates) -- every remaining request would
+    fail identically, so retry-then-skip would be pointless."""
+    window_end = end if end is not None else date.today() - timedelta(days=1)
+    report = BackfillReport(instrument_key=instrument_key)
+
+    for from_date, to_date in month_windows(start, window_end):
+        payload = _fetch_window_with_retry(
+            client, instrument_key, from_date, to_date, token, report, sleep
+        )
+        if payload is None:
+            continue
+
+        for candle in parse_candle_response(payload, instrument_id):
+            write_backfill_candle(conn, candle)
+            report.candles_written += 1
+        sleep(REQUEST_DELAY_SECONDS)
+
+    return report
+
+
+def _fetch_window_with_retry(
+    client: httpx.Client,
+    instrument_key: str,
+    from_date: date,
+    to_date: date,
+    token: str,
+    report: BackfillReport,
+    sleep: Callable[[float], None],
+) -> dict[str, Any] | None:
+    """One month-window fetch with one retry on a transient failure.
+    Returns None (and records the window in `report.skipped_windows`) if
+    both attempts fail transiently. Re-raises immediately on 401/403 --
+    every remaining request in this backfill run would fail identically,
+    so retry-then-skip would be pointless."""
+    for attempt in (1, 2):
+        try:
+            return fetch_candles(client, instrument_key, from_date, to_date, token)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (401, 403):
+                raise
+        except (httpx.TimeoutException, httpx.TransportError):
+            pass
+
+        if attempt == 1:
+            log.warning(
+                "upstox_intraday_backfill.window_failed_retrying",
+                instrument_key=instrument_key,
+                from_date=str(from_date),
+                to_date=str(to_date),
+            )
+            sleep(_RETRY_BACKOFF_SECONDS)
+        else:
+            log.warning(
+                "upstox_intraday_backfill.window_skipped",
+                instrument_key=instrument_key,
+                from_date=str(from_date),
+                to_date=str(to_date),
+            )
+            report.skipped_windows.append((from_date, to_date))
+
+    return None
+
+
+def main() -> None:
+    settings = get_settings()
+    token = settings.upstox_access_token
+    if not token:
+        raise RuntimeError(
+            "UPSTOX_ACCESS_TOKEN is not set. Run `uv run python -m trading.auth.upstox` to mint "
+            "one (it expires daily, so do this right before running this backfill)."
+        )
+
+    conn = psycopg.connect(settings.database_url, autocommit=True)
+    try:
+        instrument_ids = seed_upstox_instrument_keys(conn)
+        client = httpx.Client(timeout=30.0)
+        try:
+            reports: list[BackfillReport] = []
+            for instrument_key, instrument_id in instrument_ids.items():
+                log.info("upstox_intraday_backfill.starting_symbol", instrument_key=instrument_key)
+                report = backfill_symbol(conn, client, instrument_key, instrument_id, token)
+                reports.append(report)
+                log.info(
+                    "upstox_intraday_backfill.finished_symbol",
+                    instrument_key=instrument_key,
+                    candles_written=report.candles_written,
+                    skipped_windows=len(report.skipped_windows),
+                )
+        finally:
+            client.close()
+    finally:
+        conn.close()
+
+    total_written = sum(r.candles_written for r in reports)
+    total_skipped = sum(len(r.skipped_windows) for r in reports)
+    print(f"Backfill complete: {total_written} candles written, {total_skipped} windows skipped")
+    for report in reports:
+        if report.skipped_windows:
+            print(f"  {report.instrument_key}: skipped {report.skipped_windows}")
+
+    if total_skipped:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

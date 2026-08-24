@@ -329,7 +329,10 @@ def test_cross_source_agreement_not_applicable_with_no_data(db_conn):
 
 def test_cross_source_agreement_passes_within_tolerance(db_conn):
     ts = datetime(1998, 8, 13, 10, 0, tzinfo=UTC)
-    _load(db_conn, [_bar_row(exchange="NSE", segment="CM", symbol="XSRC", ts=ts, close="100.00")])
+    _load(
+        db_conn,
+        [_bar_row(exchange="NSE", segment="CM", symbol="XSRC", series="EQ", ts=ts, close="100.00")],
+    )
     _load(
         db_conn,
         [
@@ -358,7 +361,12 @@ def test_cross_source_agreement_passes_within_tolerance(db_conn):
 def test_cross_source_agreement_fails_beyond_tolerance(db_conn):
     ts = datetime(1998, 8, 13, 10, 0, tzinfo=UTC)
     _load(
-        db_conn, [_bar_row(exchange="NSE", segment="CM", symbol="XSRCBAD", ts=ts, close="100.00")]
+        db_conn,
+        [
+            _bar_row(
+                exchange="NSE", segment="CM", symbol="XSRCBAD", series="EQ", ts=ts, close="100.00"
+            )
+        ],
     )
     _load(
         db_conn,
@@ -384,6 +392,57 @@ def test_cross_source_agreement_fails_beyond_tolerance(db_conn):
     result = check_cross_source_agreement(db_conn, date(1998, 8, 13), date(1998, 8, 13))
     assert result.status == CheckStatus.FAIL
     assert "XSRCBAD" in result.detail
+
+
+def test_cross_source_agreement_ignores_a_non_equity_series_sharing_the_symbol(db_conn):
+    """NSE's CM segment carries more than one instrument under the same
+    SYMBOL: `BL` reports that day's block-deal trades (the same ISIN as the
+    equity, but a separate reporting window with its own O/H/L/C), and
+    `N1`/`N2`/`N3` are listed NCDs/bonds that happen to reuse the equity's
+    symbol string with a completely different ISIN. Confirmed live for
+    M&MFIN (docs/cross-source-agreement-review.md): the check's CM join had
+    no `series` filter, so it joined the future's `underlying_price` against
+    a bond trading in the low hundreds against an equity trading in the low
+    thousands and reported an 88% "disagreement" -- 1,021 of 1,027 real
+    violations were this shape, not a genuine mismatch. A non-`EQ` CM row
+    sharing the symbol must never enter the comparison at all.
+    """
+    ts = datetime(1998, 8, 13, 10, 0, tzinfo=UTC)
+    _load(
+        db_conn,
+        [
+            _bar_row(
+                exchange="NSE", segment="CM", symbol="XSIB", series="EQ", ts=ts, close="2200.00"
+            )
+        ],
+    )
+    _load(
+        db_conn,
+        [_bar_row(exchange="NSE", segment="CM", symbol="XSIB", series="N1", ts=ts, close="256.00")],
+    )
+    _load(
+        db_conn,
+        [
+            _bar_row(
+                exchange="NSE",
+                segment="FO",
+                symbol="XSIB",
+                asset_class="FUTURE",
+                ts=ts,
+                close="2201.00",
+                expiry=date(1998, 8, 27),
+            )
+        ],
+        data_source=DataSource.NSE_FO_UDIFF,
+    )
+    fo_id = _instrument_id(db_conn, "NSE", "FO", "XSIB")
+    db_conn.execute(
+        "UPDATE bars_daily SET underlying_price=%s WHERE instrument_id=%s AND ts=%s",
+        (Decimal("2199.50"), fo_id, ts),
+    )
+
+    result = check_cross_source_agreement(db_conn, date(1998, 8, 13), date(1998, 8, 13))
+    assert result.status == CheckStatus.PASS
 
 
 # ---------------------------------------------------------------------------
@@ -875,7 +934,14 @@ def test_continuity_single_bar_instrument_has_no_pair_to_examine(db_conn):
 
 def test_cross_source_agreement_tolerates_a_rounding_gap_on_a_high_priced_stock(db_conn):
     ts = datetime(1998, 8, 13, 10, 0, tzinfo=UTC)
-    _load(db_conn, [_bar_row(exchange="NSE", segment="CM", symbol="XABB", ts=ts, close="7710.00")])
+    _load(
+        db_conn,
+        [
+            _bar_row(
+                exchange="NSE", segment="CM", symbol="XABB", series="EQ", ts=ts, close="7710.00"
+            )
+        ],
+    )
     _load(
         db_conn,
         [
@@ -936,7 +1002,14 @@ def test_cross_source_agreement_tolerates_the_close_versus_last_traded_price_gap
     # above that noise floor, since the mismatch this check exists to catch
     # (a wrong symbol mapping, a stale underlying) is off by whole percent.
     ts = datetime(1998, 8, 13, 10, 0, tzinfo=UTC)
-    _load(db_conn, [_bar_row(exchange="NSE", segment="CM", symbol="XLTP", ts=ts, close="1026.10")])
+    _load(
+        db_conn,
+        [
+            _bar_row(
+                exchange="NSE", segment="CM", symbol="XLTP", series="EQ", ts=ts, close="1026.10"
+            )
+        ],
+    )
     _load(
         db_conn,
         [
@@ -967,7 +1040,12 @@ def test_cross_source_agreement_still_catches_a_stale_underlying(db_conn):
     # underlying -- must stay a failure at the same default tolerance.
     ts = datetime(1998, 8, 13, 10, 0, tzinfo=UTC)
     _load(
-        db_conn, [_bar_row(exchange="NSE", segment="CM", symbol="XSTALE", ts=ts, close="1000.00")]
+        db_conn,
+        [
+            _bar_row(
+                exchange="NSE", segment="CM", symbol="XSTALE", series="EQ", ts=ts, close="1000.00"
+            )
+        ],
     )
     _load(
         db_conn,

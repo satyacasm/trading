@@ -390,14 +390,35 @@ def check_cross_source_agreement(
     # (migrations/versions/0002_instrument_series_and_underlying_price.py)
     # adds the column and `BarLoader` (src/trading/loaders/bars.py) now
     # writes it, so the comparison below runs against real data.
+    #
+    # `cm.series = 'EQ'` (live-verified, docs/cross-source-agreement-review.md):
+    # NSE's CM segment carries more than one instrument under the same
+    # SYMBOL -- `BL` reports that day's block-deal trades (real ISIN, a
+    # separate reporting window with its own O/H/L/C, the same "series" that
+    # `check_continuity`'s own docstring already distrusts for `prev_close`),
+    # and `N1`/`N2`/`N3` are listed NCDs/bonds that happen to reuse the
+    # equity's symbol string with a wholly different ISIN. Without this
+    # filter the join compared a future's underlying_price against whichever
+    # of these happened to have a bar that day -- confirmed for M&MFIN,
+    # underlying=244.25 against an NCD's "close" of 2279.99, an 89%
+    # "disagreement" that was never a mismatch at all. `EQ` is the same
+    # canonical equity-series marker `parse_nse_corporate_actions` already
+    # pins for the identical reason (Ruling S1, task-18-brief.md).
     lower, upper = _range_bounds(start, end)
+    # The added `series = 'EQ'` predicate above changes Postgres's plan
+    # enough to reach for a parallel hash join, which needs more shared
+    # memory than this environment's 64MB Docker default (`--shm-size`) --
+    # a container resource limit, not a query correctness issue. SET LOCAL
+    # keeps the lift scoped to this transaction, same pattern as
+    # `check_idempotency`'s decompression-cap lift above.
+    conn.execute("SET LOCAL max_parallel_workers_per_gather = 0")
     rows = conn.execute(
         """
         SELECT fo.symbol, bfo.ts, bfo.underlying_price, bcm.close
         FROM bars_daily bfo
         JOIN instruments fo ON fo.instrument_id = bfo.instrument_id
         JOIN instruments cm ON cm.exchange = 'NSE' AND cm.segment = 'CM'
-            AND cm.symbol = fo.symbol AND cm.asset_class = 'EQUITY'
+            AND cm.symbol = fo.symbol AND cm.asset_class = 'EQUITY' AND cm.series = 'EQ'
         JOIN bars_daily bcm ON bcm.instrument_id = cm.instrument_id AND bcm.ts = bfo.ts
         WHERE fo.exchange = 'NSE' AND fo.segment = 'FO' AND fo.asset_class = 'FUTURE'
           AND bfo.underlying_price IS NOT NULL

@@ -187,3 +187,74 @@ def test_get_candles_404s_for_an_unknown_instrument(client):
 def test_get_candles_400s_for_an_invalid_interval(client, fixture_instrument_id):
     response = client.get(f"/candles/{fixture_instrument_id}?interval=3m")
     assert response.status_code == 400
+
+
+@pytest.fixture
+def fixture_equity_instrument_id(db_conn) -> int:
+    row = db_conn.execute(
+        """
+        INSERT INTO instruments
+            (asset_class, exchange, segment, symbol, series, status, canonical_key)
+        VALUES
+            ('EQUITY', 'NSE', 'CM', 'RELIANCE', 'EQ', 'ACTIVE', 'NSE:CM:RELIANCE:EQ')
+        RETURNING instrument_id
+        """
+    ).fetchone()
+    return row[0]
+
+
+def test_get_candles_1d_reads_bars_daily_for_an_equity(
+    client, db_conn, fixture_equity_instrument_id
+):
+    db_conn.execute(
+        """
+        INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, volume, source)
+        VALUES (%s, '2026-08-21T00:00:00Z', 2900, 2950, 2890, 2940, 1000000, 1)
+        """,
+        (fixture_equity_instrument_id,),
+    )
+    # A 1-minute row that must NOT be used for this equity's 1d candle --
+    # proves the equity branch reads bars_daily, not bucketed bars_intraday.
+    db_conn.execute(
+        """
+        INSERT INTO bars_intraday
+            (instrument_id, ts, interval_sec, open, high, low, close, volume, source)
+        VALUES (%s, '2026-08-21T09:16:00Z', 60, 1, 1, 1, 1, 1, 7)
+        """,
+        (fixture_equity_instrument_id,),
+    )
+
+    body = client.get(f"/candles/{fixture_equity_instrument_id}?interval=1d").json()
+    assert len(body["candles"]) == 1
+    assert float(body["candles"][0]["close"]) == 2940.0
+
+
+def test_get_candles_1d_buckets_bars_intraday_for_crypto(client, db_conn, fixture_instrument_id):
+    _insert_bar(
+        db_conn,
+        fixture_instrument_id,
+        datetime(2026, 8, 24, 9, 15, tzinfo=UTC),
+        100,
+        110,
+        90,
+        105,
+        5,
+    )
+    _insert_bar(
+        db_conn,
+        fixture_instrument_id,
+        datetime(2026, 8, 24, 10, 0, tzinfo=UTC),
+        105,
+        108,
+        95,
+        99,
+        5,
+    )
+
+    body = client.get(f"/candles/{fixture_instrument_id}?interval=1d").json()
+    assert len(body["candles"]) == 1
+    candle = body["candles"][0]
+    assert float(candle["open"]) == 100.0
+    assert float(candle["high"]) == 110.0
+    assert float(candle["low"]) == 90.0
+    assert float(candle["close"]) == 99.0

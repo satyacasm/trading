@@ -15,10 +15,11 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.30",
     "redis>=5.0",
+    "protobuf>=5.0",
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.2", "pytest-cov>=5.0", "ruff>=0.5", "mypy>=1.10"]
+dev = ["pytest>=8.2", "pytest-cov>=5.0", "ruff>=0.5", "mypy>=1.10", "grpcio-tools>=1.60", "types-protobuf>=5.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -31,7 +32,13 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = ["docs", ".superpowers", ".remember", "implementation-plan.md"]
+extend-exclude = [
+    "docs",
+    ".superpowers",
+    ".remember",
+    "implementation-plan.md",
+    "src/trading/streaming/upstox_proto/MarketDataFeed_pb2.py",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

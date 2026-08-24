@@ -655,6 +655,15 @@ def check_idempotency(
             f"{'; '.join(missing_archives[:10])}",
         )
 
+    # TimescaleDB compresses older chunks automatically (the Columnstore
+    # policy), and then caps one transaction at 100,000 decompressed tuples.
+    # This check deliberately re-loads a whole 30-day window -- ~700,000 rows
+    # for F&O -- so it starts failing with ConfigurationLimitExceeded as soon
+    # as compression catches up with the backfill, which says nothing about
+    # whether the data is idempotent. SET LOCAL keeps the lift scoped to this
+    # transaction, which the caller rolls back.
+    conn.execute("SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0")
+
     before_digest, before_count = _bars_checksum(conn, data_source, window_start, window_end)
     if before_count == 0:
         # Ruling B8: with no rows in the window, "re-loading changed nothing"

@@ -1025,3 +1025,40 @@ def test_continuity_accepts_every_share_count_changing_action(db_conn, action_ty
 
     result = check_continuity(db_conn, date(1998, 8, 12), date(1998, 8, 13))
     assert result.status == CheckStatus.PASS
+
+
+def test_idempotency_lifts_the_decompression_cap_for_its_own_transaction(db_conn, tmp_path):
+    """TimescaleDB compresses older chunks automatically (127 of 131 here,
+    via the Columnstore policy) and then caps how many tuples one transaction
+    may decompress at 100,000. The idempotency check re-loads a random 30-day
+    window, which for F&O is ~700,000 rows, so it began dying with
+    ConfigurationLimitExceeded once compression caught up with the backfill.
+
+    Lifted with SET LOCAL, so it lasts exactly as long as this check's
+    transaction -- which is rolled back -- and never becomes a standing
+    setting on the database.
+    """
+    registry, normalizer, validator, loader = _udiff_stage_bundle()
+    archive = _fixture_zip_dated(tmp_path, date(1998, 8, 13))
+    _load_fixture_archive(db_conn, registry, normalizer, validator, loader, archive)
+    _seed_job(
+        db_conn,
+        source_key="nse_cm_udiff",
+        business_date=date(1998, 8, 13),
+        archive_path=str(archive),
+    )
+
+    check_idempotency(
+        db_conn,
+        "nse_cm_udiff",
+        DataSource.NSE_CM_UDIFF,
+        registry,
+        normalizer,
+        validator,
+        loader,
+        date(1998, 8, 1),
+        date(1998, 8, 28),
+    )
+
+    row = db_conn.execute("SHOW timescaledb.max_tuples_decompressed_per_dml_transaction").fetchone()
+    assert row is not None and row[0] == "0"

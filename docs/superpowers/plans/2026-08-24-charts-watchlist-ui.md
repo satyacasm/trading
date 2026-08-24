@@ -1299,6 +1299,131 @@ git commit -m "feat(web): watchlist dashboard page"
 
 ---
 
+## Task 7b (discovered live, 2026-08-25): `Candle`/`WatchlistItem.last_price` serialize as JSON strings, not numbers
+
+**Why this task exists:** This plan's Global Constraints assumed "Decimal columns serialize to the frontend as plain JSON numbers (Pydantic's default `Decimal` → JSON-number behavior)." Task 7's implementer, verifying against the real running backend, found this assumption was wrong and the controller independently confirmed it: pydantic v2's default JSON serialization of a `Decimal` field produces a **quoted string** (`{"x": "100.50"}`), not a bare number (`{"x": 100.5}`). This doesn't break Task 7 (`page.tsx` only interpolates `last_price` into JSX, which renders a string or number identically) but it would silently break Task 9/10's chart code, which does real arithmetic (`Math.max`/`Math.min` in `mergeTickIntoCandles`) and hands values straight to `lightweight-charts`, a library that requires actual `number`s — a JSON string assigned into a `number`-typed field produces no compile-time error in this codebase (no runtime validation on the frontend) and would silently misrender.
+
+This does **not** extend to the WS tick path (`GET /ws`'s `Tick.price`) — that model belongs to the already-shipped crypto-streaming sub-project and stays out of scope here. Ticks arrive as strings over the wire regardless of this fix; Tasks 8 and 10's dispatches carry that fact explicitly and convert with `Number(tick.price)` at the point of use.
+
+**Files:**
+- Modify: `src/trading/streaming/market_data_api.py`
+
+**Interfaces:**
+- Modifies: `Candle`'s `open`/`high`/`low`/`close`/`volume` fields from `Decimal` to `float`. `WatchlistItem.last_price` from `Decimal | None` to `float | None`. No call-site changes needed — pydantic v2 coerces a `Decimal` value assigned into a `float`-typed field automatically (confirmed: `M(x=Decimal("100.50"))` on a `float` field produces `m.x == 100.5`, `model_dump_json()` → `{"x":100.5}`), so `_fetch_bucketed_candles`, `_fetch_daily_candles`, and `get_watchlist` need no changes beyond the type annotations.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/streaming/test_market_data_api.py`:
+
+```python
+def test_get_candles_returns_json_numbers_not_strings(client, db_conn, fixture_instrument_id):
+    _insert_bar(db_conn, fixture_instrument_id, datetime(2026, 8, 24, 9, 15, tzinfo=UTC), 100, 101, 99, 100.5, 10)
+
+    response = client.get(f"/candles/{fixture_instrument_id}?interval=5m")
+    candle = response.json()["candles"][0]
+    assert isinstance(candle["open"], float)
+    assert isinstance(candle["close"], float)
+    assert isinstance(candle["volume"], float)
+
+
+def test_get_watchlist_returns_last_price_as_a_json_number(
+    client, db_conn, fixture_instrument_id
+):
+    client.post("/watchlist", json={"instrument_id": fixture_instrument_id})
+    db_conn.execute(
+        """
+        INSERT INTO bars_intraday
+            (instrument_id, ts, interval_sec, open, high, low, close, volume, source)
+        VALUES (%s, '2026-08-24T09:16:00Z', 60, 100, 101, 99, 100.5, 10, 6)
+        """,
+        (fixture_instrument_id,),
+    )
+
+    body = client.get("/watchlist").json()
+    assert isinstance(body[0]["last_price"], float)
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `uv run pytest tests/streaming/test_market_data_api.py -v -k "returns_json_numbers or returns_last_price_as_a_json_number"`
+Expected: FAIL — `assert isinstance("100.50", float)` is false (both currently return `str`, confirmed by `response.json()["candles"][0]["open"]` being a `str` today).
+
+- [ ] **Step 3: Write the fix**
+
+In `src/trading/streaming/market_data_api.py`, change:
+
+```python
+class Candle(BaseModel):
+    ts: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+```
+
+to:
+
+```python
+class Candle(BaseModel):
+    ts: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+```
+
+And change:
+
+```python
+class WatchlistItem(BaseModel):
+    instrument_id: int
+    symbol: str
+    asset_class: str
+    exchange: str
+    added_at: datetime
+    last_price: Decimal | None
+    last_ts: datetime | None
+```
+
+to:
+
+```python
+class WatchlistItem(BaseModel):
+    instrument_id: int
+    symbol: str
+    asset_class: str
+    exchange: str
+    added_at: datetime
+    last_price: float | None
+    last_ts: datetime | None
+```
+
+No other line changes — `_fetch_bucketed_candles`, `_fetch_daily_candles`, and `get_watchlist`'s construction calls pass `Decimal` values into these fields exactly as before; pydantic coerces them to `float` during validation.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `uv run pytest tests/streaming/test_market_data_api.py -v -k "returns_json_numbers or returns_last_price_as_a_json_number"`
+Expected: 2 passed
+
+Run the full file: `uv run pytest tests/streaming/test_market_data_api.py -v`
+Expected: all passing, no regressions — every existing test that reads a numeric field via `float(candle["open"])`-style coercion in Python continues to pass since `float(100.5) == float("100.50")`; the new tests are the only ones asserting the JSON *type* directly.
+
+- [ ] **Step 5: Full suite, lint/type gate, and commit**
+
+Run: `uv run pytest`
+Expected: all passing, no regressions anywhere else (this change is additive/narrowing on two response models only, not touched by any other module).
+
+Run: `uv run ruff check . && uv run ruff format --check . && uv run mypy src`
+
+```bash
+git add src/trading/streaming/market_data_api.py tests/streaming/test_market_data_api.py
+git commit -m "fix(streaming): serialize Candle/WatchlistItem.last_price as JSON numbers, not strings"
+```
+
+---
+
 ## Task 8: Shared WS hook + live price wiring on the dashboard
 
 **Files:**
@@ -1320,8 +1445,14 @@ import { useEffect, useRef } from "react";
 export type Tick = {
   instrument_id: number;
   ts: string;
-  price: number;
-  quantity: number;
+  // Wire value is a JSON string, not a number -- the existing Tick model
+  // (from the already-shipped crypto-streaming sub-project, out of scope
+  // to change here) serializes its Decimal price field as e.g. "65000.50"
+  // over /ws, the same pydantic v2 behavior Task 7b fixed for the REST
+  // endpoints this plan owns. Convert with Number(tick.price) at the point
+  // of use -- never assume it's already numeric.
+  price: string;
+  quantity: string;
   side?: string | null;
 };
 
@@ -1426,7 +1557,10 @@ Add state for live prices and the "live" freshness clock, and the hook call, ins
   const handleTick = (tick: Tick) => {
     setLiveData((prev) => ({
       ...prev,
-      [tick.instrument_id]: { price: tick.price, lastTickAt: Date.now() },
+      // tick.price is a JSON string on the wire (see the Tick type's
+      // comment in useTickStream.ts) -- convert explicitly, never assign
+      // it directly into a number-typed field.
+      [tick.instrument_id]: { price: Number(tick.price), lastTickAt: Date.now() },
     }));
   };
 
@@ -1686,7 +1820,16 @@ Add the live-tick subscription, after that effect:
   useTickStream([instrumentId], (tick) => {
     if (tick.instrument_id !== instrumentId || !seriesRef.current) return;
     const tickTimeSeconds = new Date(tick.ts).getTime() / 1000;
-    const merged = mergeTickIntoCandles(candlesRef.current, tick.price, tickTimeSeconds, interval);
+    // tick.price is a JSON string on the wire (see the Tick type's comment
+    // in useTickStream.ts) -- mergeTickIntoCandles does real arithmetic
+    // (Math.max/Math.min) and lightweight-charts requires actual numbers,
+    // so convert explicitly here rather than passing the string through.
+    const merged = mergeTickIntoCandles(
+      candlesRef.current,
+      Number(tick.price),
+      tickTimeSeconds,
+      interval
+    );
     candlesRef.current = merged;
     seriesRef.current.update(merged[merged.length - 1]);
   });

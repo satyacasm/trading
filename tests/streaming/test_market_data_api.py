@@ -258,3 +258,37 @@ def test_get_candles_1d_buckets_bars_intraday_for_crypto(client, db_conn, fixtur
     assert float(candle["high"]) == 110.0
     assert float(candle["low"]) == 90.0
     assert float(candle["close"]) == 99.0
+
+
+def test_get_candles_returns_json_numbers_not_strings(client, db_conn, fixture_instrument_id):
+    _insert_bar(
+        db_conn,
+        fixture_instrument_id,
+        datetime(2026, 8, 24, 9, 15, tzinfo=UTC),
+        100,
+        101,
+        99,
+        100.5,
+        10,
+    )
+
+    response = client.get(f"/candles/{fixture_instrument_id}?interval=5m")
+    candle = response.json()["candles"][0]
+    assert isinstance(candle["open"], float)
+    assert isinstance(candle["close"], float)
+    assert isinstance(candle["volume"], float)
+
+
+def test_get_watchlist_returns_last_price_as_a_json_number(client, db_conn, fixture_instrument_id):
+    client.post("/watchlist", json={"instrument_id": fixture_instrument_id})
+    db_conn.execute(
+        """
+        INSERT INTO bars_intraday
+            (instrument_id, ts, interval_sec, open, high, low, close, volume, source)
+        VALUES (%s, '2026-08-24T09:16:00Z', 60, 100, 101, 99, 100.5, 10, 6)
+        """,
+        (fixture_instrument_id,),
+    )
+
+    body = client.get("/watchlist").json()
+    assert isinstance(body[0]["last_price"], float)

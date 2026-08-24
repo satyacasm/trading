@@ -25,7 +25,7 @@ class WatchlistItem(BaseModel):
     asset_class: str
     exchange: str
     added_at: datetime
-    last_price: Decimal | None
+    last_price: float | None
     last_ts: datetime | None
 
 
@@ -96,11 +96,11 @@ def remove_from_watchlist(
 
 class Candle(BaseModel):
     ts: datetime
-    open: Decimal
-    high: Decimal
-    low: Decimal
-    close: Decimal
-    volume: Decimal
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
 
 
 class CandlesResponse(BaseModel):
@@ -139,7 +139,14 @@ def _fetch_bucketed_candles(
 ) -> list[Candle]:
     rows = conn.execute(_BUCKETED_CANDLES_SQL, (bucket, instrument_id, limit)).fetchall()
     candles = [
-        Candle(ts=ts, open=open_, high=high, low=low, close=close, volume=volume or Decimal(0))
+        Candle(
+            ts=ts,
+            open=float(open_),
+            high=float(high),
+            low=float(low),
+            close=float(close),
+            volume=float(volume or Decimal(0)),
+        )
         for ts, open_, high, low, close, volume in rows
     ]
     return list(reversed(candles))
@@ -159,11 +166,11 @@ def _fetch_daily_candles(conn: Connection, instrument_id: int, limit: int) -> li
     candles = [
         Candle(
             ts=ts,
-            open=open_,
-            high=high,
-            low=low,
-            close=close,
-            volume=Decimal(volume) if volume is not None else Decimal(0),
+            open=float(open_),
+            high=float(high),
+            low=float(low),
+            close=float(close),
+            volume=float(Decimal(volume) if volume is not None else Decimal(0)),
         )
         for ts, open_, high, low, close, volume in rows
     ]

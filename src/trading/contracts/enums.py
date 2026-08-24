@@ -26,6 +26,7 @@ class DataSource(IntEnum):
     BSE_CM_UDIFF = 3
     NSE_CM_LEGACY = 4
     AMFI_NAV = 5
+    BINANCE_WS = 6
 
 
 class JobStatus(StrEnum):

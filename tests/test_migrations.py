@@ -205,4 +205,27 @@ def test_data_source_values_are_pinned():
         "BSE_CM_UDIFF": 3,
         "NSE_CM_LEGACY": 4,
         "AMFI_NAV": 5,
+        "BINANCE_WS": 6,
     }
+
+
+def test_bars_intraday_accepts_a_fractional_volume(db_conn):
+    """Crypto trade quantities are fractional Decimals (e.g. 0.01000000 BTC)
+    -- volume must not be a BIGINT. Migration 0003 widens it to NUMERIC."""
+    from decimal import Decimal
+
+    iid = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency,"
+        " status, canonical_key) VALUES ('CRYPTO','BINANCE','SPOT','TESTUSDT','USDT',"
+        "'ACTIVE','BINANCE:SPOT:TESTUSDT') RETURNING instrument_id"
+    ).fetchone()[0]
+    db_conn.execute(
+        "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low,"
+        " close, volume, trades, source) VALUES (%s, '2026-08-24T12:00:00Z', 60,"
+        " 100, 105, 98, 102, %s, 4, 6)",
+        (iid, Decimal("0.01000000")),
+    )  # must not raise
+    row = db_conn.execute(
+        "SELECT volume FROM bars_intraday WHERE instrument_id = %s", (iid,)
+    ).fetchone()
+    assert row[0] == Decimal("0.01000000")

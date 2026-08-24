@@ -1346,10 +1346,207 @@ git commit -m "fix(streaming): skip individual OHLC-invalid candles instead of c
 
 ## Task 9: Re-run the real backfill for the symbols Task 7's crash left incomplete
 
+**Superseded by Task 10 below before completion** — an attempted run of this task on 2026-08-24
+22:01 IST surfaced a second live issue (a severe performance regression from Task 8's fix), which
+is fixed by Task 10. Re-attempt this task's steps only after Task 10 is complete and reviewed.
+
 **Files:** none (verification only, same as Task 7).
 
 Task 7's run crashed partway through the 4th symbol (HDFCBANK) after successfully finishing RELIANCE, TCS/INFY (whichever the 2nd/3rd symbols were), and one more — 3 symbols fully written, committed, and safe (`autocommit=True`, each write its own transaction). Task 8's fix is now in place. Re-running `main()` from scratch is safe (idempotent upsert on every symbol, including the 3 already-complete ones — those just become cheap no-op upserts) and simpler than building a resume-from-symbol-N feature that was never in this plan's scope.
 
 - [ ] **Step 1:** Run `uv run python -m trading.streaming.upstox_intraday_backfill` again.
 - [ ] **Step 2:** Watch for any further crashes. A `candles_rejected` count in the log/summary output is expected and fine (that's Task 8's fix working as designed) — a crash is not.
+- [ ] **Step 3:** Re-run this plan's original Task 7 Step 4 verification query. Report final totals: candles written per symbol, candles rejected per symbol, earliest/latest dates, any skipped windows.
+
+---
+
+## Task 10 (discovered live, 2026-08-24): the savepoint wrapper made every production write ~3x slower for no reason
+
+**Why this task exists:** Attempting Task 9 surfaced a second gap. Task 8's fix wraps *every* candle write in `with conn.transaction():` (a savepoint) to stop a `CheckViolation` from poisoning the rest of a transaction — but that protection is only structurally necessary under an **explicit, non-autocommit transaction** (like this plan's own tests, via `db_conn`). Under `main()`'s production connection (`autocommit=True`), each statement is *already* its own independently committed/rolled-back unit at the Postgres protocol level — a failed statement there poisons nothing, so the savepoint wrapper was never doing useful work in production, only adding cost.
+
+Confirmed by direct measurement against the real local Postgres (`autocommit=True` connection, 500 trivial statements): a bare `conn.execute(...)` averaged 0.21ms/statement; the same statement wrapped in `with conn.transaction():` averaged 0.60ms/statement — roughly **3x slower per write**. Applied across the ~2.15M candles this backfill writes (5 symbols × ~430k candles each), this is the direct cause of Task 9's re-run taking over 13 minutes on just the first symbol (RELIANCE) versus ~3 minutes for the same symbol in Task 7's original, unwrapped run. The fix must keep Task 8's correctness guarantee (tests still pass, `CheckViolation` is still caught and doesn't poison a test's transaction) while restoring production's original per-write cost.
+
+**Files:**
+- Modify: `src/trading/streaming/upstox_intraday_backfill.py`
+
+**Interfaces:**
+- Modifies: `backfill_symbol`'s per-candle write loop. The savepoint (`conn.transaction()`) is applied **only when `conn.autocommit` is `False`** (i.e., only when actually structurally necessary to protect a caller's explicit transaction — true for this plan's own tests via `db_conn`, never true for `main()`'s production connection). Under `conn.autocommit is True`, the write runs bare, exactly as it did before Task 8, restoring full write throughput. No test-visible behavior changes: `CheckViolation` is still caught, still logged, still counted in `report.candles_rejected`, and the existing `test_backfill_symbol_skips_a_check_violating_candle_and_continues` test (which runs under `db_conn`, `autocommit=False`) must still pass unmodified.
+
+- [ ] **Step 1: Write a test confirming the bare-write path under autocommit**
+
+Append to `tests/streaming/test_upstox_intraday_backfill.py`:
+
+```python
+def test_backfill_symbol_does_not_wrap_writes_in_a_savepoint_under_autocommit(
+    db_url, fixture_instrument_id_factory
+):
+    """Regression test for the Task 9 re-run's ~3x slowdown: under an
+    autocommit=True connection (production's shape), write_backfill_candle
+    must be called directly, with no `with conn.transaction():` wrapper --
+    that wrapper was only ever needed to protect an explicit, non-autocommit
+    transaction (this plan's own tests) from CheckViolation poisoning it.
+    Verified by monkeypatching Connection.transaction to fail loudly if
+    called at all while a real autocommit connection runs backfill_symbol.
+    """
+    import psycopg
+    from psycopg import Connection
+
+    called = {"n": 0}
+    original_transaction = Connection.transaction
+
+    def _tracking_transaction(self, *args, **kwargs):
+        called["n"] += 1
+        return original_transaction(self, *args, **kwargs)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {"candles": [["2022-01-15T09:15:00+05:30", 1.0, 1.0, 1.0, 1.0, 1, 0]]},
+            },
+        )
+
+    client = _mock_client(handler)
+    autocommit_conn = psycopg.connect(db_url, autocommit=True)
+    try:
+        instrument_id = fixture_instrument_id_factory(autocommit_conn)
+        Connection.transaction = _tracking_transaction
+        backfill_symbol(
+            autocommit_conn,
+            client,
+            instrument_key="NSE_EQ|INE002A01018",
+            instrument_id=instrument_id,
+            token="tok",
+            start=date(2022, 1, 1),
+            end=date(2022, 1, 31),
+            sleep=lambda _: None,
+        )
+    finally:
+        Connection.transaction = original_transaction
+        autocommit_conn.execute("DELETE FROM bars_intraday WHERE instrument_id = %s", (instrument_id,))
+        autocommit_conn.execute("DELETE FROM instruments WHERE instrument_id = %s", (instrument_id,))
+        autocommit_conn.close()
+
+    assert called["n"] == 0, "conn.transaction() must not be called under an autocommit connection"
+```
+
+This test needs a `fixture_instrument_id_factory` helper that does what `fixture_instrument_id` does but against an arbitrary connection (not just `db_conn`) and without relying on `db_conn`'s rollback for cleanup (since this test uses its own real `autocommit=True` connection, cleanup is manual — see the `finally` block above). Add this alongside the existing `fixture_instrument_id` fixture:
+
+```python
+@pytest.fixture
+def fixture_instrument_id_factory():
+    def _make(conn) -> int:
+        row = conn.execute(
+            """
+            INSERT INTO instruments (asset_class, exchange, segment, symbol, status, canonical_key)
+            VALUES ('EQUITY', 'NSE', 'CM', 'RELIANCE', 'ACTIVE', 'NSE:CM:RELIANCE:EQ:AUTOCOMMIT_TEST')
+            ON CONFLICT (canonical_key) DO UPDATE SET updated_at = now()
+            RETURNING instrument_id
+            """
+        ).fetchone()
+        return row[0]
+
+    return _make
+```
+
+(The `ON CONFLICT ... DO UPDATE` is defensive: this fixture runs against a real, non-rolled-back connection, so a prior failed test run's leftover row with the same `canonical_key` must not crash this one with a unique-constraint violation.)
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `uv run pytest tests/streaming/test_upstox_intraday_backfill.py -v -k does_not_wrap`
+Expected: FAIL — `AssertionError: conn.transaction() must not be called under an autocommit connection` (`called["n"]` will be 1, since Task 8's current code always wraps).
+
+- [ ] **Step 3: Write the fix**
+
+In `src/trading/streaming/upstox_intraday_backfill.py`, add `import contextlib` to the imports.
+
+Change the per-candle write loop from (Task 8's current unconditional wrap):
+
+```python
+        for candle in parse_candle_response(payload, instrument_id):
+            try:
+                # A savepoint (via conn.transaction()) rather than a bare
+                # write: ...
+                # [Task 8's existing comment block]
+                with conn.transaction():
+                    write_backfill_candle(conn, candle)
+                report.candles_written += 1
+            except CheckViolation as exc:
+                ...
+```
+
+to:
+
+```python
+        for candle in parse_candle_response(payload, instrument_id):
+            # A savepoint (via conn.transaction()) protects an explicit,
+            # non-autocommit transaction from a CheckViolation poisoning
+            # every subsequent write in the same transaction -- but that
+            # protection is only necessary when one exists. Under an
+            # autocommit=True connection (main()'s production shape), each
+            # statement is already its own independently committed unit at
+            # the protocol level; wrapping it in a savepoint anyway adds a
+            # real ~3x per-write cost (measured: 0.21ms -> 0.60ms/statement
+            # against local Postgres) for zero correctness benefit, which is
+            # exactly what turned one production backfill run's first
+            # symbol from ~3 minutes into 13+ minutes and counting before
+            # this fix. Skip the wrapper entirely when conn.autocommit is
+            # True; only pay for it when it's actually protecting something.
+            transaction_ctx = contextlib.nullcontext() if conn.autocommit else conn.transaction()
+            try:
+                with transaction_ctx:
+                    write_backfill_candle(conn, candle)
+                report.candles_written += 1
+            except CheckViolation as exc:
+                log.warning(
+                    "upstox_intraday_backfill.candle_rejected",
+                    instrument_key=instrument_key,
+                    ts=candle.ts.isoformat(),
+                    open=str(candle.open),
+                    high=str(candle.high),
+                    low=str(candle.low),
+                    close=str(candle.close),
+                    reason=str(exc).splitlines()[0],
+                )
+                report.candles_rejected += 1
+        sleep(REQUEST_DELAY_SECONDS)
+```
+
+(Keep Task 8's existing `CheckViolation` handling logic identical — only the transaction-wrapping decision changes.)
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `uv run pytest tests/streaming/test_upstox_intraday_backfill.py -v -k "does_not_wrap or check_violating"`
+Expected: 2 passed (the new autocommit test, and Task 8's original savepoint-under-db_conn test — confirming both paths work correctly: no wrapper under autocommit, savepoint still applied under an explicit transaction).
+
+Run the full file: `uv run pytest tests/streaming/test_upstox_intraday_backfill.py -v`
+Expected: 23 passed (or 24 with the live test), no regressions in any earlier test.
+
+- [ ] **Step 5: Run the full repo suite**
+
+Run: `uv run pytest`
+Expected: all passing, no regressions.
+
+- [ ] **Step 6: A quick real-world timing sanity check (not a formal step, but do it)**
+
+Before committing, it's worth a quick manual confirmation that this actually restores throughput: time a small real slice, e.g. `backfill_symbol` for one month-window against the real API with the real `autocommit=True` connection `main()` would use, and confirm it completes in roughly the same time as Task 7's original (pre-Task-8) run did for a comparable slice. This isn't a formal pytest step — just don't skip verifying the fix actually fixes the real-world symptom, not just the mocked unit test.
+
+- [ ] **Step 7: Lint/type gate and commit**
+
+Run: `uv run ruff check . && uv run ruff format --check . && uv run mypy src`
+
+```bash
+git add src/trading/streaming/upstox_intraday_backfill.py tests/streaming/test_upstox_intraday_backfill.py
+git commit -m "fix(streaming): skip the savepoint wrapper under autocommit connections (perf)"
+```
+
+---
+
+## Task 11: Re-attempt Task 9 now that the fix is in
+
+Identical to Task 9's steps, run again now that Task 10's fix is committed. This is the task whose results get reported as this plan's final completion evidence.
+
+- [ ] **Step 1:** Run `uv run python -m trading.streaming.upstox_intraday_backfill` again.
+- [ ] **Step 2:** Watch for crashes (none expected) and note the wall-clock time for comparison against Task 7's original per-symbol timings (~3 minutes/symbol) as confirmation the performance fix worked in the real, full-scale run, not just the timing sanity check.
 - [ ] **Step 3:** Re-run this plan's original Task 7 Step 4 verification query. Report final totals: candles written per symbol, candles rejected per symbol, earliest/latest dates, any skipped windows.

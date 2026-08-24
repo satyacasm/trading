@@ -26,7 +26,7 @@ CRYPTO_PAIRS: tuple[str, ...] = (
     "AVAX-USDT",
     "DOT-USDT",
     "LINK-USDT",
-    "MATIC-USDT",
+    "POL-USDT",
     "LTC-USDT",
     "TRX-USDT",
     "ATOM-USDT",

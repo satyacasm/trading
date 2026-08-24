@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -109,3 +110,80 @@ def test_delete_watchlist_removes_an_instrument(
 def test_delete_watchlist_is_a_noop_for_an_instrument_not_in_the_list(client: TestClient) -> None:
     response = client.delete("/watchlist/999999999")
     assert response.status_code == 200
+
+
+def _insert_bar(db_conn, instrument_id, ts, open_, high, low, close, volume):
+    db_conn.execute(
+        """
+        INSERT INTO bars_intraday
+            (instrument_id, ts, interval_sec, open, high, low, close, volume, source)
+        VALUES (%s, %s, 60, %s, %s, %s, %s, %s, 6)
+        """,
+        (instrument_id, ts, open_, high, low, close, volume),
+    )
+
+
+def test_get_candles_buckets_1m_bars_into_a_5m_candle(client, db_conn, fixture_instrument_id):
+    base = datetime(2026, 8, 24, 9, 15, tzinfo=UTC)
+    _insert_bar(db_conn, fixture_instrument_id, base, 100, 102, 99, 101, 10)
+    _insert_bar(db_conn, fixture_instrument_id, base.replace(minute=16), 101, 105, 100, 103, 5)
+    _insert_bar(db_conn, fixture_instrument_id, base.replace(minute=17), 103, 104, 98, 99, 7)
+
+    response = client.get(f"/candles/{fixture_instrument_id}?interval=5m")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["instrument_id"] == fixture_instrument_id
+    assert body["interval"] == "5m"
+    assert len(body["candles"]) == 1
+    candle = body["candles"][0]
+    assert float(candle["open"]) == 100.0
+    assert float(candle["high"]) == 105.0
+    assert float(candle["low"]) == 98.0
+    assert float(candle["close"]) == 99.0
+    assert float(candle["volume"]) == 22.0
+
+
+def test_get_candles_returns_multiple_buckets_in_chronological_order(
+    client, db_conn, fixture_instrument_id
+):
+    first_bucket = datetime(2026, 8, 24, 9, 15, tzinfo=UTC)
+    second_bucket = datetime(2026, 8, 24, 9, 20, tzinfo=UTC)
+    _insert_bar(db_conn, fixture_instrument_id, first_bucket, 100, 100, 100, 100, 1)
+    _insert_bar(db_conn, fixture_instrument_id, second_bucket, 200, 200, 200, 200, 1)
+
+    body = client.get(f"/candles/{fixture_instrument_id}?interval=5m").json()
+    assert len(body["candles"]) == 2
+    assert body["candles"][0]["ts"] < body["candles"][1]["ts"]
+    assert float(body["candles"][0]["close"]) == 100.0
+    assert float(body["candles"][1]["close"]) == 200.0
+
+
+def test_get_candles_respects_limit(client, db_conn, fixture_instrument_id):
+    for minute_offset, bucket_minute in enumerate((15, 20, 25)):
+        ts = datetime(2026, 8, 24, 9, bucket_minute, tzinfo=UTC)
+        _insert_bar(
+            db_conn,
+            fixture_instrument_id,
+            ts,
+            100 + minute_offset,
+            101 + minute_offset,
+            99 + minute_offset,
+            100 + minute_offset,
+            1,
+        )
+
+    body = client.get(f"/candles/{fixture_instrument_id}?interval=5m&limit=2").json()
+    assert len(body["candles"]) == 2
+    # most recent 2 buckets, still returned oldest-first
+    assert float(body["candles"][0]["close"]) == 101.0
+    assert float(body["candles"][1]["close"]) == 102.0
+
+
+def test_get_candles_404s_for_an_unknown_instrument(client):
+    response = client.get("/candles/999999999?interval=5m")
+    assert response.status_code == 404
+
+
+def test_get_candles_400s_for_an_invalid_interval(client, fixture_instrument_id):
+    response = client.get(f"/candles/{fixture_instrument_id}?interval=3m")
+    assert response.status_code == 400

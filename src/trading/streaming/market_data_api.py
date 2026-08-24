@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from psycopg import Connection
 from pydantic import BaseModel
 
@@ -92,3 +92,78 @@ def remove_from_watchlist(
 ) -> dict[str, bool]:
     conn.execute("DELETE FROM watchlists WHERE instrument_id = %s", (instrument_id,))
     return {"ok": True}
+
+
+class Candle(BaseModel):
+    ts: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+
+
+class CandlesResponse(BaseModel):
+    instrument_id: int
+    interval: str
+    candles: list[Candle]
+
+
+_INTERVAL_BUCKETS: dict[str, str] = {
+    "1m": "1 minute",
+    "5m": "5 minutes",
+    "15m": "15 minutes",
+    "1h": "1 hour",
+}
+_VALID_INTERVALS = frozenset(_INTERVAL_BUCKETS)
+_DEFAULT_LIMIT = 300
+
+_BUCKETED_CANDLES_SQL = """
+    SELECT
+        time_bucket(%s::interval, ts) AS bucket_ts,
+        first(open, ts) AS open,
+        max(high) AS high,
+        min(low) AS low,
+        last(close, ts) AS close,
+        sum(volume) AS volume
+    FROM bars_intraday
+    WHERE instrument_id = %s AND interval_sec = 60
+    GROUP BY bucket_ts
+    ORDER BY bucket_ts DESC
+    LIMIT %s
+"""
+
+
+def _fetch_bucketed_candles(
+    conn: Connection, instrument_id: int, bucket: str, limit: int
+) -> list[Candle]:
+    rows = conn.execute(_BUCKETED_CANDLES_SQL, (bucket, instrument_id, limit)).fetchall()
+    candles = [
+        Candle(ts=ts, open=open_, high=high, low=low, close=close, volume=volume or Decimal(0))
+        for ts, open_, high, low, close, volume in rows
+    ]
+    return list(reversed(candles))
+
+
+@router.get("/candles/{instrument_id}", response_model=CandlesResponse)
+def get_candles(
+    instrument_id: int,
+    interval: str = Query(...),
+    limit: int = _DEFAULT_LIMIT,
+    conn: Connection = Depends(get_db_connection),  # noqa: B008
+) -> CandlesResponse:
+    if interval not in _VALID_INTERVALS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid interval {interval!r}; expected one of {sorted(_VALID_INTERVALS)}",
+        )
+    exists = conn.execute(
+        "SELECT 1 FROM instruments WHERE instrument_id = %s", (instrument_id,)
+    ).fetchone()
+    if exists is None:
+        raise HTTPException(
+            status_code=404, detail=f"no instrument with instrument_id={instrument_id}"
+        )
+
+    candles = _fetch_bucketed_candles(conn, instrument_id, _INTERVAL_BUCKETS[interval], limit)
+    return CandlesResponse(instrument_id=instrument_id, interval=interval, candles=candles)

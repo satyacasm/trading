@@ -207,6 +207,23 @@ def fixture_instrument_id(db_conn) -> int:
     return row[0]
 
 
+@pytest.fixture
+def fixture_instrument_id_factory():
+    def _make(conn) -> int:
+        row = conn.execute(
+            """
+            INSERT INTO instruments (asset_class, exchange, segment, symbol, status, canonical_key)
+            VALUES
+                ('EQUITY', 'NSE', 'CM', 'RELIANCE', 'ACTIVE', 'NSE:CM:RELIANCE:EQ:AUTOCOMMIT_TEST')
+            ON CONFLICT (canonical_key) DO UPDATE SET updated_at = now()
+            RETURNING instrument_id
+            """
+        ).fetchone()
+        return row[0]
+
+    return _make
+
+
 @pytest.mark.db
 def test_write_backfill_candle_inserts_a_row_with_null_trades_and_correct_source(
     db_conn, fixture_instrument_id
@@ -431,3 +448,61 @@ def test_backfill_symbol_skips_a_check_violating_candle_and_continues(
         (fixture_instrument_id,),
     ).fetchall()
     assert len(rows) == 1  # only the valid candle landed
+
+
+def test_backfill_symbol_does_not_wrap_writes_in_a_savepoint_under_autocommit(
+    db_url, fixture_instrument_id_factory
+):
+    """Regression test for the Task 9 re-run's ~3x slowdown: under an
+    autocommit=True connection (production's shape), write_backfill_candle
+    must be called directly, with no `with conn.transaction():` wrapper --
+    that wrapper was only ever needed to protect an explicit, non-autocommit
+    transaction (this plan's own tests) from CheckViolation poisoning it.
+    Verified by monkeypatching Connection.transaction to fail loudly if
+    called at all while a real autocommit connection runs backfill_symbol.
+    """
+    import psycopg
+    from psycopg import Connection
+
+    called = {"n": 0}
+    original_transaction = Connection.transaction
+
+    def _tracking_transaction(self, *args, **kwargs):
+        called["n"] += 1
+        return original_transaction(self, *args, **kwargs)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {"candles": [["2022-01-15T09:15:00+05:30", 1.0, 1.0, 1.0, 1.0, 1, 0]]},
+            },
+        )
+
+    client = _mock_client(handler)
+    autocommit_conn = psycopg.connect(db_url, autocommit=True)
+    try:
+        instrument_id = fixture_instrument_id_factory(autocommit_conn)
+        Connection.transaction = _tracking_transaction
+        backfill_symbol(
+            autocommit_conn,
+            client,
+            instrument_key="NSE_EQ|INE002A01018",
+            instrument_id=instrument_id,
+            token="tok",
+            start=date(2022, 1, 1),
+            end=date(2022, 1, 31),
+            sleep=lambda _: None,
+        )
+    finally:
+        Connection.transaction = original_transaction
+        autocommit_conn.execute(
+            "DELETE FROM bars_intraday WHERE instrument_id = %s", (instrument_id,)
+        )
+        autocommit_conn.execute(
+            "DELETE FROM instruments WHERE instrument_id = %s", (instrument_id,)
+        )
+        autocommit_conn.close()
+
+    assert called["n"] == 0, "conn.transaction() must not be called under an autocommit connection"

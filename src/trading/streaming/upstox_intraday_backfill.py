@@ -16,6 +16,7 @@ Usage: uv run python -m trading.streaming.upstox_intraday_backfill
 from __future__ import annotations
 
 import calendar
+import contextlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -199,23 +200,22 @@ def backfill_symbol(
             continue
 
         for candle in parse_candle_response(payload, instrument_id):
+            # A savepoint (via conn.transaction()) protects an explicit,
+            # non-autocommit transaction from a CheckViolation poisoning
+            # every subsequent write in the same transaction -- but that
+            # protection is only necessary when one exists. Under an
+            # autocommit=True connection (main()'s production shape), each
+            # statement is already its own independently committed unit at
+            # the protocol level; wrapping it in a savepoint anyway adds a
+            # real ~3x per-write cost (measured: 0.21ms -> 0.60ms/statement
+            # against local Postgres) for zero correctness benefit, which is
+            # exactly what turned one production backfill run's first
+            # symbol from ~3 minutes into 13+ minutes and counting before
+            # this fix. Skip the wrapper entirely when conn.autocommit is
+            # True; only pay for it when it's actually protecting something.
+            transaction_ctx = contextlib.nullcontext() if conn.autocommit else conn.transaction()
             try:
-                # A savepoint (via conn.transaction()) rather than a bare
-                # write: under main()'s autocommit=True connection this is a
-                # no-op wrapper (each write already commits on its own), but
-                # under an explicit-transaction connection (as tests use) a
-                # CheckViolation would otherwise poison the whole transaction
-                # and fail every subsequent write in the same run/test.
-                # NOTE: this savepoint behavior requires the connection to
-                # already be mid-transaction (INTRANS) when this runs -- true
-                # for every test in this file only because each one reaches
-                # here via fixture_instrument_id, which inserts a row on
-                # db_conn first. A test that calls backfill_symbol(db_conn, ...)
-                # on a still-idle connection would make conn.transaction() the
-                # outermost transaction, which issues a real BEGIN/COMMIT and
-                # would permanently persist that candle past db_conn's
-                # rollback() teardown.
-                with conn.transaction():
+                with transaction_ctx:
                     write_backfill_candle(conn, candle)
                 report.candles_written += 1
             except CheckViolation as exc:

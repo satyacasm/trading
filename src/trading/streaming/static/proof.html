@@ -20,11 +20,11 @@
     async function main() {
       const instruments = await (await fetch("/instruments")).json();
       const idToSymbol = {};
-      for (const [symbol, instrumentId] of Object.entries(instruments)) {
-        idToSymbol[instrumentId] = symbol;
+      for (const inst of instruments.filter((i) => i.asset_class === "CRYPTO")) {
+        idToSymbol[inst.instrument_id] = inst.symbol;
         const row = document.createElement("div");
-        row.id = "row-" + instrumentId;
-        row.innerHTML = symbol + ": <span class='price'>waiting...</span>";
+        row.id = "row-" + inst.instrument_id;
+        row.innerHTML = inst.symbol + ": <span class='price'>waiting...</span>";
         rows.appendChild(row);
       }
 

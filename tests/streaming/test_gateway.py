@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from trading.streaming.gateway import app, get_db_connection
 from trading.streaming.seed_instruments import CRYPTO_PAIRS, seed_crypto_instruments
+from trading.streaming.seed_upstox_instruments import UPSTOX_WATCHLIST
 
 pytestmark = pytest.mark.db
 
@@ -16,6 +17,24 @@ pytestmark = pytest.mark.db
 @pytest.fixture
 def seeded_instrument_id(db_conn) -> int:
     return seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+
+
+@pytest.fixture
+def seeded_upstox_equities(db_conn) -> None:
+    """`/instruments` calls seed_upstox_instrument_keys(conn) with its
+    default 5-symbol UPSTOX_WATCHLIST, which raises ValueError if any
+    symbol has no matching series='EQ' NSE row. The real database already
+    has these (Phase 0's backfill); this test's dedicated, freshly-migrated
+    `trading_test` database does not, so this fixture seeds them."""
+    for i, symbol in enumerate(UPSTOX_WATCHLIST):
+        db_conn.execute(
+            """
+            INSERT INTO instruments
+                (asset_class, exchange, segment, symbol, series, isin, status, canonical_key)
+            VALUES ('EQUITY', 'NSE', 'CM', %s, 'EQ', %s, 'ACTIVE', %s)
+            """,
+            (symbol, f"INE{i:03d}TEST01", f"NSE:CM:{symbol}:EQ"),
+        )
 
 
 @pytest.fixture
@@ -32,20 +51,39 @@ def client(db_conn) -> Iterator[TestClient]:
         app.dependency_overrides.clear()
 
 
-def test_instruments_endpoint_lists_the_seeded_pairs(
-    client: TestClient, seeded_instrument_id: int
+def test_instruments_endpoint_lists_crypto_and_equity_instruments(
+    client: TestClient, seeded_instrument_id: int, seeded_upstox_equities: None
 ) -> None:
     response = client.get("/instruments")
     assert response.status_code == 200
     body = response.json()
-    assert body["BTC-USDT"] == seeded_instrument_id
-    assert set(body) >= set(CRYPTO_PAIRS)
+
+    by_symbol = {row["symbol"]: row for row in body}
+    assert by_symbol["BTC-USDT"]["instrument_id"] == seeded_instrument_id
+    assert by_symbol["BTC-USDT"]["asset_class"] == "CRYPTO"
+    assert by_symbol["BTC-USDT"]["exchange"] == "BINANCE"
+    assert set(by_symbol) >= set(CRYPTO_PAIRS)
+
+    assert by_symbol["RELIANCE"]["asset_class"] == "EQUITY"
+    assert by_symbol["RELIANCE"]["exchange"] == "NSE"
 
 
 def test_index_serves_the_proof_page(client: TestClient) -> None:
     response = client.get("/")
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
+
+
+def test_cors_allows_the_local_web_dev_origin(
+    client: TestClient, seeded_instrument_id: int, seeded_upstox_equities: None
+) -> None:
+    response = client.get("/instruments", headers={"Origin": "http://localhost:3000"})
+    assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
+
+
+def test_market_data_routes_are_mounted_on_the_gateway_app(client: TestClient) -> None:
+    response = client.get("/watchlist")
+    assert response.status_code == 200
 
 
 def test_ws_forwards_a_published_tick_to_a_subscribed_client(

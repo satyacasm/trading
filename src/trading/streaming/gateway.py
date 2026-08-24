@@ -13,18 +13,30 @@ from pathlib import Path
 
 import structlog
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from psycopg import Connection
+from pydantic import BaseModel
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
 
 from trading.config import get_settings
+from trading.streaming import market_data_api
 from trading.streaming.db import get_db_connection
 from trading.streaming.seed_instruments import seed_crypto_instruments
+from trading.streaming.seed_upstox_instruments import seed_upstox_instrument_keys
 
 log = structlog.get_logger(__name__)
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.include_router(market_data_api.router)
 
 _STATIC_ROOT = Path(__file__).parent / "static"
 
@@ -34,12 +46,32 @@ async def index() -> FileResponse:
     return FileResponse(_STATIC_ROOT / "proof.html")
 
 
-@app.get("/instruments")
-async def instruments(conn: Connection = Depends(get_db_connection)) -> dict[str, int]:  # noqa: B008
+class InstrumentSummary(BaseModel):
+    instrument_id: int
+    symbol: str
+    asset_class: str
+    exchange: str
+
+
+@app.get("/instruments", response_model=list[InstrumentSummary])
+async def instruments(conn: Connection = Depends(get_db_connection)) -> list[InstrumentSummary]:  # noqa: B008
     # psycopg here is a synchronous, blocking call inside an async route --
     # an accepted simplification for this endpoint (called once per page
-    # load, not a hot path); see the design doc's scope notes.
-    return seed_crypto_instruments(conn)
+    # load, not a hot path), same as the original crypto-only version.
+    crypto_ids = set(seed_crypto_instruments(conn).values())
+    upstox_ids = set(seed_upstox_instrument_keys(conn).values())
+    all_ids = list(crypto_ids | upstox_ids)
+    if not all_ids:
+        return []
+    rows = conn.execute(
+        "SELECT instrument_id, symbol, asset_class, exchange FROM instruments "
+        "WHERE instrument_id = ANY(%s)",
+        (all_ids,),
+    ).fetchall()
+    return [
+        InstrumentSummary(instrument_id=row[0], symbol=row[1], asset_class=row[2], exchange=row[3])
+        for row in rows
+    ]
 
 
 # One connection-lifetime pattern subscription instead of per-instrument

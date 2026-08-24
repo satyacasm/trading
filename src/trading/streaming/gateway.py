@@ -9,10 +9,8 @@ Task 5 for why that's the right scope, not a shared connection manager.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
 from pathlib import Path
 
-import psycopg
 import structlog
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -21,6 +19,7 @@ from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
 
 from trading.config import get_settings
+from trading.streaming.db import get_db_connection
 from trading.streaming.seed_instruments import seed_crypto_instruments
 
 log = structlog.get_logger(__name__)
@@ -28,22 +27,6 @@ log = structlog.get_logger(__name__)
 app = FastAPI()
 
 _STATIC_ROOT = Path(__file__).parent / "static"
-
-
-def get_db_connection() -> Iterator[Connection]:
-    """A real connection per request. Tests override this dependency with
-    their own `db_conn` fixture (`app.dependency_overrides[get_db_connection]
-    = lambda: db_conn`) so `/instruments` reads inside the same rolled-back
-    test transaction instead of committing a second, real connection."""
-    conn = psycopg.connect(get_settings().database_url, autocommit=False)
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
 
 
 @app.get("/")

@@ -141,10 +141,10 @@ def _fetch_bucketed_candles(
     candles = [
         Candle(
             ts=ts,
-            open=float(open_),
-            high=float(high),
-            low=float(low),
-            close=float(close),
+            open=open_,
+            high=high,
+            low=low,
+            close=close,
             volume=float(volume or Decimal(0)),
         )
         for ts, open_, high, low, close, volume in rows
@@ -166,10 +166,10 @@ def _fetch_daily_candles(conn: Connection, instrument_id: int, limit: int) -> li
     candles = [
         Candle(
             ts=ts,
-            open=float(open_),
-            high=float(high),
-            low=float(low),
-            close=float(close),
+            open=open_,
+            high=high,
+            low=low,
+            close=close,
             volume=float(Decimal(volume) if volume is not None else Decimal(0)),
         )
         for ts, open_, high, low, close, volume in rows

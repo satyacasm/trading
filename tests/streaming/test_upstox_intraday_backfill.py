@@ -387,3 +387,47 @@ def test_backfill_symbol_continues_past_a_skipped_window_to_the_next(
 
     assert report.candles_written == 1
     assert report.skipped_windows == [(date(2022, 1, 1), date(2022, 1, 31))]
+
+
+def test_backfill_symbol_skips_a_check_violating_candle_and_continues(
+    db_conn, fixture_instrument_id
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {
+                    "candles": [
+                        # A real, verbatim shape Upstox returned for HDFCBANK on
+                        # 2024-06-25T09:15 IST -- low (837.4) > open (835.6) violates
+                        # bars_intraday's ck_ohlc_order_intraday CHECK constraint.
+                        ["2024-06-25T09:15:00+05:30", 835.6, 839.8, 837.4, 839.6, 370096, 0],
+                        ["2024-06-25T09:16:00+05:30", 839.6, 840.8, 839.4, 840.0, 362254, 0],
+                    ]
+                },
+            },
+        )
+
+    client = _mock_client(handler)
+
+    report = backfill_symbol(
+        db_conn,
+        client,
+        instrument_key="NSE_EQ|INE002A01018",
+        instrument_id=fixture_instrument_id,
+        token="tok",
+        start=date(2024, 6, 1),
+        end=date(2024, 6, 30),
+        sleep=lambda _: None,
+    )
+
+    assert report.candles_written == 1
+    assert report.candles_rejected == 1
+    assert report.skipped_windows == []
+
+    rows = db_conn.execute(
+        "SELECT ts FROM bars_intraday WHERE instrument_id = %s ORDER BY ts",
+        (fixture_instrument_id,),
+    ).fetchall()
+    assert len(rows) == 1  # only the valid candle landed

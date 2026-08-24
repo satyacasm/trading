@@ -27,6 +27,7 @@ import httpx
 import psycopg
 import structlog
 from psycopg import Connection
+from psycopg.errors import CheckViolation
 
 from trading.config import get_settings
 from trading.contracts import DataSource
@@ -167,6 +168,7 @@ def write_backfill_candle(conn: Connection, candle: BackfillCandle) -> None:
 class BackfillReport:
     instrument_key: str
     candles_written: int = 0
+    candles_rejected: int = 0
     skipped_windows: list[tuple[date, date]] = field(default_factory=list)
 
 
@@ -197,8 +199,28 @@ def backfill_symbol(
             continue
 
         for candle in parse_candle_response(payload, instrument_id):
-            write_backfill_candle(conn, candle)
-            report.candles_written += 1
+            try:
+                # A savepoint (via conn.transaction()) rather than a bare
+                # write: under main()'s autocommit=True connection this is a
+                # no-op wrapper (each write already commits on its own), but
+                # under an explicit-transaction connection (as tests use) a
+                # CheckViolation would otherwise poison the whole transaction
+                # and fail every subsequent write in the same run/test.
+                with conn.transaction():
+                    write_backfill_candle(conn, candle)
+                report.candles_written += 1
+            except CheckViolation as exc:
+                log.warning(
+                    "upstox_intraday_backfill.candle_rejected",
+                    instrument_key=instrument_key,
+                    ts=candle.ts.isoformat(),
+                    open=str(candle.open),
+                    high=str(candle.high),
+                    low=str(candle.low),
+                    close=str(candle.close),
+                    reason=str(exc).splitlines()[0],
+                )
+                report.candles_rejected += 1
         sleep(REQUEST_DELAY_SECONDS)
 
     return report
@@ -278,11 +300,17 @@ def main() -> None:
         conn.close()
 
     total_written = sum(r.candles_written for r in reports)
+    total_rejected = sum(r.candles_rejected for r in reports)
     total_skipped = sum(len(r.skipped_windows) for r in reports)
-    print(f"Backfill complete: {total_written} candles written, {total_skipped} windows skipped")
+    print(
+        f"Backfill complete: {total_written} candles written, {total_rejected} rejected "
+        f"(bad OHLC data), {total_skipped} windows skipped"
+    )
     for report in reports:
         if report.skipped_windows:
             print(f"  {report.instrument_key}: skipped {report.skipped_windows}")
+        if report.candles_rejected:
+            print(f"  {report.instrument_key}: {report.candles_rejected} candles rejected")
 
     if total_skipped:
         raise SystemExit(1)

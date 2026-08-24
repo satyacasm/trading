@@ -206,6 +206,7 @@ def test_data_source_values_are_pinned():
         "NSE_CM_LEGACY": 4,
         "AMFI_NAV": 5,
         "BINANCE_WS": 6,
+        "UPSTOX_HISTORICAL_CANDLE": 7,
     }
 
 

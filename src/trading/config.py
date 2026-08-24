@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     upstox_api_key: str | None = None
     upstox_api_secret: str | None = None
     upstox_analytics_token: str | None = None
+    upstox_access_token: str | None = None
     dhan_client_id: str | None = None
     dhan_access_token: str | None = None
 

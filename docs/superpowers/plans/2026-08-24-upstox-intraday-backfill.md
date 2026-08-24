@@ -1180,3 +1180,176 @@ Record: total candles written across all 5 symbols, the actual earliest/latest d
 - [ ] **Step 5: Report**
 
 No commit for this task (it runs shipped code, doesn't change any file). Report the verification numbers back in this plan's completion notes.
+
+---
+
+## Task 8 (discovered live, 2026-08-24): a single bad candle must not crash the whole backfill
+
+**Why this task exists:** Running Task 7 for real surfaced a genuine gap Tasks 1-6 didn't anticipate. Upstox's historical-candle API can return a candle whose OHLC values violate `bars_intraday`'s own `ck_ohlc_order_intraday` CHECK constraint (`high >= low AND high >= open AND high >= close AND low <= open AND low <= close`, when `volume` is non-zero). Confirmed live and reproduced directly against the real API (not a parsing bug — this is Upstox's own verbatim response): `NSE_EQ|INE040A01034` (HDFCBANK), `2024-06-25T09:15:00+05:30` → `[open=835.6, high=839.8, low=837.4, close=839.6]`. `low (837.4) > open (835.6)` — a real vendor data quirk at the market-open candle, most likely the pre-open auction print leaking into the "open" field while the first minute's regular-session trades set a higher low. `write_backfill_candle` let `psycopg.errors.CheckViolation` propagate uncaught, which crashed `main()` mid-run (3 of 5 symbols had already finished and committed — `autocommit=True` means each write is its own transaction, so that data is safe — but the 4th symbol was left partially backfilled and the 5th never started).
+
+This is the same class of problem Phase 0's `bars_daily` pipeline already solved for EOD data (quarantine bad rows, never let one row's defect kill the whole load) — but this backfill module deliberately doesn't participate in that heavier `ingest_jobs`/`quarantine` machinery (see this plan's spec §3: a small, dedicated write path was chosen specifically to avoid that heavier framework). The fix here stays proportionate to that choice: catch the failure at the single-candle level, log it with full detail, count it, and keep going — not wire this backfill into the full quarantine system.
+
+**Files:**
+- Modify: `src/trading/streaming/upstox_intraday_backfill.py`
+- Modify: `tests/streaming/test_upstox_intraday_backfill.py`
+
+**Interfaces:**
+- Modifies: `BackfillReport` gains a new field `candles_rejected: int = 0`.
+- Modifies: `backfill_symbol`'s per-candle write loop: each `write_backfill_candle` call is wrapped so a `psycopg.errors.CheckViolation` (and only that — not a bare `except Exception`, which would also swallow a genuine connection failure or a bug worth seeing) is caught, logged as a warning with the candle's full field values, increments `report.candles_rejected`, and the loop continues to the next candle in that window (not the next window — the rest of the window's candles are still good data and should still be written).
+- `main()`'s final summary print gains a `candles_rejected` line alongside `candles_written`/`skipped_windows`, and a nonzero rejected count does **not** by itself trigger the `SystemExit(1)` that a skipped window does — a handful of known-dirty exchange prints is expected data-quality noise, not an operational failure the way a skipped network window is.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/streaming/test_upstox_intraday_backfill.py`:
+
+```python
+def test_backfill_symbol_skips_a_check_violating_candle_and_continues(db_conn, fixture_instrument_id):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {
+                    "candles": [
+                        # A real, verbatim shape Upstox returned for HDFCBANK on
+                        # 2024-06-25T09:15 IST -- low (837.4) > open (835.6) violates
+                        # bars_intraday's ck_ohlc_order_intraday CHECK constraint.
+                        ["2024-06-25T09:15:00+05:30", 835.6, 839.8, 837.4, 839.6, 370096, 0],
+                        ["2024-06-25T09:16:00+05:30", 839.6, 840.8, 839.4, 840.0, 362254, 0],
+                    ]
+                },
+            },
+        )
+
+    client = _mock_client(handler)
+
+    report = backfill_symbol(
+        db_conn,
+        client,
+        instrument_key="NSE_EQ|INE002A01018",
+        instrument_id=fixture_instrument_id,
+        token="tok",
+        start=date(2024, 6, 1),
+        end=date(2024, 6, 30),
+        sleep=lambda _: None,
+    )
+
+    assert report.candles_written == 1
+    assert report.candles_rejected == 1
+    assert report.skipped_windows == []
+
+    rows = db_conn.execute(
+        "SELECT ts FROM bars_intraday WHERE instrument_id = %s ORDER BY ts",
+        (fixture_instrument_id,),
+    ).fetchall()
+    assert len(rows) == 1  # only the valid candle landed
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `uv run pytest tests/streaming/test_upstox_intraday_backfill.py -v -k check_violating`
+Expected: FAIL — either `psycopg.errors.CheckViolation` propagates uncaught (crashing the test) or `AttributeError: 'BackfillReport' object has no attribute 'candles_rejected'`, depending on which line the test reaches first.
+
+- [ ] **Step 3: Write the fix**
+
+In `src/trading/streaming/upstox_intraday_backfill.py`, add `candles_rejected: int = 0` to `BackfillReport`:
+
+```python
+@dataclass
+class BackfillReport:
+    instrument_key: str
+    candles_written: int = 0
+    candles_rejected: int = 0
+    skipped_windows: list[tuple[date, date]] = field(default_factory=list)
+```
+
+Add `from psycopg.errors import CheckViolation` to the imports.
+
+In `backfill_symbol`, change the candle-writing loop from:
+
+```python
+        for candle in parse_candle_response(payload, instrument_id):
+            write_backfill_candle(conn, candle)
+            report.candles_written += 1
+        sleep(REQUEST_DELAY_SECONDS)
+```
+
+to:
+
+```python
+        for candle in parse_candle_response(payload, instrument_id):
+            try:
+                write_backfill_candle(conn, candle)
+                report.candles_written += 1
+            except CheckViolation as exc:
+                log.warning(
+                    "upstox_intraday_backfill.candle_rejected",
+                    instrument_key=instrument_key,
+                    ts=candle.ts.isoformat(),
+                    open=str(candle.open),
+                    high=str(candle.high),
+                    low=str(candle.low),
+                    close=str(candle.close),
+                    reason=str(exc).splitlines()[0],
+                )
+                report.candles_rejected += 1
+        sleep(REQUEST_DELAY_SECONDS)
+```
+
+**Why `CheckViolation` and not a broader catch:** a bare `except Exception` here would also swallow a lost database connection, a schema drift, or a real bug in `write_backfill_candle` — all of which should crash loudly, not be silently counted as "one rejected candle." `CheckViolation` is the one specific, well-understood failure mode this task exists to handle: known-dirty exchange data hitting a known, intentional constraint. Note also that this catch must be scoped to `autocommit=True` connections (true for `main()`'s production connection) — under an explicit multi-statement transaction, a single failed statement would poison the whole transaction and every subsequent write would also fail until a rollback, which this narrow per-candle catch does not perform. `write_backfill_candle`'s docstring already documents that it never commits and the caller controls transaction boundaries; this task doesn't change that contract, it only relies on `main()`'s existing `autocommit=True` choice for this catch to be safe. (If `backfill_symbol` is ever called under an explicit-transaction connection — as this plan's own tests already do, via `db_conn` — a `CheckViolation` on one candle **will** poison that test's transaction for any subsequent write in the same test. This is fine for the specific test added in Step 1, which writes no candle after the rejected one within the same `db_conn` transaction, but is a real constraint worth knowing if a future test wants to assert on a successful write occurring *after* a rejected one within a single `db_conn`-backed test — it would need its own savepoint, which is out of scope here.)
+
+Update `main()`'s summary print to include the rejected count:
+
+```python
+    total_written = sum(r.candles_written for r in reports)
+    total_rejected = sum(r.candles_rejected for r in reports)
+    total_skipped = sum(len(r.skipped_windows) for r in reports)
+    print(
+        f"Backfill complete: {total_written} candles written, {total_rejected} rejected "
+        f"(bad OHLC data), {total_skipped} windows skipped"
+    )
+    for report in reports:
+        if report.skipped_windows:
+            print(f"  {report.instrument_key}: skipped {report.skipped_windows}")
+        if report.candles_rejected:
+            print(f"  {report.instrument_key}: {report.candles_rejected} candles rejected")
+
+    if total_skipped:
+        raise SystemExit(1)
+```
+
+(`total_rejected` alone does not trigger `SystemExit(1)` — see Interfaces above for why.)
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `uv run pytest tests/streaming/test_upstox_intraday_backfill.py -v -k check_violating`
+Expected: 1 passed
+
+- [ ] **Step 5: Run the full test file, then the full repo suite**
+
+Run: `uv run pytest tests/streaming/test_upstox_intraday_backfill.py -v`
+Expected: 22 passed, 1 deselected (or 23 passed if the live test runs — `UPSTOX_ACCESS_TOKEN` is minted as of this task, so it should run and pass)
+
+Run: `uv run pytest`
+Expected: all passing, no regressions.
+
+- [ ] **Step 6: Lint/type gate and commit**
+
+Run: `uv run ruff check . && uv run ruff format --check . && uv run mypy src`
+
+```bash
+git add src/trading/streaming/upstox_intraday_backfill.py tests/streaming/test_upstox_intraday_backfill.py
+git commit -m "fix(streaming): skip individual OHLC-invalid candles instead of crashing the backfill"
+```
+
+---
+
+## Task 9: Re-run the real backfill for the symbols Task 7's crash left incomplete
+
+**Files:** none (verification only, same as Task 7).
+
+Task 7's run crashed partway through the 4th symbol (HDFCBANK) after successfully finishing RELIANCE, TCS/INFY (whichever the 2nd/3rd symbols were), and one more — 3 symbols fully written, committed, and safe (`autocommit=True`, each write its own transaction). Task 8's fix is now in place. Re-running `main()` from scratch is safe (idempotent upsert on every symbol, including the 3 already-complete ones — those just become cheap no-op upserts) and simpler than building a resume-from-symbol-N feature that was never in this plan's scope.
+
+- [ ] **Step 1:** Run `uv run python -m trading.streaming.upstox_intraday_backfill` again.
+- [ ] **Step 2:** Watch for any further crashes. A `candles_rejected` count in the log/summary output is expected and fine (that's Task 8's fix working as designed) — a crash is not.
+- [ ] **Step 3:** Re-run this plan's original Task 7 Step 4 verification query. Report final totals: candles written per symbol, candles rejected per symbol, earliest/latest dates, any skipped windows.

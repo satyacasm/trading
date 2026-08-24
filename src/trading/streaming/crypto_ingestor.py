@@ -54,9 +54,18 @@ async def run_ingestion_loop(
             feed = feed_factory()
             try:
                 await feed.connect()
-                backoff = initial_backoff_seconds
+                consumed_any = False
 
                 async for raw in feed:
+                    if not consumed_any:
+                        # Only prove the connection by a real message, not merely a
+                        # successful handshake -- Binance can accept the WebSocket
+                        # handshake and then immediately close it (rate-limiting or a
+                        # soft ban), and resetting backoff on `connect()` alone would
+                        # make that failure mode reconnect at a flat interval forever
+                        # instead of backing off, risking an actual IP ban.
+                        backoff = initial_backoff_seconds
+                        consumed_any = True
                     tick = parse_trade_message(raw, instrument_ids)
                     if tick is None:
                         continue

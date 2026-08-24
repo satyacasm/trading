@@ -140,3 +140,47 @@ def test_run_ingestion_loop_reconnects_after_a_dropped_connection(
     assert message is not None
     payload = json.loads(message["data"])
     assert payload["instrument_id"] == 501
+
+
+def test_run_ingestion_loop_grows_backoff_on_repeated_connect_then_drop(
+    redis_client: redis.Redis,
+) -> None:
+    """A connect-then-immediately-drop failure -- the shape of Binance
+    rate-limiting or a soft ban -- must not reset backoff to
+    `initial_backoff_seconds` just because `connect()` succeeded. Only a
+    connection that actually yields a message proves itself and resets the
+    backoff; two connect-then-drop failures in a row must back off (1.0,
+    2.0), not flatline at (1.0, 1.0)."""
+    pubsub = redis_client.pubsub()
+    pubsub.subscribe("ticks:501")
+    pubsub.get_message(timeout=1)
+
+    failing_feed_1 = ScriptedFeed([], fail_after=ConnectionError("dropped"))
+    failing_feed_2 = ScriptedFeed([], fail_after=ConnectionError("dropped"))
+    working_feed = ScriptedFeed([_trade()])
+    feeds = iter([failing_feed_1, failing_feed_2, working_feed])
+
+    sleeps: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        asyncio.run(
+            run_ingestion_loop(
+                async_redis,
+                lambda: next(feeds),
+                instrument_ids={"btcusdt": 501},
+                sleep=_record_sleep,
+                max_ticks=1,
+            )
+        )
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    assert sleeps == [1.0, 2.0]
+    message = pubsub.get_message(timeout=2)
+    assert message is not None
+    payload = json.loads(message["data"])
+    assert payload["instrument_id"] == 501

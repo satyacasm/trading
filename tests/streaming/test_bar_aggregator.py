@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Coroutine
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
+import redis
+from redis.asyncio import Redis as AsyncRedis
+
+from trading.config import get_settings
 from trading.streaming.bar_aggregator import (
     BarAggregator,
     ClosedBar,
     OpenBar,
     bucket_start,
+    run_aggregation_loop,
     write_closed_bar,
 )
 from trading.streaming.models import Tick
@@ -178,3 +186,141 @@ def test_write_closed_bar_is_idempotent_on_conflict(db_conn) -> None:
     ).fetchall()
     assert len(rows) == 1  # upserted, not duplicated
     assert rows[0] == (Decimal("5.0000"), 3)  # second write's values won
+
+
+async def _no_sleep(seconds: float) -> None:
+    # await asyncio.sleep(0), not a bare `return None`: a plain async
+    # function that never awaits anything never actually yields control
+    # back to the event loop when awaited (only a real suspension point
+    # does). run_aggregation_loop's `_periodic_flush` background task loops
+    # `while not done.is_set(): await sleep(...)` concurrently with the
+    # tick-consuming task -- pairing it with a truly no-op `sleep` here
+    # livelocks the whole loop (confirmed by an isolated repro): the flush
+    # task spins forever without ever handing control to the consumer task
+    # that's the only thing that can set `done`. `asyncio.sleep(0)` keeps
+    # "no real delay" while still cooperating with the scheduler.
+    await asyncio.sleep(0)
+
+
+def _tick_json(instrument_id: int, ts: str, price: str, quantity: str = "0.01000000") -> str:
+    return Tick(
+        instrument_id=instrument_id,
+        ts=datetime.fromisoformat(ts),
+        price=Decimal(price),
+        quantity=Decimal(quantity),
+    ).model_dump_json()
+
+
+def test_run_aggregation_loop_writes_a_closed_bar_once_its_window_elapses(
+    db_conn, redis_client: redis.Redis
+) -> None:
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel = f"ticks:{iid}"
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(async_redis, db_conn, sleep=_no_sleep, max_bars_written=1)
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)  # give psubscribe time to land before we publish
+            redis_client.publish(channel, _tick_json(iid, "2026-08-24T12:00:10+00:00", "65000.00"))
+            redis_client.publish(channel, _tick_json(iid, "2026-08-24T12:01:05+00:00", "65010.00"))
+
+        asyncio.run(_run_both(loop_task, _publish_after_subscribed()))
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    row = db_conn.execute(
+        "SELECT open, high, low, close, volume, trades, source"
+        " FROM bars_intraday WHERE instrument_id = %s",
+        (iid,),
+    ).fetchone()
+    assert row == (
+        Decimal("65000.0000"),
+        Decimal("65000.0000"),
+        Decimal("65000.0000"),
+        Decimal("65000.0000"),
+        Decimal("0.01000000"),
+        1,
+        6,
+    )
+
+
+async def _run_both(
+    loop_task: Coroutine[Any, Any, None], publisher: Coroutine[Any, Any, None]
+) -> None:
+    # Both args are passed as bare coroutines rather than pre-scheduled via
+    # asyncio.ensure_future()/create_task(): scheduling them here, inside
+    # the coroutine asyncio.run() actually executes, binds each resulting
+    # Task to the one event loop that's running. Scheduling loop_task
+    # eagerly at the call site (before any loop is running) binds it to a
+    # different, implicitly-created loop instead, and asyncio.gather()
+    # below then raises "got Future attached to a different loop".
+    await asyncio.gather(loop_task, publisher)
+
+
+def test_run_aggregation_loop_skips_a_malformed_message_and_keeps_going(
+    db_conn, redis_client: redis.Redis
+) -> None:
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel = f"ticks:{iid}"
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(async_redis, db_conn, sleep=_no_sleep, max_bars_written=1)
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)
+            redis_client.publish(channel, "not json")
+            redis_client.publish(channel, _tick_json(iid, "2026-08-24T12:00:10+00:00", "65000.00"))
+            redis_client.publish(channel, _tick_json(iid, "2026-08-24T12:01:05+00:00", "65010.00"))
+
+        asyncio.run(_run_both(loop_task, _publish_after_subscribed()))
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    row = db_conn.execute(
+        "SELECT trades FROM bars_intraday WHERE instrument_id = %s", (iid,)
+    ).fetchone()
+    assert row == (1,)  # only the one valid tick before the bucket closed
+
+
+def test_run_aggregation_loop_flushes_a_stale_bucket_via_the_periodic_safety_net(
+    db_conn, redis_client: redis.Redis
+) -> None:
+    """No second tick ever arrives to trigger ingest()'s rollover-detection
+    -- only the periodic flush can close this bucket. Uses a tick timestamped
+    far in the past (not a real multi-minute wall-clock wait): the very
+    first periodic check already finds the bucket's window elapsed."""
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel = f"ticks:{iid}"
+    stale_ts = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(
+            async_redis,
+            db_conn,
+            flush_check_seconds=0.05,
+            sleep=asyncio.sleep,
+            max_bars_written=1,
+        )
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)
+            redis_client.publish(channel, _tick_json(iid, stale_ts, "65000.00"))
+
+        asyncio.run(_run_both(loop_task, _publish_after_subscribed()))
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    row = db_conn.execute(
+        "SELECT trades FROM bars_intraday WHERE instrument_id = %s", (iid,)
+    ).fetchone()
+    assert row == (1,)

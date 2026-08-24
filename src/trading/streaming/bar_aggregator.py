@@ -9,12 +9,19 @@ exists: turning crypto_ingestor's live ticks into real 1-minute bars in
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import psycopg
+import structlog
 from psycopg import Connection
+from redis.asyncio import Redis
+from redis.asyncio.client import PubSub
 
+from trading.config import get_settings
 from trading.contracts import DataSource
 from trading.streaming.models import Tick
 
@@ -141,3 +148,118 @@ def write_closed_bar(
             DataSource.BINANCE_WS.value,
         ),
     )
+
+
+log = structlog.get_logger(__name__)
+
+_TICK_PATTERN = "ticks:*"
+
+Sleeper = Callable[[float], Awaitable[None]]
+
+
+async def _default_sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+def _parse_tick(raw: str) -> Tick | None:
+    try:
+        return Tick.model_validate_json(raw)
+    except Exception as exc:  # noqa: BLE001 - a malformed message is skipped, never fatal
+        log.warning("bar_aggregator.malformed_message", reason=str(exc), raw=raw[:200])
+        return None
+
+
+async def run_aggregation_loop(
+    redis: Redis,
+    conn: Connection,
+    *,
+    interval_seconds: int = INTERVAL_SECONDS,
+    flush_check_seconds: float = 5.0,
+    sleep: Sleeper = _default_sleep,
+    max_bars_written: int | None = None,
+) -> None:
+    """Subscribe to `ticks:*`, aggregate into bars, write each closed bar.
+
+    Runs forever when `max_bars_written` is None (production). Stops once
+    `max_bars_written` bars have been written when it's an int -- a test
+    seam, the same shape as `crypto_ingestor.run_ingestion_loop`'s
+    `max_ticks`.
+    """
+    aggregator = BarAggregator(interval_seconds)
+    written = 0
+    done = asyncio.Event()
+
+    def _write_all(closed_bars: list[ClosedBar]) -> None:
+        nonlocal written
+        for closed in closed_bars:
+            write_closed_bar(conn, closed, interval_seconds=interval_seconds)
+            written += 1
+        if max_bars_written is not None and written >= max_bars_written:
+            done.set()
+
+    async def _consume_ticks(pubsub: PubSub) -> None:
+        async for message in pubsub.listen():
+            if message["type"] != "pmessage":
+                continue
+            tick = _parse_tick(message["data"])
+            if tick is None:
+                continue
+            _write_all(aggregator.ingest(tick))
+            if done.is_set():
+                return
+
+    async def _periodic_flush() -> None:
+        while not done.is_set():
+            await sleep(flush_check_seconds)
+            _write_all(aggregator.flush_stale(datetime.now(UTC)))
+
+    pubsub = redis.pubsub()
+    await pubsub.psubscribe(_TICK_PATTERN)
+    consumer = asyncio.create_task(_consume_ticks(pubsub))
+    flusher = asyncio.create_task(_periodic_flush())
+    try:
+        if max_bars_written is None:
+            await asyncio.gather(consumer, flusher)
+        else:
+            await done.wait()
+    finally:
+        consumer.cancel()
+        flusher.cancel()
+        try:
+            await pubsub.punsubscribe()
+            # redis-py's PubSub.aclose (unlike Redis.aclose) ships with no
+            # type annotations at all -- a real upstream stub gap, matching
+            # the same suppression stream_gateway already carries.
+            await pubsub.aclose()  # type: ignore[no-untyped-call]
+        except Exception:  # noqa: BLE001 - cleanup must never itself crash the loop
+            log.debug("bar_aggregator.pubsub_cleanup_failed", exc_info=True)
+        # Same reasoning as crypto_ingestor.run_ingestion_loop's identical
+        # finally block: release any pooled connection(s) opened during this
+        # run before control returns to the caller's event loop, so a
+        # caller closing `redis` from a *different* asyncio.run() call later
+        # (as short-lived test runs do) never hits a stale, cross-loop
+        # connection.
+        await redis.connection_pool.disconnect()
+
+
+def main() -> None:
+    settings = get_settings()
+    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    # autocommit=True: each closed bar is its own independent unit of work
+    # over a long-running connection -- unlike seed_instruments.py's
+    # one-shot atomic batch, there is no reason one bar's write should roll
+    # back because a later bar's write fails. This is also what keeps
+    # write_closed_bar() safe to call against `db_conn` in tests without any
+    # special-casing: it never commits itself either way.
+    conn = psycopg.connect(settings.database_url, autocommit=True)
+    log.info("bar_aggregator.starting", interval_seconds=INTERVAL_SECONDS)
+    try:
+        asyncio.run(run_aggregation_loop(redis, conn))
+    except KeyboardInterrupt:
+        log.info("bar_aggregator.interrupted")
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

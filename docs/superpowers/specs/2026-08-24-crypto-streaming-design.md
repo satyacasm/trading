@@ -135,6 +135,22 @@ different wire protocol):
   verbatim (as JSON) to every browser client currently subscribed to that
   `instrument_id`.
 
+> **Amendment (post-ship, 2026-08-24):** the shipped gateway does not hold a
+> per-instrument Redis `SUBSCRIBE`/`UNSUBSCRIBE` as described above. During
+> Task 5's fix loop, a controller-approved ruling replaced it with one
+> connection-lifetime `psubscribe("ticks:*")` per WebSocket connection plus
+> in-process filtering against a local `subscribed: set[int]`. Reason:
+> redis-py's `PubSub.subscribe()`/`unsubscribe()` are fire-and-forget — they
+> write the command and return without waiting for Redis's confirmation —
+> which raced against a real, separately-connected publisher, risking ticks
+> published before the matching `SUBSCRIBE` had actually reached Redis. The
+> `psubscribe` redesign closes that race structurally. This trades away
+> only the literal per-channel-selectivity mechanism, not the
+> connection-scoped-subscription design goal above (still one Redis
+> subscription per WebSocket connection, torn down on disconnect, no shared
+> manager). Full reasoning:
+> `.superpowers/sdd/2026-08-24-crypto-streaming/progress.md`, Task 5 entries.
+
 ## Testing
 
 Follows this repo's existing conventions rather than introducing new ones:

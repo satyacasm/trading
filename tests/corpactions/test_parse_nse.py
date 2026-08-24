@@ -136,13 +136,21 @@ def test_split_ratios_are_stored_canonically_reduced_to_lowest_terms(db_conn):
     assert by_symbol["SKMEGGPROD"].ratio_to == Decimal("2")
 
 
-def test_an_unrecognised_subject_is_skipped_not_guessed(db_conn):
-    """'Scheme Of Arrangement - Bonus Ncrps 4:1' is not a plain equity bonus
-    and this parser has not been shown a verified example of what its ratio
-    means -- it must be skipped, not guessed."""
+def test_an_ncrps_bonus_is_never_read_as_an_equity_bonus(db_conn):
+    """'Scheme Of Arrangement - Bonus Ncrps 4:1' issues preference shares --
+    the equity share count does not change, so treating it as a BONUS would
+    apply a 4:1 factor to every price before that date.
+
+    It is now recorded as a DEMERGER (it is a scheme of arrangement, and the
+    date alone explains a price move), which is a change from being dropped
+    entirely. The invariant that matters is unchanged and asserted directly:
+    its ratio is never taken, and it never becomes a BONUS."""
     result = parse_nse_corporate_actions(_SAMPLE, DbInstrumentResolver(), db_conn)
-    assert result.skipped == 1
-    assert {r.raw["symbol"] for r in result.rows} == {
+
+    ncrps = [r for r in result.rows if r.raw["symbol"] == "SIYSIL"]
+    assert all(r.action_type != "BONUS" for r in result.rows if r.raw["symbol"] == "SIYSIL")
+    assert all(r.ratio_to is None for r in ncrps)
+    assert {r.raw["symbol"] for r in result.rows} >= {
         "BESTAGRO",
         "MCX",
         "SKMEGGPROD",

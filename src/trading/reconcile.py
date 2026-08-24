@@ -443,7 +443,21 @@ def check_cross_source_agreement(
 # 4. Continuity
 # ---------------------------------------------------------------------------
 
-_CORP_ACTION_TYPES = ("SPLIT", "BONUS", "DIVIDEND")
+# Every action that changes the share count or carves value out of it, and
+# so genuinely moves the price on its ex-date. RIGHTS, DEMERGER and
+# CAPITAL_REDUCTION were added once the decade of NSE corporate actions was
+# actually loaded: 396 real events could not explain the move they had caused
+# because this tuple did not name them. `adjust.py` still applies only SPLIT
+# and BONUS -- the others have no ratio in NSE's feed -- so naming them here
+# explains a jump without repricing anything.
+_CORP_ACTION_TYPES = (
+    "SPLIT",
+    "BONUS",
+    "DIVIDEND",
+    "RIGHTS",
+    "DEMERGER",
+    "CAPITAL_REDUCTION",
+)
 
 
 _CONTINUITY_PAIRS = """

@@ -75,26 +75,52 @@ _MONTH_NUM = {
 # guessed: every alternative below is a spelling NSE actually uses. See
 # tests/corpactions/test_classify.py, where each case is copied verbatim.
 _NUM = r"(\d+(?:\.\d+)?)"
+# NSE writes an amount as "Rs 2", "Re 1/-", "Rs 2.55" -- the "/-" is
+# decoration, not part of the number.
+_RUPEES = rf"R[se]\.?\s*{_NUM}(?:/-)?"
+# "(Purpose Revised)", "(Revised)" and similar administrative suffixes change
+# nothing about the action itself.
+_SUFFIX = r"(?:\s*\([^)]*\))?"
 
-# "Bonus 1:2" -> 1 new share for every 2 held. Anchored at the start of its
-# own segment so "Scheme Of Arrangement - Bonus Ncrps 4:1" can never match:
-# an NCRPS bonus issues preference shares, leaving the equity share count
-# unchanged, so applying it would corrupt every price before that date.
-_BONUS_RE = re.compile(rf"^Bonus {_NUM}:{_NUM}$")
+# "Bonus 1:2" -> 1 new share for every 2 held. Anchored to its own segment so
+# "Scheme Of Arrangement - Bonus Ncrps 4:1" can never match: an NCRPS bonus
+# issues preference shares, leaving the equity share count unchanged, so
+# applying it would corrupt every price before that date.
+_BONUS_RE = re.compile(rf"^Bonus {_NUM}:{_NUM}{_SUFFIX}$")
 
 # "Face Value Split (Sub-Division) - From Rs 10/- Per Share To Rs 2/- Per Share"
-# "Face Value Split From Rs 10 To Rs 2"
-# "Face Value Split (Sub-Division) - From Rs10/- Per Share To Rs 5/- Per Share"
+# "Face Value Split From Rs 10 To Rs 2" / "Fv Splt Frm Rs 10 To Re 1"
 _SPLIT_RE = re.compile(
-    rf"^Face Value Split\s*(?:\(Sub-Division\))?\s*-?\s*From\s+R[se]\s*{_NUM}"
-    rf"(?:/-)?(?:\s+Per\s+Share)?\s+To\s+R[se]\s*{_NUM}(?:/-)?(?:\s+Per\s+Share)?$"
+    rf"^(?:Face Value Split|Fv Splt)\s*(?:\(Sub-Division\))?\s*-?\s*(?:From|Frm)\s+"
+    rf"{_RUPEES}(?:\s+Per\s+Share)?\s+To\s+{_RUPEES}(?:\s+Per\s+Share)?{_SUFFIX}$"
 )
 
-# "Dividend - Rs 2 Per Share", "Interim Dividend - Rs 2.55 Per Share",
-# "Dividend - Re 0.70  Per Share" (doubled space), "Dividend - Rs 6 Per Sh".
+# "Dividend - Rs 2 Per Share", "Interim Dividend Rs 5/- Per Share",
+# "Interim Dividend - Rs 2/- Per Share (Purpose Revised)", "Interim Div - Rs 6/-".
 _DIVIDEND_RE = re.compile(
-    rf"^(?:Interim|Final|Special)?\s*Dividend\s*-\s*R[se]\s*{_NUM}\s+Per\s+Sh(?:are)?$"
+    rf"^(?:Interim|Int|Final|Special)?\s*Div(?:idend)?\s*-?\s*{_RUPEES}"
+    rf"\s+Per\s+Sh(?:are)?{_SUFFIX}$"
 )
+
+# "Rights 2:5 @ Premium Rs 1.17/-" -- 2 new shares offered for every 5 held.
+# Dilutive, so the price genuinely moves on the ex-date. Recorded rather than
+# dropped; `adjust.py` applies only SPLIT and BONUS, so this informs the
+# continuity check without repricing anything.
+_RIGHTS_RE = re.compile(rf"^Rights {_NUM}:{_NUM}\b.*$")
+
+# "Scheme Of Arrangement", "Scheme Of Amalgamation", "Demerger". These carve
+# real value out of the share price, and this feed carries no ratio for them
+# at all -- only the date. The event is recorded so the move is explained;
+# inventing a factor would silently reprice a decade of history.
+_DEMERGER_RE = re.compile(
+    r"(?i)^(?:Composite\s+)?(?:Scheme Of (?:Arrangement|Amalgamation|Demerger)"
+    r"|Demerger|Spin.?Off)\b.*$"
+)
+
+# "Capital Reduction" -- shares cancelled against accumulated losses, so the
+# share count changes and the price moves. Like a demerger, this feed gives
+# no ratio, so the event is recorded without one.
+_CAPITAL_REDUCTION_RE = re.compile(r"(?i)^(?:Reduction Of Capital|Capital Reduction)\b.*$")
 
 
 @dataclass(frozen=True)
@@ -214,8 +240,9 @@ def _classify(subject: str) -> list[tuple[str, Decimal | None, Decimal | None, D
     before that date and fails silently, which is worse than not parsing it.
     """
     actions: list[tuple[str, Decimal | None, Decimal | None, Decimal | None]] = []
-    # Split on "/" only where it separates two actions, never inside "Rs 10/-".
-    for part in re.split(r"/(?!-)", subject):
+    # Split on "/", "+" or "&" where they separate two actions, never inside
+    # the "/-" that decorates a rupee amount.
+    for part in re.split(r"/(?!-)|\+|&", subject):
         segment = part.strip()
         if m := _BONUS_RE.match(segment):
             new, held = Decimal(m.group(1)), Decimal(m.group(2))
@@ -235,6 +262,13 @@ def _classify(subject: str) -> list[tuple[str, Decimal | None, Decimal | None, D
             actions.append(("SPLIT", Decimal(ratio.numerator), Decimal(ratio.denominator), None))
         elif m := _DIVIDEND_RE.match(segment):
             actions.append(("DIVIDEND", None, None, Decimal(m.group(1))))
+        elif m := _RIGHTS_RE.match(segment):
+            offered, held = Decimal(m.group(1)), Decimal(m.group(2))
+            actions.append(("RIGHTS", held, held + offered, None))
+        elif _DEMERGER_RE.match(segment):
+            actions.append(("DEMERGER", None, None, None))
+        elif _CAPITAL_REDUCTION_RE.match(segment):
+            actions.append(("CAPITAL_REDUCTION", None, None, None))
     return actions
 
 

@@ -992,3 +992,36 @@ def test_cross_source_agreement_still_catches_a_stale_underlying(db_conn):
 
     result = check_cross_source_agreement(db_conn, date(1998, 8, 13), date(1998, 8, 13))
     assert result.status == CheckStatus.FAIL
+
+
+@pytest.mark.parametrize("action_type", ["RIGHTS", "DEMERGER", "CAPITAL_REDUCTION"])
+def test_continuity_accepts_every_share_count_changing_action(db_conn, action_type: str):
+    """A rights issue dilutes, a demerger carves value out, a capital
+    reduction cancels shares -- all three genuinely move the price on the
+    ex-date, so all three explain a jump. Recognising only SPLIT/BONUS/
+    DIVIDEND left 396 real events unable to explain the move they caused.
+    """
+    _load(
+        db_conn,
+        [
+            _bar_row(
+                symbol=f"CONT{action_type[:4]}",
+                ts=datetime(1998, 8, 12, 10, 0, tzinfo=UTC),
+                close="100.00",
+            ),
+            _bar_row(
+                symbol=f"CONT{action_type[:4]}",
+                ts=datetime(1998, 8, 13, 10, 0, tzinfo=UTC),
+                close="50.00",
+            ),
+        ],
+    )
+    iid = _instrument_id(db_conn, "NSE", "CM", f"CONT{action_type[:4]}")
+    db_conn.execute(
+        "INSERT INTO corporate_actions (instrument_id, action_type, ex_date, source) "
+        "VALUES (%s,%s,%s,'test')",
+        (iid, action_type, date(1998, 8, 13)),
+    )
+
+    result = check_continuity(db_conn, date(1998, 8, 12), date(1998, 8, 13))
+    assert result.status == CheckStatus.PASS

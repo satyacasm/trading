@@ -52,7 +52,7 @@ def test_backfill_ingests_every_window_and_totals_the_rows(db_conn):
         (date(2017, 1, 1), date(2017, 12, 31)): (
             b'[{"symbol":"CABTESTB","subject":"Dividend - Rs 2 Per Share",'
             b'"exDate":"20-Jul-2017","caBroadcastDate":null},'
-            b'{"symbol":"CABTESTC","subject":"Scheme Of Arrangement",'
+            b'{"symbol":"CABTESTC","subject":"Buy Back",'
             b'"exDate":"21-Jul-2017","caBroadcastDate":null}]'
         ),
     }
@@ -69,7 +69,9 @@ def test_backfill_ingests_every_window_and_totals_the_rows(db_conn):
         (date(2017, 1, 1), date(2017, 12, 31)),
     ]
     assert result.ingested == 2  # the bonus and the dividend
-    assert result.skipped == 1  # "Scheme Of Arrangement" is never guessed at
+    # A buy-back is a tender offer with no ex-date price adjustment, so it is
+    # counted as unrecognised rather than recorded.
+    assert result.skipped == 1
     stored = db_conn.execute(
         "SELECT count(*) FROM corporate_actions ca JOIN instruments i USING (instrument_id) "
         "WHERE i.symbol LIKE 'CABTEST%'"

@@ -1166,3 +1166,90 @@ def test_a_spike_is_never_excused_by_a_corporate_action(db_conn):
 
     assert result.status == CheckStatus.FAIL
     assert "spike" in result.detail
+
+
+def test_a_corporate_action_on_a_sibling_series_still_explains_a_step(db_conn):
+    """A stock migrating series (EQ<->BE, a routine surveillance event) around
+    its own split date gets two `instrument_id` rows sharing one ISIN. NSE's/
+    BSE's feed attaches the action to whichever series it resolves against --
+    not necessarily the one that was actually trading (and printing the
+    step) on ex-date. Confirmed live: AARTECH's SPLIT+BONUS landed on its
+    post-migration EQ-series instrument_id while the actual -65% step
+    happened on the BE-series row that was still trading that day
+    (docs/continuity-step-review.md, Finding 1).
+    """
+    _three_bars(db_conn, "SIBSTEP", ("100.00", "50.00", "51.00"))
+    live_iid = _instrument_id(db_conn, "NSE", "CM", "SIBSTEP")
+
+    # The sibling instrument_id the action actually lands on: same symbol,
+    # ISIN and segment, different series -- e.g. the post-migration EQ row.
+    sibling_iid = db_conn.execute(
+        "INSERT INTO instruments (exchange, segment, symbol, series, asset_class, status, "
+        "canonical_key) VALUES ('NSE','CM','SIBSTEP','BE','EQUITY','ACTIVE',"
+        "'test_sibling_sibstep_be') RETURNING instrument_id"
+    ).fetchone()[0]
+    db_conn.execute(
+        "UPDATE instruments SET isin='INE_SIBLING_TEST' WHERE instrument_id IN (%s,%s)",
+        (live_iid, sibling_iid),
+    )
+    db_conn.execute(
+        "INSERT INTO corporate_actions (instrument_id, action_type, ex_date, ratio_from, "
+        "ratio_to, source) VALUES (%s,'SPLIT',%s,1,2,'test')",
+        (sibling_iid, date(1998, 8, 12)),
+    )
+
+    result = check_continuity(db_conn, date(1998, 8, 11), date(1998, 8, 13))
+
+    assert result.status == CheckStatus.PASS
+
+
+def test_a_corporate_action_a_few_days_before_an_illiquid_step_still_explains_it(db_conn):
+    """An illiquid instrument doesn't trade every session: the "previous bar"
+    a pair is built from can predate the action, and the "current bar" is
+    simply the first trade after it -- which can land several sessions past
+    the announced `ex_date`. Confirmed live: MINOLTAF's -90.5% step landed
+    4 calendar days after its recorded 1:10 SPLIT ex_date
+    (docs/continuity-step-review.md, Finding 2). `max_gap_days` already
+    bounds how far apart two compared bars may be, so the same tolerance
+    should cover the action's ex_date.
+    """
+    _load(
+        db_conn,
+        [
+            _bar_row(symbol="LAGSTEP", ts=datetime(1998, 8, 6, 10, 0, tzinfo=UTC), close="100.00"),
+            _bar_row(symbol="LAGSTEP", ts=datetime(1998, 8, 12, 10, 0, tzinfo=UTC), close="10.00"),
+        ],
+    )
+    iid = _instrument_id(db_conn, "NSE", "CM", "LAGSTEP")
+    db_conn.execute(
+        "INSERT INTO corporate_actions (instrument_id, action_type, ex_date, ratio_from, "
+        "ratio_to, source) VALUES (%s,'SPLIT',%s,1,10,'test')",
+        (iid, date(1998, 8, 7)),
+    )
+
+    result = check_continuity(db_conn, date(1998, 8, 6), date(1998, 8, 12), max_gap_days=7)
+
+    assert result.status == CheckStatus.PASS
+
+
+def test_a_corporate_action_more_than_max_gap_days_before_a_step_does_not_explain_it(db_conn):
+    """The widened window is bounded, not unlimited: an action more than
+    `max_gap_days` before the jump is still coincidental, not explanatory."""
+    _load(
+        db_conn,
+        [
+            _bar_row(symbol="TOOFAR", ts=datetime(1998, 8, 1, 10, 0, tzinfo=UTC), close="100.00"),
+            _bar_row(symbol="TOOFAR", ts=datetime(1998, 8, 7, 10, 0, tzinfo=UTC), close="10.00"),
+        ],
+    )
+    iid = _instrument_id(db_conn, "NSE", "CM", "TOOFAR")
+    db_conn.execute(
+        "INSERT INTO corporate_actions (instrument_id, action_type, ex_date, ratio_from, "
+        "ratio_to, source) VALUES (%s,'SPLIT',%s,1,10,'test')",
+        (iid, date(1998, 7, 20)),
+    )
+
+    result = check_continuity(db_conn, date(1998, 8, 1), date(1998, 8, 7), max_gap_days=7)
+
+    assert result.status == CheckStatus.FAIL
+    assert "TOOFAR" in result.detail

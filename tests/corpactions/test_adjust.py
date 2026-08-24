@@ -88,6 +88,70 @@ def test_query_is_immune_to_session_timezone(db_conn, seeded_instrument):
     assert seen_dates == {date(2026, 8, 11), date(2026, 8, 13)}
 
 
+def test_a_split_recorded_against_a_sibling_series_still_adjusts_the_bars(
+    db_conn, seeded_instrument
+):
+    """A stock migrating trading series (EQ<->BE, a routine surveillance
+    event) around its own split date ends up with two `instrument_id` rows
+    sharing one ISIN. NSE's/BSE's feed attaches the action to whichever one
+    it resolves against -- confirmed live for AARTECH and PCJEWELLER
+    (docs/continuity-step-review.md, Finding 1) the action can land on the
+    *other* series' row, not the one whose bars actually need adjusting.
+    `adjustment_factors` must still find it.
+    """
+    live_iid = seeded_instrument(closes={date(2026, 8, 11): 500}, symbol="SIBADJ")
+    sibling_iid = db_conn.execute(
+        "INSERT INTO instruments (exchange, segment, symbol, series, asset_class, status, "
+        "canonical_key) VALUES ('NSE','CM','SIBADJ','BE','EQUITY','ACTIVE',"
+        "'test_sibling_sibadj_be') RETURNING instrument_id"
+    ).fetchone()[0]
+    db_conn.execute(
+        "UPDATE instruments SET isin='INE_SIBLING_ADJ_TEST' WHERE instrument_id IN (%s,%s)",
+        (live_iid, sibling_iid),
+    )
+    # The SPLIT lands on the sibling instrument_id, not the one with the bars.
+    db_conn.execute(
+        "INSERT INTO corporate_actions (instrument_id, action_type, ex_date,"
+        " ratio_from, ratio_to, source) VALUES (%s,'SPLIT','2026-08-12',1,5,'test')",
+        (sibling_iid,),
+    )
+
+    frame = adjusted_bars(
+        db_conn, live_iid, date(2026, 8, 11), date(2026, 8, 11), as_of=date(2026, 8, 14)
+    )
+    assert frame["close"][0] == Decimal("100.0000")
+
+
+def test_a_duplicate_action_across_sibling_series_is_applied_only_once(db_conn, seeded_instrument):
+    """Live-verified (PCJEWELLER, docs/continuity-step-review.md Finding 1):
+    the same real-world SPLIT can be ingested once per sibling instrument_id
+    (BSE alone carried three identical rows for PC Jeweller's 1:10 split).
+    Widening the lookup to every sibling must not multiply the factor.
+    """
+    live_iid = seeded_instrument(closes={date(2026, 8, 11): 500}, symbol="SIBDUP")
+    sibling_iid = db_conn.execute(
+        "INSERT INTO instruments (exchange, segment, symbol, series, asset_class, status, "
+        "canonical_key) VALUES ('NSE','CM','SIBDUP','BE','EQUITY','ACTIVE',"
+        "'test_sibling_sibdup_be') RETURNING instrument_id"
+    ).fetchone()[0]
+    db_conn.execute(
+        "UPDATE instruments SET isin='INE_SIBLING_DUP_TEST' WHERE instrument_id IN (%s,%s)",
+        (live_iid, sibling_iid),
+    )
+    for iid in (live_iid, sibling_iid):
+        db_conn.execute(
+            "INSERT INTO corporate_actions (instrument_id, action_type, ex_date,"
+            " ratio_from, ratio_to, source) VALUES (%s,'SPLIT','2026-08-12',1,5,'test')",
+            (iid,),
+        )
+
+    frame = adjusted_bars(
+        db_conn, live_iid, date(2026, 8, 11), date(2026, 8, 11), as_of=date(2026, 8, 14)
+    )
+    # 500 / 5 = 100 -- if the duplicate were double-applied it would be 20.
+    assert frame["close"][0] == Decimal("100.0000")
+
+
 def test_announced_at_is_also_immune_to_session_timezone(db_conn, seeded_instrument):
     """Ruling A6 (task-16 fix round 1): `announced_at::date` had the exact
     session-timezone defect Ruling A2 already fixed on `ts` -- left on its

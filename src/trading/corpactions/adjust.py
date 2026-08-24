@@ -54,15 +54,42 @@ _BAR_QUERY = """
 # with an exclusive upper bound one day after `as_of` (computed in Python,
 # same pattern as `_BAR_QUERY`'s `upper`) makes an action "known as of
 # as_of" iff it was announced any time on or before that UTC calendar day.
+#
+# `instrument_id = ANY(%s)` rather than `= %s`: a SPLIT/BONUS belongs to the
+# company (ISIN), not to whichever trading series NSE's/BSE's feed happened
+# to resolve it against. `_identity_group` supplies every instrument_id
+# sharing this one's ISIN, exchange and segment (docs/continuity-step-review.md,
+# Finding 1, live-verified against AARTECH and PCJEWELLER: a series migration
+# around the split date -- EQ<->BE, a routine surveillance event -- puts the
+# action on a *different* instrument_id than the bars that need adjusting).
 _ACTION_QUERY = """
     SELECT ex_date, ratio_from, ratio_to
     FROM corporate_actions
-    WHERE instrument_id = %s
+    WHERE instrument_id = ANY(%s)
       AND action_type IN ('SPLIT', 'BONUS')
       AND ex_date <= %s
       AND (announced_at IS NULL OR announced_at < %s)
     ORDER BY ex_date
 """
+
+_IDENTITY_GROUP_QUERY = """
+    SELECT s.instrument_id
+    FROM instruments t
+    JOIN instruments s
+      ON s.isin = t.isin AND s.exchange = t.exchange AND s.segment = t.segment
+    WHERE t.instrument_id = %s AND t.isin IS NOT NULL
+"""
+
+
+def _identity_group(conn: Connection, instrument_id: int) -> list[int]:
+    """Every instrument_id sharing this instrument's ISIN, exchange and segment.
+
+    Includes `instrument_id` itself. Falls back to just `[instrument_id]`
+    when it has no ISIN on file -- nothing to match siblings on.
+    """
+    rows = conn.execute(_IDENTITY_GROUP_QUERY, (instrument_id,)).fetchall()
+    ids = [row[0] for row in rows]
+    return ids if ids else [instrument_id]
 
 
 def adjustment_factors(
@@ -78,14 +105,30 @@ def adjustment_factors(
     `(conn, instrument_id, *, as_of)`, dropping the dead parameters and
     making `as_of` keyword-only so no caller can transpose it with a date
     bound.
+
+    Looks past `instrument_id` alone to its whole identity group
+    (`_identity_group`) so a split filed against a sibling series is not
+    silently invisible to the bars that actually need adjusting.
     """
     known_before = datetime(as_of.year, as_of.month, as_of.day, tzinfo=UTC) + timedelta(days=1)
-    rows = conn.execute(_ACTION_QUERY, (instrument_id, as_of, known_before)).fetchall()
-    return [
-        (ex_date, Decimal(ratio_from) / Decimal(ratio_to))
-        for ex_date, ratio_from, ratio_to in rows
-        if ratio_to
-    ]
+    group = _identity_group(conn, instrument_id)
+    rows = conn.execute(_ACTION_QUERY, (group, as_of, known_before)).fetchall()
+
+    # The same real-world action can be ingested once per sibling
+    # instrument_id (live-verified for PCJEWELLER's BSE split, filed three
+    # times across three instrument_ids) -- dedupe on the fact of the action,
+    # not its row, so widening to the identity group never double-applies it.
+    seen: set[tuple[date, Decimal, Decimal]] = set()
+    factors: list[tuple[date, Decimal]] = []
+    for ex_date, ratio_from, ratio_to in rows:
+        if not ratio_to:
+            continue
+        key = (ex_date, Decimal(ratio_from), Decimal(ratio_to))
+        if key in seen:
+            continue
+        seen.add(key)
+        factors.append((ex_date, Decimal(ratio_from) / Decimal(ratio_to)))
+    return factors
 
 
 def adjusted_bars(

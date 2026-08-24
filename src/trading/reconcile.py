@@ -524,6 +524,24 @@ def check_continuity(
                  split-adjustment bug spec §8 item 4 is really about, so it
                  fails unless a corporate action explains it.
 
+    A `step`'s corporate action lookup is deliberately not an exact
+    `(instrument_id, ex_date)` match (docs/continuity-step-review.md,
+    Findings 1-2, live-verified against 1,530 real steps):
+
+    - it also accepts the action on any *sibling* `instrument_id` -- same
+      ISIN, exchange and segment, different `series` -- because a stock
+      migrating series (EQ<->BE, a routine surveillance event) around its
+      own split date gets two `instrument_id` rows, and NSE's/BSE's feed
+      attaches the action to whichever one it resolves against, not
+      necessarily the one that was actually trading (and printing the step)
+      on ex-date;
+    - it accepts `ex_date` anywhere in `[row_date - max_gap_days, row_date]`,
+      not only exactly `row_date`, because an illiquid instrument doesn't
+      trade every session -- its first post-action print can land several
+      sessions after the announced ex-date, and that gap is already the
+      same tolerance `max_gap_days` uses to decide two bars are close enough
+      to compare at all.
+
     Every pair lands in exactly one bucket and every bucket is counted in the
     result, so nothing is quietly dropped on the way to a green check.
     """
@@ -578,9 +596,19 @@ def check_continuity(
             continue
 
         matched = conn.execute(
-            "SELECT 1 FROM corporate_actions WHERE instrument_id=%s "
-            "AND action_type = ANY(%s) AND ex_date = %s LIMIT 1",
-            (instrument_id, list(_CORP_ACTION_TYPES), row_date),
+            "SELECT 1 FROM corporate_actions ca JOIN instruments t "
+            "ON t.instrument_id = %s WHERE ca.action_type = ANY(%s) "
+            "AND ca.ex_date BETWEEN %s AND %s "
+            "AND (ca.instrument_id = t.instrument_id OR (t.isin IS NOT NULL AND "
+            "     ca.instrument_id IN (SELECT s.instrument_id FROM instruments s "
+            "         WHERE s.isin = t.isin AND s.exchange = t.exchange "
+            "         AND s.segment = t.segment))) LIMIT 1",
+            (
+                instrument_id,
+                list(_CORP_ACTION_TYPES),
+                row_date - timedelta(days=max_gap_days),
+                row_date,
+            ),
         ).fetchone()
         if matched is not None:
             explained += 1

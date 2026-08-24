@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Crypto stream proof</title>
+  <style>
+    body { font-family: monospace; padding: 2rem; }
+    .price { font-size: 2rem; }
+    .up { color: green; }
+    .down { color: red; }
+  </style>
+</head>
+<body>
+  <h1>Live crypto ticks (Binance)</h1>
+  <div id="rows"></div>
+  <script>
+    const rows = document.getElementById("rows");
+    const lastPrice = {};
+
+    async function main() {
+      const instruments = await (await fetch("/instruments")).json();
+      const idToSymbol = {};
+      for (const [symbol, instrumentId] of Object.entries(instruments)) {
+        idToSymbol[instrumentId] = symbol;
+        const row = document.createElement("div");
+        row.id = "row-" + instrumentId;
+        row.innerHTML = symbol + ": <span class='price'>waiting...</span>";
+        rows.appendChild(row);
+      }
+
+      const ws = new WebSocket("ws://" + location.host + "/ws");
+      ws.onopen = () => {
+        for (const instrumentId of Object.keys(idToSymbol)) {
+          ws.send(JSON.stringify({ action: "subscribe", instrument_id: Number(instrumentId) }));
+        }
+      };
+      ws.onmessage = (event) => {
+        const tick = JSON.parse(event.data);
+        const symbol = idToSymbol[tick.instrument_id];
+        const row = document.getElementById("row-" + tick.instrument_id);
+        const priceEl = row.querySelector(".price");
+        const price = Number(tick.price);
+        const prev = lastPrice[tick.instrument_id];
+        priceEl.textContent = tick.price;
+        priceEl.className = "price " + (prev === undefined ? "" : price >= prev ? "up" : "down");
+        lastPrice[tick.instrument_id] = price;
+      };
+    }
+
+    main();
+  </script>
+</body>
+</html>

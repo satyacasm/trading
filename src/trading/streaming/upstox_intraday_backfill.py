@@ -67,6 +67,9 @@ def parse_candle_response(payload: dict[str, Any], instrument_id: int) -> list[B
         raise ValueError(f"response missing data.candles: {payload!r}")
 
     raw_candles = data["candles"]
+    if not isinstance(raw_candles, list):
+        raise ValueError(f"data.candles must be a list, got {type(raw_candles).__name__}")
+
     candles: list[BackfillCandle] = []
     for row in raw_candles:
         if len(row) != 7:

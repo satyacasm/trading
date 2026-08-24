@@ -105,3 +105,10 @@ def test_parse_candle_response_raises_when_a_candle_row_has_the_wrong_arity():
 
     with pytest.raises(ValueError, match="7"):
         parse_candle_response(payload, instrument_id=1)
+
+
+def test_parse_candle_response_raises_when_candles_is_not_a_list():
+    payload = {"status": "success", "data": {"candles": None}}
+
+    with pytest.raises(ValueError, match="candles"):
+        parse_candle_response(payload, instrument_id=1)

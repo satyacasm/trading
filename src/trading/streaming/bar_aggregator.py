@@ -127,12 +127,24 @@ _UPSERT_BAR = """
 
 
 def write_closed_bar(
-    conn: Connection, closed: ClosedBar, *, interval_seconds: int = INTERVAL_SECONDS
+    conn: Connection,
+    closed: ClosedBar,
+    *,
+    interval_seconds: int = INTERVAL_SECONDS,
+    source: DataSource = DataSource.BINANCE_WS,
 ) -> None:
     """Upsert one closed bar. Never calls `conn.commit()` -- see this plan's
     Global Constraints for why (keeps this function test-safe against
     `db_conn`'s rollback-at-teardown; production commits via an
-    `autocommit=True` connection instead)."""
+    `autocommit=True` connection instead).
+
+    `source` defaults to `DataSource.BINANCE_WS` -- today's only publisher
+    on the `ticks:*` convention -- but the bucketing logic upstream is
+    publisher-agnostic (it only reads `Tick.instrument_id`), so a future
+    non-Binance ingestor publishing the same `Tick`-shaped JSON can pass its
+    own `DataSource` here instead of silently mis-attributing its bars as
+    Binance's.
+    """
     conn.execute(
         _UPSERT_BAR,
         (
@@ -145,7 +157,7 @@ def write_closed_bar(
             closed.bar.close,
             closed.bar.volume,
             closed.bar.trades,
-            DataSource.BINANCE_WS.value,
+            source.value,
         ),
     )
 
@@ -177,22 +189,44 @@ async def run_aggregation_loop(
     flush_check_seconds: float = 5.0,
     sleep: Sleeper = _default_sleep,
     max_bars_written: int | None = None,
+    source: DataSource = DataSource.BINANCE_WS,
+    pattern: str = _TICK_PATTERN,
 ) -> None:
-    """Subscribe to `ticks:*`, aggregate into bars, write each closed bar.
+    """Subscribe to `pattern` (`ticks:*` by default), aggregate into bars,
+    write each closed bar.
 
     Runs forever when `max_bars_written` is None (production). Stops once
     `max_bars_written` bars have been written when it's an int -- a test
     seam, the same shape as `crypto_ingestor.run_ingestion_loop`'s
     `max_ticks`.
+
+    Whatever minute is already in progress when this process starts has
+    only been partially observed -- this process cannot honestly claim to
+    have captured the whole window. `first_complete_bucket` is the first
+    bucket boundary at or after startup that this process *can* claim in
+    full; any bar that closes for an earlier bucket is discarded (logged,
+    not written) rather than persisted as if it were complete. This is the
+    startup-side counterpart to the shutdown path, which already discards
+    any still-open bucket instead of force-flushing it.
     """
     aggregator = BarAggregator(interval_seconds)
+    first_complete_bucket = bucket_start(datetime.now(UTC), interval_seconds) + timedelta(
+        seconds=interval_seconds
+    )
     written = 0
     done = asyncio.Event()
 
     def _write_all(closed_bars: list[ClosedBar]) -> None:
         nonlocal written
         for closed in closed_bars:
-            write_closed_bar(conn, closed, interval_seconds=interval_seconds)
+            if closed.bucket < first_complete_bucket:
+                log.info(
+                    "bar_aggregator.discarding_partial_startup_bar",
+                    instrument_id=closed.instrument_id,
+                    bucket=closed.bucket.isoformat(),
+                )
+                continue
+            write_closed_bar(conn, closed, interval_seconds=interval_seconds, source=source)
             written += 1
         if max_bars_written is not None and written >= max_bars_written:
             done.set()
@@ -214,7 +248,7 @@ async def run_aggregation_loop(
             _write_all(aggregator.flush_stale(datetime.now(UTC)))
 
     pubsub = redis.pubsub()
-    await pubsub.psubscribe(_TICK_PATTERN)
+    await pubsub.psubscribe(pattern)
     consumer = asyncio.create_task(_consume_ticks(pubsub))
     flusher = asyncio.create_task(_periodic_flush())
     try:

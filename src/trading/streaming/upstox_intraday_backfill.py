@@ -206,6 +206,15 @@ def backfill_symbol(
                 # under an explicit-transaction connection (as tests use) a
                 # CheckViolation would otherwise poison the whole transaction
                 # and fail every subsequent write in the same run/test.
+                # NOTE: this savepoint behavior requires the connection to
+                # already be mid-transaction (INTRANS) when this runs -- true
+                # for every test in this file only because each one reaches
+                # here via fixture_instrument_id, which inserts a row on
+                # db_conn first. A test that calls backfill_symbol(db_conn, ...)
+                # on a still-idle connection would make conn.transaction() the
+                # outermost transaction, which issues a real BEGIN/COMMIT and
+                # would permanently persist that candle past db_conn's
+                # rollback() teardown.
                 with conn.transaction():
                     write_backfill_candle(conn, candle)
                 report.candles_written += 1

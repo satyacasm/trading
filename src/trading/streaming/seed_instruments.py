@@ -26,6 +26,21 @@ CRYPTO_PAIRS: tuple[str, ...] = (
     "AVAX-USDT",
     "DOT-USDT",
     "LINK-USDT",
+    "MATIC-USDT",
+    "LTC-USDT",
+    "TRX-USDT",
+    "ATOM-USDT",
+    "UNI-USDT",
+    "ETC-USDT",
+    "XLM-USDT",
+    "NEAR-USDT",
+    "APT-USDT",
+    "ARB-USDT",
+    "OP-USDT",
+    "FIL-USDT",
+    "ICP-USDT",
+    "SUI-USDT",
+    "INJ-USDT",
 )
 
 _UPSERT = """

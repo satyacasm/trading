@@ -27,8 +27,14 @@ import psycopg
 import structlog
 
 from trading.config import get_settings
+from trading.corpactions.bse import (
+    BSE_CORPORATE_ACTIONS_URL,
+    BSE_HEADERS,
+    parse_bse_corporate_actions,
+)
 from trading.corpactions.ingest import (
     NSE_CORPORATE_ACTIONS_URL,
+    ParseResult,
     ingest_corporate_actions,
     parse_nse_corporate_actions,
 )
@@ -41,6 +47,7 @@ log = structlog.get_logger(__name__)
 NSE_PRIME_URL = "https://www.nseindia.com/companies-listing/corporate-filings-actions"
 
 Fetch = Callable[[date, date], bytes | None]
+Parse = Callable[[bytes, DbInstrumentResolver, psycopg.Connection], ParseResult]
 
 
 @dataclass(frozen=True)
@@ -83,6 +90,7 @@ def backfill_corporate_actions(
     *,
     resolver: DbInstrumentResolver | None = None,
     on_window: Callable[[date, date, int, int], None] | None = None,
+    parse: Parse | None = None,
 ) -> BackfillResult:
     """Fetch, parse and upsert every window in `[start, end]`.
 
@@ -98,7 +106,8 @@ def backfill_corporate_actions(
             failed += 1
             log.warning("corpactions.window_empty", start=window_start, end=window_end)
             continue
-        parsed = parse_nse_corporate_actions(payload, _resolver, conn)
+        _parse = parse if parse is not None else parse_nse_corporate_actions
+        parsed = _parse(payload, _resolver, conn)
         written = ingest_corporate_actions(conn, parsed.rows) if parsed.rows else 0
         fetched += 1
         ingested += written
@@ -129,8 +138,36 @@ def _nse_fetch(delay: float) -> Fetch:
     return fetch
 
 
+def _bse_fetch(delay: float) -> Fetch:
+    from trading.sources.http import ArchivingClient
+
+    client = ArchivingClient(root=get_settings().raw_archive_root)
+
+    def fetch(start: date, end: date) -> bytes | None:
+        url = f"{BSE_CORPORATE_ACTIONS_URL}&Fdate={start:%Y-%m-%d}&TDate={end:%Y-%m-%d}"
+        name = f"bse_corporate_actions/{start.isoformat()}_{end.isoformat()}.json"
+        result = client.get(url, archive_name=name, headers=BSE_HEADERS)
+        time.sleep(delay)
+        return result[0] if result is not None else None
+
+    return fetch
+
+
+def _bse_parse(
+    payload: bytes, _resolver: DbInstrumentResolver, conn: psycopg.Connection
+) -> ParseResult:
+    """Adapter: BSE resolves symbols by lookup, so it needs no resolver."""
+    return parse_bse_corporate_actions(payload, conn)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Backfill NSE corporate actions.")
+    parser = argparse.ArgumentParser(description="Backfill NSE/BSE corporate actions.")
+    parser.add_argument(
+        "--exchange",
+        choices=("nse", "bse"),
+        default="nse",
+        help="Which exchange's feed to walk (default: %(default)s).",
+    )
     parser.add_argument("--from", dest="start", type=date.fromisoformat, required=True)
     parser.add_argument("--to", dest="end", type=date.fromisoformat, required=True)
     parser.add_argument("--delay", type=float, default=1.0)
@@ -147,9 +184,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     def progress(w_start: date, w_end: date, written: int, skipped: int) -> None:
         print(f"  {w_start} .. {w_end}: {written} ingested, {skipped} skipped", flush=True)
 
+    fetch = _bse_fetch(args.delay) if args.exchange == "bse" else _nse_fetch(args.delay)
+    parse = _bse_parse if args.exchange == "bse" else None
     with psycopg.connect(get_settings().database_url, autocommit=False) as conn:
         result = backfill_corporate_actions(
-            conn, _nse_fetch(args.delay), args.start, args.end, on_window=progress
+            conn, fetch, args.start, args.end, on_window=progress, parse=parse
         )
         conn.commit()
     print(result)

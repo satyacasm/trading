@@ -16,7 +16,10 @@ Usage: uv run python -m trading.streaming.upstox_intraday_backfill
 from __future__ import annotations
 
 import calendar
-from datetime import date, timedelta
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from typing import Any
 
 
 def month_windows(start: date, end: date) -> list[tuple[date, date]]:
@@ -36,3 +39,49 @@ def month_windows(start: date, end: date) -> list[tuple[date, date]]:
         windows.append((window_start, window_end))
         window_start = window_end + timedelta(days=1)
     return windows
+
+
+@dataclass(frozen=True)
+class BackfillCandle:
+    instrument_id: int
+    ts: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+    open_interest: int | None
+
+
+def parse_candle_response(payload: dict[str, Any], instrument_id: int) -> list[BackfillCandle]:
+    """Parse one historical-candle API response into BackfillCandles.
+
+    Raises ValueError for a response shape that doesn't match the
+    documented contract -- not a silent skip. A REST response is one
+    deliberate, retryable request; a shape mismatch means the API contract
+    changed, and every subsequent window in this run would fail identically,
+    so it must surface immediately rather than be swallowed row by row.
+    """
+    data = payload.get("data")
+    if not isinstance(data, dict) or "candles" not in data:
+        raise ValueError(f"response missing data.candles: {payload!r}")
+
+    raw_candles = data["candles"]
+    candles: list[BackfillCandle] = []
+    for row in raw_candles:
+        if len(row) != 7:
+            raise ValueError(f"expected 7 elements per candle row, got {len(row)}: {row!r}")
+        ts_str, open_, high, low, close, volume, open_interest = row
+        candles.append(
+            BackfillCandle(
+                instrument_id=instrument_id,
+                ts=datetime.fromisoformat(ts_str).astimezone(UTC),
+                open=Decimal(str(open_)),
+                high=Decimal(str(high)),
+                low=Decimal(str(low)),
+                close=Decimal(str(close)),
+                volume=Decimal(str(volume)),
+                open_interest=int(open_interest) if open_interest is not None else None,
+            )
+        )
+    return candles

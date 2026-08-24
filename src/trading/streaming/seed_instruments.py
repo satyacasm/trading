@@ -15,7 +15,18 @@ from psycopg import Connection
 from trading.config import get_settings
 from trading.contracts import AssetClass, InstrumentRef
 
-CRYPTO_PAIRS: tuple[str, ...] = ("BTC-USDT", "ETH-USDT", "SOL-USDT")
+CRYPTO_PAIRS: tuple[str, ...] = (
+    "BTC-USDT",
+    "ETH-USDT",
+    "SOL-USDT",
+    "BNB-USDT",
+    "XRP-USDT",
+    "ADA-USDT",
+    "DOGE-USDT",
+    "AVAX-USDT",
+    "DOT-USDT",
+    "LINK-USDT",
+)
 
 _UPSERT = """
     INSERT INTO instruments

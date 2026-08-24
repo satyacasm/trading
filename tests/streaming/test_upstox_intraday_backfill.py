@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
+import httpx
 import pytest
 
 from trading.streaming.upstox_intraday_backfill import (
     BackfillCandle,
+    fetch_candles,
     month_windows,
     parse_candle_response,
 )
@@ -112,3 +114,74 @@ def test_parse_candle_response_raises_when_candles_is_not_a_list():
 
     with pytest.raises(ValueError, match="candles"):
         parse_candle_response(payload, instrument_id=1)
+
+
+def _mock_client(handler) -> httpx.Client:
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_fetch_candles_issues_the_documented_request_and_returns_json():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"status": "success", "data": {"candles": []}})
+
+    client = _mock_client(handler)
+
+    result = fetch_candles(
+        client,
+        instrument_key="NSE_EQ|INE002A01018",
+        from_date=date(2024, 1, 1),
+        to_date=date(2024, 1, 31),
+        token="tok123",
+    )
+
+    assert result == {"status": "success", "data": {"candles": []}}
+    assert captured["auth"] == "Bearer tok123"
+    assert (
+        captured["url"]
+        == "https://api.upstox.com/v3/historical-candle/NSE_EQ|INE002A01018/minutes/1/2024-01-31/2024-01-01"
+    )
+
+
+def test_fetch_candles_raises_on_non_2xx():
+    client = _mock_client(lambda request: httpx.Response(401, json={"error": "invalid token"}))
+
+    with pytest.raises(httpx.HTTPStatusError):
+        fetch_candles(
+            client,
+            instrument_key="NSE_EQ|INE002A01018",
+            from_date=date(2024, 1, 1),
+            to_date=date(2024, 1, 31),
+            token="badtoken",
+        )
+
+
+@pytest.mark.live
+def test_live_fetch_candles_matches_the_documented_response_shape():
+    """One real request against Upstox's historical-candle API, confirming
+    the response shape this module assumes. Excluded from the default run.
+    Requires a real, currently-valid UPSTOX_ACCESS_TOKEN (minted via
+    `uv run python -m trading.auth.upstox`) -- skips cleanly if unset."""
+    from trading.config import get_settings
+
+    token = get_settings().upstox_access_token
+    if not token:
+        pytest.skip("UPSTOX_ACCESS_TOKEN not set")
+
+    with httpx.Client(timeout=10.0) as client:
+        payload = fetch_candles(
+            client,
+            instrument_key="NSE_EQ|INE002A01018",  # RELIANCE
+            from_date=date(2024, 1, 2),
+            to_date=date(2024, 1, 2),
+            token=token,
+        )
+
+    assert payload["status"] == "success"
+    candles = payload["data"]["candles"]
+    assert isinstance(candles, list)
+    if candles:
+        assert len(candles[0]) == 7

@@ -21,6 +21,8 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+import httpx
+
 
 def month_windows(start: date, end: date) -> list[tuple[date, date]]:
     """Split [start, end] into calendar-month-aligned (from_date, to_date)
@@ -88,3 +90,24 @@ def parse_candle_response(payload: dict[str, Any], instrument_id: int) -> list[B
             )
         )
     return candles
+
+
+_BASE_URL = "https://api.upstox.com"
+
+
+def fetch_candles(
+    client: httpx.Client, instrument_key: str, from_date: date, to_date: date, token: str
+) -> dict[str, Any]:
+    """One GET against Upstox's V3 historical-candle endpoint for 1-minute
+    candles. Raises httpx.HTTPStatusError on any non-2xx response --
+    callers distinguish 401/403 (abort the whole backfill) from other
+    statuses (retry-then-skip this window) via the exception's
+    response.status_code."""
+    url = (
+        f"{_BASE_URL}/v3/historical-candle/{instrument_key}/minutes/1/"
+        f"{to_date.isoformat()}/{from_date.isoformat()}"
+    )
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    response = client.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json()  # type: ignore[no-any-return]

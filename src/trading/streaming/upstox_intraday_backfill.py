@@ -22,6 +22,10 @@ from decimal import Decimal
 from typing import Any
 
 import httpx
+from psycopg import Connection
+
+from trading.contracts import DataSource
+from trading.streaming.bar_aggregator import INTERVAL_SECONDS
 
 
 def month_windows(start: date, end: date) -> list[tuple[date, date]]:
@@ -111,3 +115,38 @@ def fetch_candles(
     response = client.get(url, headers=headers)
     response.raise_for_status()
     return response.json()  # type: ignore[no-any-return]
+
+
+_UPSERT_BACKFILL_CANDLE = """
+    INSERT INTO bars_intraday (
+        instrument_id, ts, interval_sec, open, high, low, close,
+        volume, trades, open_interest, source
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s)
+    ON CONFLICT (instrument_id, ts, interval_sec) DO UPDATE SET
+        open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
+        close = EXCLUDED.close, volume = EXCLUDED.volume,
+        open_interest = EXCLUDED.open_interest, source = EXCLUDED.source
+"""
+
+
+def write_backfill_candle(conn: Connection, candle: BackfillCandle) -> None:
+    """Upsert one backfilled candle into bars_intraday. trades is always
+    written NULL -- the historical-candle API gives no trade count, and
+    writing 0 would falsely claim zero trades occurred. Never commits; the
+    caller controls transaction boundaries (see this module's main())."""
+    conn.execute(
+        _UPSERT_BACKFILL_CANDLE,
+        (
+            candle.instrument_id,
+            candle.ts,
+            INTERVAL_SECONDS,
+            candle.open,
+            candle.high,
+            candle.low,
+            candle.close,
+            candle.volume,
+            candle.open_interest,
+            DataSource.UPSTOX_HISTORICAL_CANDLE,
+        ),
+    )

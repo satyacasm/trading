@@ -6,11 +6,13 @@ from decimal import Decimal
 import httpx
 import pytest
 
+from trading.contracts import DataSource
 from trading.streaming.upstox_intraday_backfill import (
     BackfillCandle,
     fetch_candles,
     month_windows,
     parse_candle_response,
+    write_backfill_candle,
 )
 
 
@@ -185,3 +187,89 @@ def test_live_fetch_candles_matches_the_documented_response_shape():
     assert isinstance(candles, list)
     if candles:
         assert len(candles[0]) == 7
+
+
+@pytest.fixture
+def fixture_instrument_id(db_conn) -> int:
+    """`db_conn` hands out a rolled-back transaction on a freshly migrated,
+    otherwise-empty `trading_test` database (tests/conftest.py) -- there is
+    no pre-seeded instrument row to reuse. This inserts one minimal, real
+    `instruments` row so `bars_intraday`'s foreign key has something to
+    resolve against, and returns its generated `instrument_id`."""
+    row = db_conn.execute(
+        """
+        INSERT INTO instruments (asset_class, exchange, segment, symbol, status, canonical_key)
+        VALUES ('EQUITY', 'NSE', 'CM', 'RELIANCE', 'ACTIVE', 'NSE:CM:RELIANCE:EQ')
+        RETURNING instrument_id
+        """
+    ).fetchone()
+    return row[0]
+
+
+@pytest.mark.db
+def test_write_backfill_candle_inserts_a_row_with_null_trades_and_correct_source(
+    db_conn, fixture_instrument_id
+):
+    candle = BackfillCandle(
+        instrument_id=fixture_instrument_id,
+        ts=datetime(2024, 1, 2, 3, 45, tzinfo=UTC),
+        open=Decimal("100.5"),
+        high=Decimal("101.0"),
+        low=Decimal("99.5"),
+        close=Decimal("100.75"),
+        volume=Decimal("12345"),
+        open_interest=0,
+    )
+
+    write_backfill_candle(db_conn, candle)
+
+    row = db_conn.execute(
+        "SELECT open, high, low, close, volume, trades, source, open_interest "
+        "FROM bars_intraday WHERE instrument_id = %s AND ts = %s AND interval_sec = 60",
+        (fixture_instrument_id, datetime(2024, 1, 2, 3, 45, tzinfo=UTC)),
+    ).fetchone()
+
+    assert row is not None
+    assert row[0] == Decimal("100.5")
+    assert row[4] == Decimal("12345")
+    assert row[5] is None  # trades always NULL for backfilled rows
+    assert row[6] == DataSource.UPSTOX_HISTORICAL_CANDLE
+    assert row[7] == 0
+
+
+@pytest.mark.db
+def test_write_backfill_candle_upserts_rather_than_duplicates(db_conn, fixture_instrument_id):
+    candle = BackfillCandle(
+        instrument_id=fixture_instrument_id,
+        ts=datetime(2024, 1, 2, 3, 46, tzinfo=UTC),
+        open=Decimal("1"),
+        high=Decimal("1"),
+        low=Decimal("1"),
+        close=Decimal("1"),
+        volume=Decimal("1"),
+        open_interest=None,
+    )
+    write_backfill_candle(db_conn, candle)
+
+    updated = BackfillCandle(
+        instrument_id=fixture_instrument_id,
+        ts=datetime(2024, 1, 2, 3, 46, tzinfo=UTC),
+        open=Decimal("2"),
+        high=Decimal("2"),
+        low=Decimal("2"),
+        close=Decimal("2"),
+        volume=Decimal("2"),
+        open_interest=None,
+    )
+    write_backfill_candle(db_conn, updated)
+
+    rows = db_conn.execute(
+        (
+            "SELECT close FROM bars_intraday "
+            "WHERE instrument_id = %s AND ts = %s AND interval_sec = 60"
+        ),
+        (fixture_instrument_id, datetime(2024, 1, 2, 3, 46, tzinfo=UTC)),
+    ).fetchall()
+
+    assert len(rows) == 1
+    assert rows[0][0] == Decimal("2")

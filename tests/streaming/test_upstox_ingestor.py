@@ -14,9 +14,14 @@ from trading.streaming.upstox_proto import MarketDataFeed_pb2 as pb
 
 class ScriptedUpstoxFeed:
     """A fake `UpstoxFeed`: records authorize()/subscribe() calls, yields
-    scripted raw frames, then optionally fails."""
+    scripted raw frames (bytes, str, or object), then optionally fails."""
 
-    def __init__(self, frames: Sequence[bytes], *, fail_after: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        frames: Sequence[bytes | str | object],
+        *,
+        fail_after: BaseException | None = None,
+    ) -> None:
         self.frames = list(frames)
         self.fail_after = fail_after
         self.authorized = False
@@ -30,9 +35,9 @@ class ScriptedUpstoxFeed:
         self.subscribed_keys = instrument_keys
         return instrument_keys
 
-    async def __aiter__(self) -> AsyncIterator[bytes]:
+    async def __aiter__(self) -> AsyncIterator[bytes | str | object]:
         for frame in self.frames:
-            yield frame
+            yield frame  # type: ignore[misc]
         if self.fail_after is not None:
             raise self.fail_after
 
@@ -152,3 +157,50 @@ def test_run_ingestion_loop_grows_backoff_on_repeated_connect_then_drop(
 
     assert sleeps == [1.0, 2.0]
     assert working.authorized and working.subscribed_keys == ["NSE_EQ|INE002A01018"]
+
+
+def test_run_ingestion_loop_skips_non_bytes_frame_and_continues(
+    redis_client: redis.Redis,
+) -> None:
+    """A non-bytes frame (str or object) is skipped without crashing the
+    loop or attempting to parse it. Subsequent valid bytes frames are
+    processed normally."""
+    pubsub = redis_client.pubsub()
+    pubsub.subscribe("ticks:501")
+    pubsub.get_message(timeout=1)
+
+    # Mix of non-bytes frames (str and object) followed by a valid bytes frame
+    feed = ScriptedUpstoxFeed(
+        [
+            "unexpected_str_frame",  # str frame (should be skipped)
+            object(),  # object frame (should be skipped)
+            _ltpc_frame("NSE_EQ|INE002A01018", 2500.50),  # valid bytes frame
+        ]
+    )
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        asyncio.run(
+            run_ingestion_loop(
+                async_redis,
+                lambda: feed,
+                instrument_ids={"NSE_EQ|INE002A01018": 501},
+                sleep=_no_sleep,
+                max_ticks=1,
+            )
+        )
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    # Verify that the feed was authorized and subscribed
+    assert feed.authorized
+    assert feed.subscribed_keys == ["NSE_EQ|INE002A01018"]
+
+    # Verify that a tick was published for the valid bytes frame only
+    message = pubsub.get_message(timeout=2)
+    assert message is not None and message["type"] == "message"
+    payload = message["data"]
+    import json
+
+    parsed = json.loads(payload)
+    assert parsed["instrument_id"] == 501
+    assert Decimal(str(parsed["price"])) == Decimal("2500.5")

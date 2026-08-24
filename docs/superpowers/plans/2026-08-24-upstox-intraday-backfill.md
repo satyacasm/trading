@@ -1139,21 +1139,27 @@ git commit -m "feat(streaming): backfill_symbol() orchestration and CLI entry po
 
 Controller-run, not delegated — this performs real writes against the production database using a real, expiring access token, and burns real requests against Upstox's API (~280 requests across 5 symbols for the full 2022-01 → yesterday range). Unlike Task 5 of the upstox-ingestion plan, this does **not** need NSE market hours — historical data is available any time — but it does need a currently-valid `UPSTOX_ACCESS_TOKEN`, which is **not minted as of this plan's writing** (only `UPSTOX_ANALYTICS_TOKEN`, `UPSTOX_API_KEY`, `UPSTOX_API_SECRET` are set in `.env.local`).
 
-- [ ] **Step 1: Mint a fresh access token**
+- [x] **Step 1: Mint a fresh access token**
 
 Run: `uv run python -m trading.auth.upstox`
 This opens a browser OAuth flow — **requires human interaction to log in and approve**, cannot be done autonomously. Confirms afterward: `uv run python -c "from trading.config import get_settings; print(bool(get_settings().upstox_access_token))"` should print `True`.
 
-- [ ] **Step 2: Confirm infrastructure**
+**Done 2026-08-24 21:35 IST** — completed near-instantly (browser already had an active Upstox session from earlier the same day).
+
+- [x] **Step 2: Confirm infrastructure**
 
 Run: `docker compose ps` — expect `trading_tsdb` healthy (this task doesn't need Redis).
 
-- [ ] **Step 3: Run the backfill**
+**Done** — confirmed healthy.
+
+- [x] **Step 3: Run the backfill**
 
 Run: `uv run python -m trading.streaming.upstox_intraday_backfill`
 This will take a while (~280 requests × ~0.3-2s each ≈ several minutes to ~15 minutes, depending on retries). Watch the log output for `upstox_intraday_backfill.finished_symbol` lines per symbol.
 
-- [ ] **Step 4: Verify and record**
+**This first attempt crashed** at 21:45 IST, partway through the 4th symbol (HDFCBANK), on a real `psycopg.errors.CheckViolation`: Upstox's own live API returned a genuine candle (`NSE_EQ|INE040A01034`, `2024-06-25T09:15:00+05:30`, `open=835.6 high=839.8 low=837.4 close=839.6`) whose OHLC values violate `bars_intraday`'s `ck_ohlc_order_intraday` constraint (`low > open`) — confirmed by independently re-fetching the exact same window directly from the live API and getting byte-identical values, not a parsing bug. 3 of 5 symbols had already fully backfilled and committed before the crash (`autocommit=True`, each write its own transaction — that data was safe). This led to Task 8 (fix: catch and skip a bad candle instead of crashing) and, via Task 9/10/11 below, a successful full run. See "Completion Notes" at the end of this plan for the final verified results.
+
+- [x] **Step 4: Verify and record**
 
 Query, similar shape to the bar-aggregator and upstox-ingestion plans' own verification steps:
 
@@ -1177,9 +1183,9 @@ Expected: roughly 5 rows (one per watchlist symbol), each with hundreds of thous
 
 Record: total candles written across all 5 symbols, the actual earliest/latest dates observed, and any skipped windows the CLI reported (from Task 6's `main()` output) — the same evidentiary standard every prior live/production task in this project has held itself to.
 
-- [ ] **Step 5: Report**
+- [x] **Step 5: Report**
 
-No commit for this task (it runs shipped code, doesn't change any file). Report the verification numbers back in this plan's completion notes.
+No commit for this task (it runs shipped code, doesn't change any file). Report the verification numbers back in this plan's completion notes. **See "Completion Notes" at the end of this plan.**
 
 ---
 
@@ -1198,7 +1204,7 @@ This is the same class of problem Phase 0's `bars_daily` pipeline already solved
 - Modifies: `backfill_symbol`'s per-candle write loop: each `write_backfill_candle` call is wrapped so a `psycopg.errors.CheckViolation` (and only that — not a bare `except Exception`, which would also swallow a genuine connection failure or a bug worth seeing) is caught, logged as a warning with the candle's full field values, increments `report.candles_rejected`, and the loop continues to the next candle in that window (not the next window — the rest of the window's candles are still good data and should still be written).
 - `main()`'s final summary print gains a `candles_rejected` line alongside `candles_written`/`skipped_windows`, and a nonzero rejected count does **not** by itself trigger the `SystemExit(1)` that a skipped window does — a handful of known-dirty exchange prints is expected data-quality noise, not an operational failure the way a skipped network window is.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/streaming/test_upstox_intraday_backfill.py`:
 
@@ -1245,12 +1251,12 @@ def test_backfill_symbol_skips_a_check_violating_candle_and_continues(db_conn, f
     assert len(rows) == 1  # only the valid candle landed
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `uv run pytest tests/streaming/test_upstox_intraday_backfill.py -v -k check_violating`
 Expected: FAIL — either `psycopg.errors.CheckViolation` propagates uncaught (crashing the test) or `AttributeError: 'BackfillReport' object has no attribute 'candles_rejected'`, depending on which line the test reaches first.
 
-- [ ] **Step 3: Write the fix**
+- [x] **Step 3: Write the fix**
 
 In `src/trading/streaming/upstox_intraday_backfill.py`, add `candles_rejected: int = 0` to `BackfillReport`:
 
@@ -1320,12 +1326,12 @@ Update `main()`'s summary print to include the rejected count:
 
 (`total_rejected` alone does not trigger `SystemExit(1)` — see Interfaces above for why.)
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `uv run pytest tests/streaming/test_upstox_intraday_backfill.py -v -k check_violating`
 Expected: 1 passed
 
-- [ ] **Step 5: Run the full test file, then the full repo suite**
+- [x] **Step 5: Run the full test file, then the full repo suite**
 
 Run: `uv run pytest tests/streaming/test_upstox_intraday_backfill.py -v`
 Expected: 22 passed, 1 deselected (or 23 passed if the live test runs — `UPSTOX_ACCESS_TOKEN` is minted as of this task, so it should run and pass)
@@ -1333,7 +1339,7 @@ Expected: 22 passed, 1 deselected (or 23 passed if the live test runs — `UPSTO
 Run: `uv run pytest`
 Expected: all passing, no regressions.
 
-- [ ] **Step 6: Lint/type gate and commit**
+- [x] **Step 6: Lint/type gate and commit**
 
 Run: `uv run ruff check . && uv run ruff format --check . && uv run mypy src`
 
@@ -1354,9 +1360,9 @@ is fixed by Task 10. Re-attempt this task's steps only after Task 10 is complete
 
 Task 7's run crashed partway through the 4th symbol (HDFCBANK) after successfully finishing RELIANCE, TCS/INFY (whichever the 2nd/3rd symbols were), and one more — 3 symbols fully written, committed, and safe (`autocommit=True`, each write its own transaction). Task 8's fix is now in place. Re-running `main()` from scratch is safe (idempotent upsert on every symbol, including the 3 already-complete ones — those just become cheap no-op upserts) and simpler than building a resume-from-symbol-N feature that was never in this plan's scope.
 
-- [ ] **Step 1:** Run `uv run python -m trading.streaming.upstox_intraday_backfill` again.
-- [ ] **Step 2:** Watch for any further crashes. A `candles_rejected` count in the log/summary output is expected and fine (that's Task 8's fix working as designed) — a crash is not.
-- [ ] **Step 3:** Re-run this plan's original Task 7 Step 4 verification query. Report final totals: candles written per symbol, candles rejected per symbol, earliest/latest dates, any skipped windows.
+- [x] **Step 1:** Run `uv run python -m trading.streaming.upstox_intraday_backfill` again.
+- [x] **Step 2:** Watch for any further crashes. A `candles_rejected` count in the log/summary output is expected and fine (that's Task 8's fix working as designed) — a crash is not.
+- [x] **Step 3:** Re-run this plan's original Task 7 Step 4 verification query. Report final totals: candles written per symbol, candles rejected per symbol, earliest/latest dates, any skipped windows.
 
 ---
 
@@ -1372,7 +1378,7 @@ Confirmed by direct measurement against the real local Postgres (`autocommit=Tru
 **Interfaces:**
 - Modifies: `backfill_symbol`'s per-candle write loop. The savepoint (`conn.transaction()`) is applied **only when `conn.autocommit` is `False`** (i.e., only when actually structurally necessary to protect a caller's explicit transaction — true for this plan's own tests via `db_conn`, never true for `main()`'s production connection). Under `conn.autocommit is True`, the write runs bare, exactly as it did before Task 8, restoring full write throughput. No test-visible behavior changes: `CheckViolation` is still caught, still logged, still counted in `report.candles_rejected`, and the existing `test_backfill_symbol_skips_a_check_violating_candle_and_continues` test (which runs under `db_conn`, `autocommit=False`) must still pass unmodified.
 
-- [ ] **Step 1: Write a test confirming the bare-write path under autocommit**
+- [x] **Step 1: Write a test confirming the bare-write path under autocommit**
 
 Append to `tests/streaming/test_upstox_intraday_backfill.py`:
 
@@ -1452,12 +1458,12 @@ def fixture_instrument_id_factory():
 
 (The `ON CONFLICT ... DO UPDATE` is defensive: this fixture runs against a real, non-rolled-back connection, so a prior failed test run's leftover row with the same `canonical_key` must not crash this one with a unique-constraint violation.)
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `uv run pytest tests/streaming/test_upstox_intraday_backfill.py -v -k does_not_wrap`
 Expected: FAIL — `AssertionError: conn.transaction() must not be called under an autocommit connection` (`called["n"]` will be 1, since Task 8's current code always wraps).
 
-- [ ] **Step 3: Write the fix**
+- [x] **Step 3: Write the fix**
 
 In `src/trading/streaming/upstox_intraday_backfill.py`, add `import contextlib` to the imports.
 
@@ -1515,7 +1521,7 @@ to:
 
 (Keep Task 8's existing `CheckViolation` handling logic identical — only the transaction-wrapping decision changes.)
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/streaming/test_upstox_intraday_backfill.py -v -k "does_not_wrap or check_violating"`
 Expected: 2 passed (the new autocommit test, and Task 8's original savepoint-under-db_conn test — confirming both paths work correctly: no wrapper under autocommit, savepoint still applied under an explicit transaction).
@@ -1523,16 +1529,16 @@ Expected: 2 passed (the new autocommit test, and Task 8's original savepoint-und
 Run the full file: `uv run pytest tests/streaming/test_upstox_intraday_backfill.py -v`
 Expected: 23 passed (or 24 with the live test), no regressions in any earlier test.
 
-- [ ] **Step 5: Run the full repo suite**
+- [x] **Step 5: Run the full repo suite**
 
 Run: `uv run pytest`
 Expected: all passing, no regressions.
 
-- [ ] **Step 6: A quick real-world timing sanity check (not a formal step, but do it)**
+- [x] **Step 6: A quick real-world timing sanity check (not a formal step, but do it)**
 
 Before committing, it's worth a quick manual confirmation that this actually restores throughput: time a small real slice, e.g. `backfill_symbol` for one month-window against the real API with the real `autocommit=True` connection `main()` would use, and confirm it completes in roughly the same time as Task 7's original (pre-Task-8) run did for a comparable slice. This isn't a formal pytest step — just don't skip verifying the fix actually fixes the real-world symptom, not just the mocked unit test.
 
-- [ ] **Step 7: Lint/type gate and commit**
+- [x] **Step 7: Lint/type gate and commit**
 
 Run: `uv run ruff check . && uv run ruff format --check . && uv run mypy src`
 
@@ -1547,6 +1553,52 @@ git commit -m "fix(streaming): skip the savepoint wrapper under autocommit conne
 
 Identical to Task 9's steps, run again now that Task 10's fix is committed. This is the task whose results get reported as this plan's final completion evidence.
 
-- [ ] **Step 1:** Run `uv run python -m trading.streaming.upstox_intraday_backfill` again.
-- [ ] **Step 2:** Watch for crashes (none expected) and note the wall-clock time for comparison against Task 7's original per-symbol timings (~3 minutes/symbol) as confirmation the performance fix worked in the real, full-scale run, not just the timing sanity check.
-- [ ] **Step 3:** Re-run this plan's original Task 7 Step 4 verification query. Report final totals: candles written per symbol, candles rejected per symbol, earliest/latest dates, any skipped windows.
+- [x] **Step 1:** Run `uv run python -m trading.streaming.upstox_intraday_backfill` again.
+- [x] **Step 2:** Watch for crashes (none expected) and note the wall-clock time for comparison against Task 7's original per-symbol timings (~3 minutes/symbol) as confirmation the performance fix worked in the real, full-scale run, not just the timing sanity check.
+- [x] **Step 3 (Task 11):** Re-run this plan's original Task 7 Step 4 verification query. Report final totals: candles written per symbol, candles rejected per symbol, earliest/latest dates, any skipped windows.
+
+---
+
+## Completion Notes
+
+**Run completed 2026-08-24 22:38:58 IST.** Started 22:23:27 IST, finished 22:38:58 IST — **~15.5
+minutes total**, matching the original (pre-Task-8) per-symbol pace of ~3 minutes/symbol,
+confirming Task 10's performance fix restored full production throughput.
+
+**Result: 2,147,075 candles written across all 5 watchlist symbols. 0 windows skipped (no
+network failures at all). 2 candles rejected** (Task 8/10's fix working exactly as designed) —
+both at the identical real-world timestamp `2024-06-25T09:15:00+05:30`, for two different,
+unrelated stocks (`NSE_EQ|INE040A01034` HDFCBANK and `NSE_EQ|INE090A01021` ICICIBANK). The
+identical timestamp across two unrelated instruments is strong independent evidence this is a
+real, NSE-wide opening-auction data quirk on that specific trading day, not instrument-specific
+garbage data or a parsing bug in this codebase — each rejected candle's `open` sat outside its
+own minute's high/low band, most likely because the pre-open auction print leaked into the
+"open" field while the first regular-session trades set a higher `low`.
+
+**Per-symbol verification** (`SELECT i.symbol, count(*), min(b.ts), max(b.ts) FROM bars_intraday
+b JOIN instruments i ON ... WHERE b.source = 7 GROUP BY i.symbol`):
+
+| Symbol | Bars written | Earliest | Latest |
+|---|---|---|---|
+| TCS | 429,425 | 2022-01-03 03:45 UTC | 2026-08-21 09:59 UTC |
+| INFY | 429,424 | 2022-01-03 03:45 UTC | 2026-08-21 09:59 UTC |
+| HDFCBANK | 429,423 | 2022-01-03 03:45 UTC | 2026-08-21 09:59 UTC |
+| ICICIBANK | 429,423 | 2022-01-03 03:45 UTC | 2026-08-21 09:59 UTC |
+| RELIANCE | 429,380 | 2022-01-03 03:45 UTC | 2026-08-21 09:59 UTC |
+
+`earliest` lands on 2022-01-03 — the first actual NSE trading day on or after the API's
+documented January 2022 floor for 1-minute data (Jan 1–2, 2022 were a Saturday/Sunday).
+`latest` lands on 2026-08-21 (Friday) — the last real trading session before the run date
+(2026-08-24, a Monday; the computed "yesterday" cutoff, 2026-08-23, was a Sunday, so the API
+simply had no further real trading data to return, as expected — not a bug).
+
+**Live path summary:** this plan's original 6 tasks shipped a working backfill on the first
+production attempt (`git log ef31ef5..33a1f5f`); the real production run then surfaced two real
+bugs no per-task review could have caught — a genuine bad-OHLC candle from Upstox's own API
+(Task 8) and a 3x write-performance regression introduced by that fix (Task 10) — both diagnosed
+against the real API/DB, fixed with the same TDD + review discipline as every planned task, and
+verified by a second, fully successful production run (Task 11). A final whole-branch review
+(opus) found no Critical issues across all 12 commits; 5 Important documentation/observability
+findings were logged as follow-up work (see `.superpowers/sdd/2026-08-24-upstox-intraday-backfill/progress.md`
+for the full list, if that workspace still exists) rather than blocking this already-verified,
+already-successful production data load.

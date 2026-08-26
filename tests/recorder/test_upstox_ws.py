@@ -16,7 +16,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from trading.recorder.session import RecordingSession, read_frames
-from trading.recorder.upstox_ws import Frame, run_recording_loop
+from trading.recorder.upstox_ws import Frame, LiveUpstoxFeed, run_recording_loop
 
 
 class FakeClock:
@@ -231,3 +231,42 @@ def test_a_frame_the_handler_cannot_interpret_is_kept_raw_and_flagged(tmp_path: 
     frame_file = next((tmp_path / "upstox_chain" / "2026-08-13").glob("*.frames.gz"))
     recovered = list(read_frames(frame_file))
     assert recovered == [b"good-1", b"12345", b"good-2"]  # repr() of the malformed frame
+
+
+class FakeConnection:
+    """Stands in for `websockets.asyncio.client.ClientConnection.send`.
+
+    Only `send` is exercised by `LiveUpstoxFeed.subscribe`; it records
+    exactly what object was passed so the test can assert on its Python
+    type (str vs bytes decides the WebSocket frame type the real
+    `websockets` library emits).
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[object] = []
+
+    async def send(self, message: object) -> None:
+        self.sent.append(message)
+
+
+def test_subscribe_sends_the_control_message_as_a_binary_frame_not_text() -> None:
+    """Regression guard for the BUG 1 root cause: Upstox V3 silently drops
+    the subscribe control message when it arrives as a Text frame (which is
+    what `websockets` sends for a Python `str`). It must be sent as `bytes`
+    so `websockets` emits a Binary frame instead."""
+    feed = LiveUpstoxFeed(access_token="fake-token")
+    fake_connection = FakeConnection()
+    feed._connection = fake_connection  # type: ignore[assignment]
+
+    instrument_keys = ["NSE_EQ|INE002A01018", "NSE_EQ|INE467B01029"]
+    acknowledged = asyncio.run(feed.subscribe(instrument_keys))
+
+    assert acknowledged == instrument_keys
+    assert len(fake_connection.sent) == 1
+    sent = fake_connection.sent[0]
+    assert isinstance(sent, bytes), f"expected bytes (Binary frame), got {type(sent).__name__}"
+
+    payload = json.loads(sent)
+    assert payload["method"] == "sub"
+    assert payload["data"] == {"mode": "full", "instrumentKeys": instrument_keys}
+    assert isinstance(payload["guid"], str) and payload["guid"]

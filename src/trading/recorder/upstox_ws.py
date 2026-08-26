@@ -201,10 +201,12 @@ class LiveUpstoxFeed:
             "data": {"mode": "full", "instrumentKeys": instrument_keys},
         }
         # `websockets` picks the WebSocket frame type from the Python type:
-        # `str` -> Text frame, `bytes` -> Binary frame. Upstox expects the
-        # subscribe control message as Text; pre-encoding to bytes would
-        # send it as Binary and get it silently ignored.
-        await self._connection.send(json.dumps(request))
+        # `str` -> Text frame, `bytes` -> Binary frame. Verified against the
+        # live V3 feed: Upstox requires the subscribe control message as a
+        # Binary frame. Sending a `str` (Text frame) is silently dropped --
+        # the socket stays connected but no subscription ever takes effect,
+        # so only unsolicited `market_info` frames arrive.
+        await self._connection.send(json.dumps(request).encode("utf-8"))
         # Upstox's feed does not return a synchronous, distinguishable
         # subscription ack -- confirmation lives in the (unparsed) frame
         # stream itself. We record what we asked for as "acknowledged";

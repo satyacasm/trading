@@ -42,15 +42,16 @@ def parse_upstox_frame(raw: bytes, instrument_ids: dict[str, int]) -> list[Tick]
         instrument_id = instrument_ids.get(instrument_key)
         if instrument_id is None:
             continue
-        if feed.WhichOneof("FeedUnion") != "ltpc":
+        ltpc = _extract_ltpc(feed)
+        if ltpc is None:
             continue
         try:
             ticks.append(
                 Tick(
                     instrument_id=instrument_id,
-                    ts=datetime.fromtimestamp(feed.ltpc.ltt / 1000, tz=UTC),
-                    price=Decimal(str(feed.ltpc.ltp)),
-                    quantity=Decimal(str(feed.ltpc.ltq)),
+                    ts=datetime.fromtimestamp(ltpc.ltt / 1000, tz=UTC),
+                    price=Decimal(str(ltpc.ltp)),
+                    quantity=Decimal(str(ltpc.ltq)),
                 )
             )
         except (ValueError, InvalidOperation) as exc:
@@ -58,3 +59,25 @@ def parse_upstox_frame(raw: bytes, instrument_ids: dict[str, int]) -> list[Tick]
                 "upstox_feed.malformed_ltpc", instrument_key=instrument_key, reason=str(exc)
             )
     return ticks
+
+
+def _extract_ltpc(feed: pb.Feed) -> pb.LTPC | None:  # type: ignore[name-defined]
+    """Find the `LTPC` payload wherever this `Feed` carries it.
+
+    In mode "ltpc" it sits directly at `feed.ltpc`. In mode "full" (which is
+    what this pipeline subscribes with) it never does -- every tick arrives
+    as `feed.ff`, one level down inside `FullFeed`'s own oneof: `marketFF`
+    for equities, `indexFF` for indices. Returns `None` (skip, no log) for
+    an unset/unknown union member at either level.
+    """
+    which = feed.WhichOneof("FeedUnion")
+    if which == "ltpc":
+        return feed.ltpc
+    if which == "ff":
+        ff_which = feed.ff.WhichOneof("FullFeedUnion")
+        if ff_which == "marketFF":
+            return feed.ff.marketFF.ltpc
+        if ff_which == "indexFF":
+            return feed.ff.indexFF.ltpc
+        return None
+    return None

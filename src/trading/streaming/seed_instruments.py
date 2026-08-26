@@ -52,6 +52,17 @@ _UPSERT = """
 """
 
 
+def crypto_canonical_keys(pairs: Sequence[str] = CRYPTO_PAIRS) -> list[str]:
+    """Canonical keys for the crypto pair universe, computed without
+    touching the database. Lets read-only callers (e.g. `GET /instruments`)
+    resolve instrument ids with a `SELECT ... WHERE canonical_key = ANY(...)`
+    instead of going through `seed_crypto_instruments`'s upsert."""
+    return [
+        InstrumentRef(exchange="BINANCE", segment="SPOT", symbol=symbol).canonical_key
+        for symbol in pairs
+    ]
+
+
 def seed_crypto_instruments(
     conn: Connection, pairs: Sequence[str] = CRYPTO_PAIRS
 ) -> dict[str, int]:

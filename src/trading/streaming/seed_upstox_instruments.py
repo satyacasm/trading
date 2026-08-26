@@ -15,6 +15,7 @@ import psycopg
 from psycopg import Connection
 
 from trading.config import get_settings
+from trading.contracts import InstrumentRef
 
 UPSTOX_WATCHLIST: tuple[str, ...] = ("RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK")
 
@@ -29,6 +30,19 @@ _UPDATE_BINDING = """
     SET source_bindings = source_bindings || jsonb_build_object('upstox_instrument_key', %s::text)
     WHERE instrument_id = %s
 """
+
+
+def upstox_canonical_keys(symbols: Sequence[str] = UPSTOX_WATCHLIST) -> list[str]:
+    """Canonical keys for the Upstox equity watchlist, computed without
+    touching the database. Mirrors `_SELECT_EQ_ROW`'s identifying columns
+    (exchange NSE, segment CM, series EQ) via `InstrumentRef`, so read-only
+    callers (e.g. `GET /instruments`) can resolve instrument ids with a
+    `SELECT ... WHERE canonical_key = ANY(...)` instead of going through
+    `seed_upstox_instrument_keys`'s update."""
+    return [
+        InstrumentRef(exchange="NSE", segment="CM", symbol=symbol, series="EQ").canonical_key
+        for symbol in symbols
+    ]
 
 
 def seed_upstox_instrument_keys(

@@ -9,8 +9,11 @@ Task 5 for why that's the right scope, not a shared connection manager.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
+import psycopg
 import structlog
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,12 +26,55 @@ from redis.asyncio.client import PubSub
 from trading.config import get_settings
 from trading.streaming import market_data_api
 from trading.streaming.db import get_db_connection
-from trading.streaming.seed_instruments import seed_crypto_instruments
-from trading.streaming.seed_upstox_instruments import seed_upstox_instrument_keys
+from trading.streaming.seed_instruments import crypto_canonical_keys, seed_crypto_instruments
+from trading.streaming.seed_upstox_instruments import (
+    seed_upstox_instrument_keys,
+    upstox_canonical_keys,
+)
 
 log = structlog.get_logger(__name__)
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Seed the fixed crypto and Upstox-equity watchlists exactly once per
+    process, at startup -- never per request.
+
+    `GET /instruments` used to call these seed functions' upserts on every
+    request, taking a row lock each time. Two concurrent requests could then
+    deadlock the single blocking psycopg connection running on the event
+    loop thread: one held an uncommitted upsert while the other blocked on
+    its row lock, also on the event loop, so the first could never reach
+    `conn.commit()` (observed live, unrecoverable). Moving the writes here
+    and turning the route below into a plain `def` removes both halves of
+    that defect.
+
+    Tests override `get_db_connection` with their own rolled-back
+    transaction (`app.dependency_overrides`); honoring that override here,
+    instead of unconditionally opening a fresh connection to
+    `get_settings().database_url`, keeps startup seeding inside that same
+    test transaction rather than writing to a real database.
+    """
+    override = app.dependency_overrides.get(get_db_connection)
+    if override is not None:
+        conn = override()
+        seed_crypto_instruments(conn)
+        seed_upstox_instrument_keys(conn)
+    else:
+        conn = psycopg.connect(get_settings().database_url, autocommit=False)
+        try:
+            seed_crypto_instruments(conn)
+            seed_upstox_instrument_keys(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,19 +100,22 @@ class InstrumentSummary(BaseModel):
 
 
 @app.get("/instruments", response_model=list[InstrumentSummary])
-async def instruments(conn: Connection = Depends(get_db_connection)) -> list[InstrumentSummary]:  # noqa: B008
-    # psycopg here is a synchronous, blocking call inside an async route --
-    # an accepted simplification for this endpoint (called once per page
-    # load, not a hot path), same as the original crypto-only version.
-    crypto_ids = set(seed_crypto_instruments(conn).values())
-    upstox_ids = set(seed_upstox_instrument_keys(conn).values())
-    all_ids = list(crypto_ids | upstox_ids)
-    if not all_ids:
+def instruments(conn: Connection = Depends(get_db_connection)) -> list[InstrumentSummary]:  # noqa: B008
+    # Plain `def`, not `async def`: psycopg here is a blocking call, and
+    # FastAPI dispatches plain `def` routes to a threadpool instead of
+    # running them on the event loop -- the same pattern every route in
+    # `market_data_api.py` already uses. Seeding happens once at process
+    # startup (see `lifespan` above), so this route only ever reads: it
+    # resolves the watchlists' canonical keys in-process (no DB round trip,
+    # no write) and looks up the matching rows by `canonical_key`, rather
+    # than the whole `instruments` table.
+    canonical_keys = crypto_canonical_keys() + upstox_canonical_keys()
+    if not canonical_keys:
         return []
     rows = conn.execute(
         "SELECT instrument_id, symbol, asset_class, exchange FROM instruments "
-        "WHERE instrument_id = ANY(%s)",
-        (all_ids,),
+        "WHERE canonical_key = ANY(%s)",
+        (canonical_keys,),
     ).fetchall()
     return [
         InstrumentSummary(instrument_id=row[0], symbol=row[1], asset_class=row[2], exchange=row[3])

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Iterator
 
@@ -38,11 +39,18 @@ def seeded_upstox_equities(db_conn) -> None:
 
 
 @pytest.fixture
-def client(db_conn) -> Iterator[TestClient]:
+def client(db_conn, seeded_upstox_equities: None) -> Iterator[TestClient]:
     # `/instruments` reads through get_db_connection; overriding it with the
     # test's own db_conn means the endpoint sees this test's uncommitted
     # seed row (same transaction, same connection) without ever committing
     # -- db_conn's fixture rolls everything back at teardown either way.
+    #
+    # Requesting `seeded_upstox_equities` here (rather than leaving it to
+    # individual tests) guarantees it runs before `TestClient(app)` below,
+    # which triggers the gateway's startup lifespan. That lifespan seeds the
+    # Upstox equity watchlist unconditionally, and `seed_upstox_instrument_keys`
+    # raises if the underlying NSE rows don't exist yet -- exactly the rows
+    # this fixture creates in the test database.
     app.dependency_overrides[get_db_connection] = lambda: db_conn
     try:
         with TestClient(app) as test_client:
@@ -66,6 +74,74 @@ def test_instruments_endpoint_lists_crypto_and_equity_instruments(
 
     assert by_symbol["RELIANCE"]["asset_class"] == "EQUITY"
     assert by_symbol["RELIANCE"]["exchange"] == "NSE"
+
+
+def test_instruments_endpoint_performs_no_writes(
+    client: TestClient, seeded_instrument_id: int, seeded_upstox_equities: None, db_conn
+) -> None:
+    """GET must never write. The old implementation called
+    `seed_crypto_instruments` (an upsert with `ON CONFLICT DO UPDATE SET
+    updated_at = now()`) on every request, taking a row lock each time --
+    the root cause of a live deadlock.
+
+    Comparing `updated_at` directly is not a reliable signal here: the test
+    and the request share one open transaction (`db_conn`, via the
+    dependency override), and Postgres's `now()` is stable for the whole
+    transaction, so an in-transaction `UPDATE ... SET updated_at = now()`
+    would not actually change the value. `ctid` (the row's physical
+    version) does change on every UPDATE, including ones inside the same
+    still-open transaction, so it reliably proves whether a write touched
+    the row at all.
+    """
+    before = db_conn.execute(
+        "SELECT ctid FROM instruments WHERE instrument_id = %s", (seeded_instrument_id,)
+    ).fetchone()
+
+    response = client.get("/instruments")
+    assert response.status_code == 200
+
+    after = db_conn.execute(
+        "SELECT ctid FROM instruments WHERE instrument_id = %s", (seeded_instrument_id,)
+    ).fetchone()
+
+    assert before == after
+
+
+def test_instruments_route_is_not_a_coroutine_function() -> None:
+    """Guards the whole blocking-call-on-event-loop defect class: an
+    `async def` route running blocking psycopg calls executes on the event
+    loop thread, where two concurrent requests can deadlock each other (as
+    happened live). A plain `def` route is dispatched to FastAPI's
+    threadpool instead, matching every route in `market_data_api.py`."""
+    route = next(r for r in app.routes if getattr(r, "path", None) == "/instruments")
+    assert inspect.iscoroutinefunction(route.endpoint) is False
+
+
+def test_instruments_endpoint_is_scoped_to_the_seeded_watchlists(
+    client: TestClient,
+    seeded_instrument_id: int,
+    seeded_upstox_equities: None,
+    db_conn,
+) -> None:
+    """The response must be the seeded crypto pairs plus the seeded Upstox
+    equities -- never the whole `instruments` table, which also holds a
+    large backfilled NSE universe unrelated to either watchlist."""
+    db_conn.execute(
+        """
+        INSERT INTO instruments
+            (asset_class, exchange, segment, symbol, series, isin, status, canonical_key)
+        VALUES ('EQUITY', 'NSE', 'CM', 'WIPRO', 'EQ', 'INE999TEST99', 'ACTIVE', 'NSE:CM:WIPRO:EQ')
+        """
+    )
+
+    response = client.get("/instruments")
+    assert response.status_code == 200
+    body = response.json()
+
+    by_symbol = {row["symbol"]: row for row in body}
+    assert set(by_symbol) >= set(CRYPTO_PAIRS)
+    assert "RELIANCE" in by_symbol
+    assert "WIPRO" not in by_symbol
 
 
 def test_index_serves_the_proof_page(client: TestClient) -> None:

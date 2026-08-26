@@ -1242,3 +1242,30 @@ the wrong provenance (`BINANCE_WS`) and the ~33x-understated snapshot volume. Th
 identifiable (`exchange='NSE' AND source_bindings ? 'upstox_instrument_key' AND source = 6`) and
 should be deleted or re-derived from the Upstox historical-candle API before any backtest touches
 today's date.
+
+### Data gaps backfilled (2026-08-26, applied 10:33 IST)
+
+Today's session had three gaps per instrument: 09:15-09:55 (pipeline dead / bad-volume rows
+deleted), 09:59-10:03 and 10:08-10:13 (the two aggregator crashes). 257 minute-bars across the
+5 NSE names, now zero missing from 09:15 onward.
+
+Source: Upstox's **intraday** candle sub-route,
+`/v3/historical-candle/intraday/{key}/minutes/1`. The plain historical endpoint the existing
+backfill CLI walks returns an empty candle list for the current date (verified), so the CLI as
+written could not have filled a same-day gap. The intraday route accepts the Analytics token, so
+no daily OAuth mint was needed. Reused `parse_candle_response` and `write_backfill_candle`
+unchanged — the payload shape is identical; only gap selection was new logic, and it filters
+strictly to missing minutes so the upsert cannot overwrite good live bars.
+
+Rows are stamped `UPSTOX_HISTORICAL_CANDLE`, not a new source code: same API family, same
+pre-aggregated REST candle shape, same trust level. The live-vs-REST distinction remains visible
+(`UPSTOX_WS` vs `UPSTOX_HISTORICAL_CANDLE`); only the sub-route is not separately encoded.
+
+**Two independent validations of the I1 work:**
+1. Across the ~26 minutes where live WS bars and REST candles overlap, closes matched on every
+   single one — 0 mismatches. Two independent Upstox transports agree exactly.
+2. The seam is continuous: RELIANCE 10:03 backfill close 1315.0 hands to 10:04 live open 1315.0.
+
+Not productized. Filling a same-day gap is currently a scratch script; if ingestion downtime
+during market hours recurs, the intraday route belongs in the backfill CLI as a tested `--today`
+mode.

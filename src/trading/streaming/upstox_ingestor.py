@@ -21,7 +21,7 @@ from redis.asyncio import Redis
 from trading.config import get_settings
 from trading.recorder.upstox_ws import LiveUpstoxFeed, UpstoxFeed
 from trading.streaming.seed_upstox_instruments import seed_upstox_instrument_keys
-from trading.streaming.upstox_feed import parse_upstox_frame
+from trading.streaming.upstox_feed import parse_upstox_bars, parse_upstox_frame
 
 log = structlog.get_logger(__name__)
 
@@ -52,6 +52,15 @@ async def run_ingestion_loop(
     backoff = initial_backoff_seconds
     published = 0
     instrument_keys = list(instrument_ids)
+    # The same I1 bar is re-sent on every ~3s "full" push while its minute
+    # is still the most recent one -- without this, one real minute would
+    # be republished to `bars:{id}` roughly 20 times. One signature per
+    # instrument is all that's needed (each instrument only ever has one
+    # current I1 bar at a time), so this can never grow unbounded. Kept
+    # outside the reconnect loop below so it survives a reconnect too --
+    # there's no correctness reason to republish an unchanged bar just
+    # because the socket dropped and came back.
+    last_bar_signature: dict[int, tuple[object, ...]] = {}
 
     try:
         while max_ticks is None or published < max_ticks:
@@ -83,6 +92,15 @@ async def run_ingestion_loop(
                             log.warning("upstox_ingestor.publish_failed", reason=str(exc))
                         if max_ticks is not None and published >= max_ticks:
                             break
+                    for bar in parse_upstox_bars(raw, instrument_ids):
+                        signature = (bar.ts, bar.open, bar.high, bar.low, bar.close, bar.volume)
+                        if last_bar_signature.get(bar.instrument_id) == signature:
+                            continue
+                        last_bar_signature[bar.instrument_id] = signature
+                        try:
+                            await redis.publish(f"bars:{bar.instrument_id}", bar.model_dump_json())
+                        except Exception as exc:  # noqa: BLE001 - a publish failure must not kill the socket
+                            log.warning("upstox_ingestor.bar_publish_failed", reason=str(exc))
                     if max_ticks is not None and published >= max_ticks:
                         break
             except Exception as exc:  # noqa: BLE001 - any failure here is a reconnect, not a crash

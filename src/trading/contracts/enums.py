@@ -28,6 +28,7 @@ class DataSource(IntEnum):
     AMFI_NAV = 5
     BINANCE_WS = 6
     UPSTOX_HISTORICAL_CANDLE = 7
+    UPSTOX_WS = 8
 
 
 class JobStatus(StrEnum):

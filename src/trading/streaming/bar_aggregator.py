@@ -23,7 +23,7 @@ from redis.asyncio.client import PubSub
 
 from trading.config import get_settings
 from trading.contracts import DataSource
-from trading.streaming.models import Tick
+from trading.streaming.models import Bar, Tick
 
 INTERVAL_SECONDS = 60
 
@@ -165,6 +165,11 @@ def write_closed_bar(
 log = structlog.get_logger(__name__)
 
 _TICK_PATTERN = "ticks:*"
+_BAR_PATTERN = "bars:*"
+
+_SELECT_UPSTOX_BOUND_INSTRUMENT_IDS = """
+    SELECT instrument_id FROM instruments WHERE source_bindings ? 'upstox_instrument_key'
+"""
 
 Sleeper = Callable[[float], Awaitable[None]]
 
@@ -181,6 +186,55 @@ def _parse_tick(raw: str) -> Tick | None:
         return None
 
 
+def _parse_bar(raw: str) -> Bar | None:
+    try:
+        return Bar.model_validate_json(raw)
+    except Exception as exc:  # noqa: BLE001 - a malformed message is skipped, never fatal
+        log.warning("bar_aggregator.malformed_bar_message", reason=str(exc), raw=raw[:200])
+        return None
+
+
+def _query_upstox_bound_instrument_ids(conn: Connection) -> set[int]:
+    """Instruments with an Upstox binding get their bars authoritatively
+    from `bars:*` (published from `marketOHLC`'s I1 entries) -- letting
+    the tick path also aggregate bars for them would both under-count
+    volume (mode "full" ticks are LTP snapshots, not a trade stream) and
+    race the good bars for the same `(instrument_id, ts, interval_sec)`
+    primary key, with the winner decided by arrival order."""
+    rows = conn.execute(_SELECT_UPSTOX_BOUND_INSTRUMENT_IDS).fetchall()
+    return {int(row[0]) for row in rows}
+
+
+def write_upstox_bar(
+    conn: Connection,
+    bar: Bar,
+    *,
+    interval_seconds: int = INTERVAL_SECONDS,
+    source: DataSource = DataSource.UPSTOX_WS,
+) -> None:
+    """Upsert one already-complete I1 bar straight into `bars_intraday`,
+    bypassing `BarAggregator`/`OpenBar` entirely -- unlike a tick-
+    aggregated `ClosedBar`, this bar was never partially observed, so
+    there is no bucketing state to build up first. `trades` is always
+    NULL: the feed gives no trade count, and inventing one would be
+    dishonest."""
+    conn.execute(
+        _UPSERT_BAR,
+        (
+            bar.instrument_id,
+            bar.ts,
+            interval_seconds,
+            bar.open,
+            bar.high,
+            bar.low,
+            bar.close,
+            bar.volume,
+            None,
+            source.value,
+        ),
+    )
+
+
 async def run_aggregation_loop(
     redis: Redis,
     conn: Connection,
@@ -191,27 +245,57 @@ async def run_aggregation_loop(
     max_bars_written: int | None = None,
     source: DataSource = DataSource.BINANCE_WS,
     pattern: str = _TICK_PATTERN,
+    bars_pattern: str = _BAR_PATTERN,
 ) -> None:
-    """Subscribe to `pattern` (`ticks:*` by default), aggregate into bars,
-    write each closed bar.
+    """Subscribe to `pattern` (`ticks:*` by default) and `bars_pattern`
+    (`bars:*` by default), writing each resulting bar to `bars_intraday`.
+
+    Two independent sources feed the same table, kept from fighting over
+    the same `(instrument_id, ts, interval_sec)` primary key by partition,
+    not by arrival order:
+
+    - `pattern`: raw ticks, bucketed in-process by `BarAggregator` into
+      `ClosedBar`s once a bucket's window has fully elapsed. Ticks for any
+      instrument with an Upstox binding (`source_bindings ?
+      'upstox_instrument_key'`, queried once at startup) are skipped here
+      -- those instruments get authoritative, already-complete bars via
+      `bars_pattern` instead, and a tick-aggregated bar for them would
+      both under-count volume (mode "full" ticks are LTP snapshots, not a
+      trade stream) and race the good bar for the same primary key, with
+      the winner decided by arrival order. Crypto instruments carry no
+      Upstox binding, so this exclusion never touches them.
+    - `bars_pattern`: already-complete bars (e.g. Upstox's I1 minute
+      bars), upserted directly via `write_upstox_bar` -- never routed
+      through `BarAggregator`/`OpenBar`, and never subject to the tick
+      path's startup-discard rule below (a bar arriving this way was never
+      partially observed by this process, unlike a tick-aggregated
+      bucket).
 
     Runs forever when `max_bars_written` is None (production). Stops once
-    `max_bars_written` bars have been written when it's an int -- a test
-    seam, the same shape as `crypto_ingestor.run_ingestion_loop`'s
-    `max_ticks`.
+    `max_bars_written` bars have been written (from either source
+    combined) when it's an int -- a test seam, the same shape as
+    `crypto_ingestor.run_ingestion_loop`'s `max_ticks`.
 
-    Whatever minute is already in progress when this process starts has
-    only been partially observed -- this process cannot honestly claim to
-    have captured the whole window. `first_complete_bucket` is the first
-    bucket boundary at or after startup that this process *can* claim in
-    full; any bar that closes for an earlier bucket is discarded (logged,
-    not written) rather than persisted as if it were complete. This is the
-    startup-side counterpart to the shutdown path, which already discards
-    any still-open bucket instead of force-flushing it.
+    Whatever minute is already in progress on the tick path when this
+    process starts has only been partially observed -- this process cannot
+    honestly claim to have captured the whole window. `first_complete_bucket`
+    is the first bucket boundary at or after startup that this process
+    *can* claim in full; any tick-aggregated bar that closes for an
+    earlier bucket is discarded (logged, not written) rather than
+    persisted as if it were complete. This is the startup-side counterpart
+    to the shutdown path, which already discards any still-open bucket
+    instead of force-flushing it. This rule never applies to the
+    `bars_pattern` path -- those bars are complete by construction.
     """
     aggregator = BarAggregator(interval_seconds)
     first_complete_bucket = bucket_start(datetime.now(UTC), interval_seconds) + timedelta(
         seconds=interval_seconds
+    )
+    excluded_instrument_ids = _query_upstox_bound_instrument_ids(conn)
+    log.info(
+        "bar_aggregator.excluding_tick_aggregation",
+        count=len(excluded_instrument_ids),
+        instrument_ids=sorted(excluded_instrument_ids),
     )
     written = 0
     done = asyncio.Event()
@@ -231,6 +315,13 @@ async def run_aggregation_loop(
         if max_bars_written is not None and written >= max_bars_written:
             done.set()
 
+    def _write_upstox_bar(bar: Bar) -> None:
+        nonlocal written
+        write_upstox_bar(conn, bar, interval_seconds=interval_seconds)
+        written += 1
+        if max_bars_written is not None and written >= max_bars_written:
+            done.set()
+
     async def _consume_ticks(pubsub: PubSub) -> None:
         async for message in pubsub.listen():
             if message["type"] != "pmessage":
@@ -238,7 +329,20 @@ async def run_aggregation_loop(
             tick = _parse_tick(message["data"])
             if tick is None:
                 continue
+            if tick.instrument_id in excluded_instrument_ids:
+                continue
             _write_all(aggregator.ingest(tick))
+            if done.is_set():
+                return
+
+    async def _consume_bars(pubsub: PubSub) -> None:
+        async for message in pubsub.listen():
+            if message["type"] != "pmessage":
+                continue
+            bar = _parse_bar(message["data"])
+            if bar is None:
+                continue
+            _write_upstox_bar(bar)
             if done.is_set():
                 return
 
@@ -249,24 +353,29 @@ async def run_aggregation_loop(
 
     pubsub = redis.pubsub()
     await pubsub.psubscribe(pattern)
+    bars_pubsub = redis.pubsub()
+    await bars_pubsub.psubscribe(bars_pattern)
     consumer = asyncio.create_task(_consume_ticks(pubsub))
+    bars_consumer = asyncio.create_task(_consume_bars(bars_pubsub))
     flusher = asyncio.create_task(_periodic_flush())
     try:
         if max_bars_written is None:
-            await asyncio.gather(consumer, flusher)
+            await asyncio.gather(consumer, bars_consumer, flusher)
         else:
             await done.wait()
     finally:
         consumer.cancel()
+        bars_consumer.cancel()
         flusher.cancel()
-        try:
-            await pubsub.punsubscribe()
-            # redis-py's PubSub.aclose (unlike Redis.aclose) ships with no
-            # type annotations at all -- a real upstream stub gap, matching
-            # the same suppression stream_gateway already carries.
-            await pubsub.aclose()  # type: ignore[no-untyped-call]
-        except Exception:  # noqa: BLE001 - cleanup must never itself crash the loop
-            log.debug("bar_aggregator.pubsub_cleanup_failed", exc_info=True)
+        for one_pubsub in (pubsub, bars_pubsub):
+            try:
+                await one_pubsub.punsubscribe()
+                # redis-py's PubSub.aclose (unlike Redis.aclose) ships with no
+                # type annotations at all -- a real upstream stub gap, matching
+                # the same suppression stream_gateway already carries.
+                await one_pubsub.aclose()  # type: ignore[no-untyped-call]
+            except Exception:  # noqa: BLE001 - cleanup must never itself crash the loop
+                log.debug("bar_aggregator.pubsub_cleanup_failed", exc_info=True)
         # Same reasoning as crypto_ingestor.run_ingestion_loop's identical
         # finally block: release any pooled connection(s) opened during this
         # run before control returns to the caller's event loop, so a

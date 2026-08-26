@@ -19,7 +19,7 @@ from trading.streaming.bar_aggregator import (
     run_aggregation_loop,
     write_closed_bar,
 )
-from trading.streaming.models import Tick
+from trading.streaming.models import Bar, Tick
 
 
 def _tick(
@@ -466,3 +466,193 @@ def test_run_aggregation_loop_discards_a_partial_bar_left_over_from_before_start
     # bucket that predates this process's startup never appears at all.
     assert len(rows) == 1
     assert rows[0] == (bucket_start(later_tick_ts), Decimal("200.0000"), Decimal("200.0000"))
+
+
+def _bar_json(instrument_id: int, ts: datetime, close: str = "100.00", volume: str = "1000") -> str:
+    return Bar(
+        instrument_id=instrument_id,
+        ts=ts,
+        open=Decimal(close),
+        high=Decimal(close),
+        low=Decimal(close),
+        close=Decimal(close),
+        volume=Decimal(volume),
+    ).model_dump_json()
+
+
+def _isolated_bars_channel_and_pattern(iid: int) -> tuple[str, str]:
+    """Same isolation reasoning as `_isolated_channel_and_pattern`, for the
+    `bars:*`-shaped consumer instead of `ticks:*`."""
+    channel = f"test-bars:{iid}:{iid}"
+    pattern = f"test-bars:{iid}:*"
+    return channel, pattern
+
+
+def _make_upstox_bound_instrument(db_conn) -> int:
+    """A minimal EQUITY instrument row carrying an `upstox_instrument_key`
+    binding -- enough to exercise the tick-aggregation exclusion query
+    without depending on `seed_upstox_instrument_keys`'s fixed watchlist
+    (which requires pre-seeded RELIANCE/TCS/... rows this test doesn't
+    otherwise need)."""
+    row = db_conn.execute(
+        """
+        INSERT INTO instruments
+            (asset_class, exchange, segment, symbol, series, currency, status,
+             canonical_key, source_bindings)
+        VALUES ('EQUITY', 'NSE', 'CM', 'BARAGGTEST', 'EQ', 'INR', 'ACTIVE',
+                'NSE:CM:BARAGGTEST:EQ', '{"upstox_instrument_key": "NSE_EQ|TESTISIN"}'::jsonb)
+        RETURNING instrument_id
+        """
+    ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def test_run_aggregation_loop_upserts_a_bars_message_with_upstox_ws_source(
+    db_conn, redis_client: redis.Redis
+) -> None:
+    """A `bars:*` message (an already-complete I1 bar) is upserted
+    directly via `_UPSERT_BAR` -- it never touches `BarAggregator`/
+    `OpenBar`, and is never subject to the tick path's startup-discard
+    rule (it's complete by construction, not partially observed)."""
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_bars_channel_and_pattern(iid)
+    # Deliberately in the past (long before "now") -- unlike the tick path,
+    # a bars:* message must never be discarded by the startup cutoff.
+    bar_ts = datetime(2020, 1, 1, 9, 16, 0, tzinfo=UTC)
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(
+            async_redis, db_conn, sleep=_no_sleep, max_bars_written=1, bars_pattern=pattern
+        )
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)
+            redis_client.publish(channel, _bar_json(iid, bar_ts, close="65000.00", volume="123"))
+
+        asyncio.run(_run_both(loop_task, _publish_after_subscribed()))
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    row = db_conn.execute(
+        "SELECT ts, open, close, volume, trades, source"
+        " FROM bars_intraday WHERE instrument_id = %s",
+        (iid,),
+    ).fetchone()
+    assert row == (
+        bar_ts,
+        Decimal("65000.0000"),
+        Decimal("65000.0000"),
+        Decimal("123.00000000"),
+        None,
+        DataSource.UPSTOX_WS.value,
+    )
+
+
+def test_run_aggregation_loop_excludes_upstox_bound_instruments_from_tick_aggregation(
+    db_conn, redis_client: redis.Redis
+) -> None:
+    """An Upstox-bound instrument's ticks must produce no tick-aggregated
+    bar at all (it gets its bars from `bars:*` instead, and a tick-
+    aggregated one would be volume-wrong and race the good one for the
+    same primary key). A crypto instrument (no Upstox binding) on the same
+    pattern must still aggregate normally with source=BINANCE_WS."""
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    excluded_iid = _make_upstox_bound_instrument(db_conn)
+    crypto_iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    tag = f"{excluded_iid}-{crypto_iid}"
+    pattern = f"test-ticks:{tag}:*"
+    excluded_channel = f"test-ticks:{tag}:{excluded_iid}"
+    crypto_channel = f"test-ticks:{tag}:{crypto_iid}"
+    base = datetime.now(UTC) + timedelta(minutes=3)
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(
+            async_redis, db_conn, sleep=_no_sleep, max_bars_written=1, pattern=pattern
+        )
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)
+            # Two ticks -> a rollover -> would close a bar if aggregated.
+            redis_client.publish(
+                excluded_channel, _tick_json(excluded_iid, base.isoformat(), "999.00")
+            )
+            redis_client.publish(
+                excluded_channel,
+                _tick_json(
+                    excluded_iid, (base + timedelta(minutes=1, seconds=5)).isoformat(), "998.00"
+                ),
+            )
+            # Crypto tick rollover -- this is the one that actually closes
+            # a bar and stops the loop via max_bars_written=1.
+            redis_client.publish(
+                crypto_channel, _tick_json(crypto_iid, base.isoformat(), "65000.00")
+            )
+            redis_client.publish(
+                crypto_channel,
+                _tick_json(
+                    crypto_iid, (base + timedelta(minutes=1, seconds=5)).isoformat(), "65010.00"
+                ),
+            )
+
+        asyncio.run(_run_both(loop_task, _publish_after_subscribed()))
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    excluded_rows = db_conn.execute(
+        "SELECT 1 FROM bars_intraday WHERE instrument_id = %s", (excluded_iid,)
+    ).fetchall()
+    assert excluded_rows == []  # never aggregated from ticks
+
+    crypto_row = db_conn.execute(
+        "SELECT source FROM bars_intraday WHERE instrument_id = %s", (crypto_iid,)
+    ).fetchone()
+    assert crypto_row == (DataSource.BINANCE_WS.value,)
+
+
+def test_run_aggregation_loop_logs_the_excluded_instrument_set_once_at_startup(
+    db_conn, redis_client: redis.Redis
+) -> None:
+    import structlog
+
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    excluded_iid = _make_upstox_bound_instrument(db_conn)
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    base = datetime.now(UTC) + timedelta(minutes=3)
+
+    with structlog.testing.capture_logs() as cap:
+        async_redis: AsyncRedis = AsyncRedis.from_url(
+            get_settings().redis_url, decode_responses=True
+        )
+        try:
+            loop_task = run_aggregation_loop(
+                async_redis, db_conn, sleep=_no_sleep, max_bars_written=1, pattern=pattern
+            )
+
+            async def _publish_after_subscribed() -> None:
+                await asyncio.sleep(0.2)
+                redis_client.publish(channel, _tick_json(iid, base.isoformat(), "65000.00"))
+                redis_client.publish(
+                    channel,
+                    _tick_json(
+                        iid, (base + timedelta(minutes=1, seconds=5)).isoformat(), "65010.00"
+                    ),
+                )
+
+            asyncio.run(_run_both(loop_task, _publish_after_subscribed()))
+        finally:
+            asyncio.run(async_redis.aclose())
+
+    events = [
+        entry for entry in cap if entry.get("event") == "bar_aggregator.excluding_tick_aggregation"
+    ]
+    assert len(events) == 1
+    assert excluded_iid in events[0]["instrument_ids"]
+    assert events[0]["count"] == len(events[0]["instrument_ids"])

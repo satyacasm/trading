@@ -30,3 +30,26 @@ class Tick(BaseModel):
         if value.tzinfo is None:
             raise ValueError("Tick.ts must carry tzinfo (UTC in storage/wire format)")
         return value
+
+
+class Bar(BaseModel):
+    """One complete, authoritative minute bar as delivered whole by a
+    provider (e.g. Upstox's `marketOHLC` `I1` entry) -- unlike `Tick`, this
+    is never assembled by our own aggregation logic."""
+
+    model_config = ConfigDict(frozen=True)
+
+    instrument_id: int
+    ts: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+
+    @field_validator("ts")
+    @classmethod
+    def _ts_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("Bar.ts must carry tzinfo (UTC in storage/wire format)")
+        return value

@@ -1,6 +1,10 @@
-"""Shared fixtures for the streaming test suite. Redis is real
-(docker-compose's `trading_redis`), never mocked -- the same convention
-`db_conn` already uses for Postgres."""
+"""Shared fixtures for the streaming test suite. Redis is real, never
+mocked -- the same convention `db_conn` already uses for Postgres.
+
+It points at docker-compose's `trading_redis_test` (a separate instance
+from production `trading_redis`), via the session-scoped redirect in the
+root `tests/conftest.py`, which also guards against ever pointing at
+production and flushes this instance between tests."""
 
 from __future__ import annotations
 

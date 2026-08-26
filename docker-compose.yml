@@ -22,5 +22,21 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+  # Separate INSTANCE, not a separate database number, because Redis pub/sub
+  # is not scoped by db: a subscriber on db1 receives what a publisher sends
+  # on db7 (verified against this very image). Sharing an instance therefore
+  # means the test suite's fixture messages land on live ingestors' channels
+  # -- which is exactly how a pytest run killed the bar_aggregator mid-session
+  # with a ForeignKeyViolation on a fixture instrument_id. Deliberately has no
+  # volume: nothing here should ever survive a restart.
+  redis_test:
+    image: redis:7-alpine
+    container_name: trading_redis_test
+    ports: ["6380:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 volumes:
   tsdb_data:

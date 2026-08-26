@@ -1118,3 +1118,127 @@ Record in the task's completion notes: which watchlist names were observed updat
 - [ ] **Step 7: Stop the processes**
 
 Ctrl-C both processes (or leave running if continuing to observe). No commit for this task — it verifies Tasks 1-4's commits, it doesn't add its own.
+
+---
+
+## Task 5 completion notes (live run 2026-08-26, 09:25–09:36 IST, NSE open)
+
+**Outcome: the pipeline was completely dead, for two independent reasons. Both found, both fixed, end-to-end now verified live.**
+
+### Bug 1 — subscribe sent as a Text frame (root cause of zero data)
+`LiveUpstoxFeed.subscribe()` sent `json.dumps(request)` (a `str`), which `websockets` emits as a
+**Text** frame. Upstox V3 silently ignores it: the socket stays open, `authorize()` succeeds,
+`subscribe()` "succeeds", and the only frame that ever arrives is an unsolicited `market_info`.
+Measured: 1 frame in 45 s, `feeds=0`. Sending `.encode("utf-8")` (Binary) → live ticks for all 5
+instruments within one second. The pre-existing code comment asserted the exact opposite and had
+never been run against the live feed.
+
+Note the failure was *invisible by construction*: `subscribe()` returns the keys it was asked for,
+because Upstox sends no synchronous ack. A dropped subscription is indistinguishable from a good
+one at that seam.
+
+### Bug 2 — parser discarded 100% of real frames (masked by Bug 1)
+`parse_upstox_frame()` skipped anything whose `FeedUnion` oneof wasn't `ltpc`. But we subscribe with
+`"mode": "full"`, under which *every* feed arrives as `ff` → `FullFeed.marketFF.ltpc` (or `indexFF`
+for indices). So even with Bug 1 fixed, zero ticks would have been published. Fixed via
+`_extract_ltpc()` handling `ltpc`, `ff/marketFF`, and `ff/indexFF`.
+
+**Why 542 tests passed over a dead pipeline:** every fixture in `test_upstox_feed.py` was
+synthesised with `feed.ltpc.*` — the tests encoded the same wrong assumption as the code — and
+`LiveUpstoxFeed.subscribe` had no coverage at all ("no network in tests"). Now guarded by real
+captured frames in `tests/streaming/fixtures/upstox_{initial,live}_feed.bin` and
+`upstox_market_info.bin`, plus a Text-vs-Binary regression test. Suite: 547 passing.
+
+### Live verification (Step 5)
+`authorize()` and `subscribe()` both worked first attempt against the real Analytics token.
+Redis, 30 s window: INFY/RELIANCE/HDFCBANK/ICICIBANK/TCS, 10 ticks each (50 total).
+`bars_intraday` at 04:05 UTC (09:35 IST), OHLC cross-checked as sane:
+
+| symbol | open | high | low | close | recorded vol |
+|---|---|---|---|---|---|
+| RELIANCE | 1309.60 | 1310.30 | 1309.60 | 1310.30 | 344 |
+| TCS | 2294.10 | 2294.10 | 2292.80 | 2294.00 | 220 |
+| HDFCBANK | 726.65 | 726.80 | 726.60 | 726.80 | 929 |
+| ICICIBANK | 1444.50 | 1444.80 | 1444.00 | 1444.80 | 353 |
+| INFY | 1132.00 | 1133.40 | 1132.00 | 1133.00 | 1091 |
+
+### `initial_feed` question (deferred by the design doc) — answered
+Exactly one `initial_feed` frame per connection, carrying a snapshot of all subscribed instruments.
+It is a *stale last trade*, not a new one. In one session its values were re-emitted verbatim as the
+next `live_feed`; in a 60 s session they were not. Low impact per connection — but every reconnect
+re-injects a snapshot tick, so a flapping socket manufactures spurious ticks. Task 3's
+"include initial_feed ticks too" decision should be revisited alongside the volume issue below.
+
+### CRITICAL follow-up — `bars_intraday.volume` from this path is not traded volume
+Mode "full" is a **snapshot** feed at a ~3 s cadence (hence exactly 10 ticks/instrument/30 s,
+identical across all five regardless of activity), not a trade-by-trade stream. `ltq` is the *last
+trade's* quantity re-broadcast each push, so summing it per tick is meaningless: ~11% of pushes in a
+60 s window were byte-identical `(ltt, ltp, ltq)` repeats, and the sampling misses most trades
+outright. Measured gap: we recorded RELIANCE **344** for the 09:35 minute; the feed's own
+`marketOHLC` bar for that instrument reports **11,496** — roughly 33× under-count.
+
+`eFeedDetails` (which carries `tv`, cumulative traded volume) is **not populated** in this feed.
+But `MarketFullFeed.marketOHLC.ohlc` already carries exchange-authoritative bars, both
+`interval='I1'` (1-minute OHLCV) and `interval='1d'`. Example, RELIANCE:
+`I1 o=1311.1 h=1311.3 l=1310.6 c=1311.1 volume=11496`, `1d o=1310.0 h=1314.8 l=1308.0 c=1311.5 volume=565764`.
+
+So the pipeline is currently reconstructing an inferior bar from LTP samples while discarding a
+correct one the feed hands us for free. OHLC from the tick path is roughly right; **volume is not,
+and must not be trusted by any strategy, metric, or backtest until this is resolved.** Resolving it
+is a design decision (it changes the bar_aggregator contract for the Upstox path) and is tracked
+separately — it was not improvised into this task.
+
+### I1 bar semantics — verified (09:40–09:43 IST, RELIANCE + ICICIBANK)
+
+Before building the I1 write path, the key question was whether `marketOHLC` `interval='I1'` is the
+*completed previous* minute or a *mutating in-progress* one. Measured over 3.5 minutes, tracking
+every distinct `(open, high, low, close, volume)` tuple seen per `(instrument, I1 ts)`:
+
+| symbol | I1 bar minute | pushes | distinct OHLCV | mutated? |
+|---|---|---|---|---|
+| ICICIBANK | 09:40 / 09:41 / 09:42 / 09:43 | 17 / 20 / 21 / 15 | 1 / 1 / 1 / 1 | no |
+| RELIANCE | 09:40 / 09:41 / 09:42 / 09:43 | 17 / 19 / 24 / 13 | 1 / 1 / 1 / 1 | no |
+
+**I1 is the previous completed minute and is immutable** — re-broadcast 13–24× on the ~3 s snapshot
+cadence, always byte-identical. Consequences for the implementation: the upsert is genuinely
+idempotent (not just convergent), no bucket-completeness rule is needed for these bars, and
+in-process dedupe before publishing removes ~95% of otherwise-redundant Redis traffic.
+
+### Volume follow-up RESOLVED — I1 bar path shipped (2026-08-26, live-verified 09:56–09:58 IST)
+
+Decision taken: for Upstox-bound instruments, `bars_intraday` is written from the feed's own
+`marketOHLC interval='I1'` bar rather than aggregated from LTP snapshots. Crypto keeps aggregating
+from ticks. Implemented as: `DataSource.UPSTOX_WS = 8` (+ migration `0006`, chained after `0005`);
+`parse_upstox_bars()` in `upstox_feed.py`; `bars:{instrument_id}` publishing with per-instrument
+signature dedupe in `upstox_ingestor`; and a second `bars:*` consumer in `bar_aggregator` that
+upserts directly with `trades = NULL` (the feed gives no trade count; inventing one would be
+dishonest).
+
+**The correctness crux was two writers on one primary key.** `bars_intraday` is keyed
+`(instrument_id, ts, interval_sec)`, so the tick path and the I1 path would have raced for the same
+rows with the winner decided by arrival order. `bar_aggregator` now queries the Upstox-bound
+instrument set at startup and skips those ticks, logging the partition explicitly
+(`bar_aggregator.excluding_tick_aggregation count=5 instrument_ids=[57153, 57440, 58492, 58607, 58891]`).
+Ticks are still published for those instruments — the live-price UI needs them; they are just no
+longer aggregated into bars.
+
+Live evidence, `bars:*` channel: exactly 5 messages in 90 s (one per instrument per minute — dedupe
+suppressing ~20 pushes each). Rows landed with `source=UPSTOX_WS`, `trades=NULL`, and realistic
+volume:
+
+| symbol | 04:27 UTC OHLC | new volume | old broken volume (09:35) |
+|---|---|---|---|
+| RELIANCE | 1312.0 / 1312.9 / 1311.4 / 1312.0 | 16,632 | 344 |
+| HDFCBANK | 727.45 / 727.45 / 727.15 / 727.25 | 21,199 | 929 |
+| ICICIBANK | 1442.9 / 1443.2 / 1442.5 / 1443.0 | 10,718 | 353 |
+| INFY | 1130.4 / 1130.6 / 1130.1 / 1130.4 | 8,844 | 1,091 |
+| TCS | 2296.5 / 2297.3 / 2296.3 / 2296.6 | 2,504 | 220 |
+
+Crypto path confirmed unchanged (73 `BINANCE_WS` bars in the same 5-minute window). Suite 559
+passing, ruff + mypy clean, `alembic current` = 0006.
+
+**Outstanding data-quality item:** 105 NSE rows written between 09:25 and 09:56 IST today carry both
+the wrong provenance (`BINANCE_WS`) and the ~33x-understated snapshot volume. They are precisely
+identifiable (`exchange='NSE' AND source_bindings ? 'upstox_instrument_key' AND source = 6`) and
+should be deleted or re-derived from the Upstox historical-candle API before any backtest touches
+today's date.

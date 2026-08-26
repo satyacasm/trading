@@ -1864,3 +1864,31 @@ Controller-run, not delegated — it requires a human eye on a real browser watc
 - [ ] **Step 3:** Open a crypto instrument's chart page. Confirm history renders and all five timeframe buttons work. Confirm the `1m` chart's rightmost candle updates live from ticks.
 - [ ] **Step 4:** Take a screenshot of the working dashboard and a screenshot of the working chart page.
 - [ ] **Step 5:** Record in this plan's Completion Notes (append a new section below): which symbols were used, whether the NSE market was open or closed during the run and which state was observed, the screenshot paths, and any issues found (fixed inline if small, or filed as a new discovered-live task the same way Tasks 8/9/10 were added to the intraday-backfill plan if not).
+
+---
+
+## Completion Notes — Tasks 8–11 (2026-08-26)
+
+**Run conditions.** NSE mid-session (verified ~11:28 IST, well inside 09:15–15:30), so the equity path was exercised live rather than in its market-closed state. Full stack up: gateway, `crypto_ingestor`, `bar_aggregator`, `upstox_ingestor`, Next dev server.
+
+**Symbols observed.** NSE equities RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY; crypto BTC-USDT, BNB-USDT, DOGE-USDT. All eight showed a live price and the blue LIVE tag simultaneously ("8 streaming"). Charts verified on BTC-USDT (1m and 1h) and RELIANCE (1m).
+
+**Evidence.**
+- `docs/verification/dashboard-live.png` — eight instruments streaming; BNB-USDT captured mid flash-down, showing the tick animation firing on real data.
+- `docs/verification/chart-btc-1m.png`, `docs/verification/chart-btc-1h.png` — same instrument across two timeframes, visibly different bucket granularity and price range.
+- `docs/verification/chart-reliance-1m.png` — NSE equity fed by the Upstox pipeline, live.
+
+**Deviations from the plan as written.** All deliberate, all committed:
+- Ticks are coalesced through a ref and flushed every 150ms instead of `setState`-per-tick. BTC-USDT was measured at ~107 ticks/sec against ~0.5/sec for an NSE equity; the plan's literal code would re-render the table ~107 times a second. Chart data bypasses React entirely via `series.update()`.
+- `useTickStream` hoists `instrumentIdsRef` above the connection effect, clears its reconnect timer on unmount, and guards `JSON.parse`. Ref writes moved into effects for `react-hooks/refs`.
+- Callers memoize the id array; the hook diffs on array identity.
+- Chart adds a `ResizeObserver`, `fitContent()` after `setData`, clears the candle ref before a timeframe refetch, and seeds the header from the last close when no tick has arrived.
+- `candles.ts` gained vitest coverage (19 cases) — not in the original plan. Mutation-tested: an off-by-one in the bucket boundary fails 15 tests, a dropped high-water update fails 1, treating a late tick as an append fails 1.
+
+**Issue found live — gateway deadlock (fixed, `5d03a2e`).** `GET /instruments` was an `async def` calling two seeding upserts on every request, so a read took row locks and ran blocking psycopg on the event loop. Two concurrent requests deadlocked the process permanently — 3 connections `idle in transaction`, 1 blocked on `Lock: transactionid`, 0% CPU, unrecoverable without a restart. `pg_terminate_backend` frees the current pair but the next page load re-arms it, so this was not a clearable state.
+
+Not introduced by this plan: the Task 7 dashboard already fetched `/watchlist` and `/instruments` concurrently, and React's dev double-mount fires that twice. It would have hit any refresh, and in production any two simultaneous visitors. Fixed at root — seeding moved to a lifespan handler, route made a plain `def`, route made read-only. Verified with 40 concurrent requests: all 200, single request 15ms, zero lingering transactions.
+
+**Suite state.** Backend 569 passed. Frontend: 19 vitest cases, `tsc --noEmit` clean, eslint clean.
+
+**Known-good but worth noting.** A thinly-traded equity can legitimately show "as of …" mid-session simply because it has not printed inside the 90s window — correct behaviour, not a bug. The BTC 1m chart shows sparse bars overnight where `bar_aggregator` had its earlier gap; that is real history, not a rendering fault.

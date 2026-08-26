@@ -1,26 +1,100 @@
 @import "tailwindcss";
 
+/*
+ * Palette. Two independent colour channels, deliberately kept apart:
+ *
+ *   - direction (up/down) -- what the price did
+ *   - liveness (live)     -- whether the socket is still feeding us
+ *
+ * Most terminals render both in green, which collides precisely when a
+ * trader is scanning fastest. Liveness is blue here so "this number is
+ * fresh" can never be misread as "this number went up".
+ */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --ground: #0b0f14;
+  --surface: #131a22;
+  --raised: #1a232e;
+  --line: #1f2a35;
+  --text: #e4e9ef;
+  --muted: #7a8794;
+  --up: #26a69a;
+  --down: #ef5350;
+  --live: #4da3ff;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+  --color-ground: var(--ground);
+  --color-surface: var(--surface);
+  --color-raised: var(--raised);
+  --color-line: var(--line);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-up: var(--up);
+  --color-down: var(--down);
+  --color-live: var(--live);
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --font-display: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, "SF Mono", monospace;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--ground);
+  color: var(--text);
+  font-family: var(--font-sans);
+}
+
+/*
+ * Every numeric cell uses this. Proportional digits re-flow the column on
+ * each tick, so decimal points drift and the eye loses the scan line down
+ * the price column -- tabular figures pin them.
+ */
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/*
+ * Signature interaction: a price cell flashes its direction on arrival and
+ * decays. This encodes two facts a static number can't -- which way it
+ * moved, and that it moved *just now* -- without the trader watching that
+ * row. It's the one animated thing on the page; everything else holds still.
+ */
+@keyframes flash-up {
+  from {
+    background-color: color-mix(in oklab, var(--up) 28%, transparent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+@keyframes flash-down {
+  from {
+    background-color: color-mix(in oklab, var(--down) 28%, transparent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+.flash-up {
+  animation: flash-up 600ms ease-out;
+}
+
+.flash-down {
+  animation: flash-down 600ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flash-up,
+  .flash-down {
+    animation: none;
+  }
+}
+
+:focus-visible {
+  outline: 2px solid var(--live);
+  outline-offset: 2px;
 }

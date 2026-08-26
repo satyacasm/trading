@@ -310,14 +310,41 @@ async def run_aggregation_loop(
                     bucket=closed.bucket.isoformat(),
                 )
                 continue
-            write_closed_bar(conn, closed, interval_seconds=interval_seconds, source=source)
+            try:
+                write_closed_bar(conn, closed, interval_seconds=interval_seconds, source=source)
+            except Exception as exc:  # noqa: BLE001 - a single unwritable bar (e.g.
+                # a ForeignKeyViolation for an instrument_id absent from
+                # `instruments`, the same real production crash
+                # `_write_upstox_bar` guards against) must never kill the
+                # whole consumer -- log and skip it, the same discipline
+                # `_parse_tick` already applies to a malformed message.
+                log.warning(
+                    "bar_aggregator.closed_bar_write_failed",
+                    instrument_id=closed.instrument_id,
+                    ts=closed.bucket.isoformat(),
+                    reason=str(exc),
+                )
+                continue
             written += 1
         if max_bars_written is not None and written >= max_bars_written:
             done.set()
 
     def _write_upstox_bar(bar: Bar) -> None:
         nonlocal written
-        write_upstox_bar(conn, bar, interval_seconds=interval_seconds)
+        try:
+            write_upstox_bar(conn, bar, interval_seconds=interval_seconds)
+        except Exception as exc:  # noqa: BLE001 - a single unwritable bar (e.g.
+            # a ForeignKeyViolation for an instrument_id absent from
+            # `instruments`, the real production crash this guards against)
+            # must never kill the whole consumer -- log and skip it, the same
+            # discipline _parse_bar already applies to a malformed message.
+            log.warning(
+                "bar_aggregator.bar_write_failed",
+                instrument_id=bar.instrument_id,
+                ts=bar.ts.isoformat(),
+                reason=str(exc),
+            )
+            return
         written += 1
         if max_bars_written is not None and written >= max_bars_written:
             done.set()

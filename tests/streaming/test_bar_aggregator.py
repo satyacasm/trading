@@ -373,6 +373,81 @@ def test_run_aggregation_loop_skips_a_malformed_message_and_keeps_going(
     assert row == (1,)  # only the one valid tick before the bucket closed
 
 
+def test_run_aggregation_loop_skips_a_closed_bar_whose_write_fails_and_keeps_going(
+    db_conn, redis_client: redis.Redis, monkeypatch
+) -> None:
+    """Same discipline as the `bars:*` path's identical test: a tick-
+    aggregated closed bar whose `write_closed_bar` call raises (e.g. the
+    real production crash: a ForeignKeyViolation for an instrument_id
+    absent from `instruments`) must be logged and skipped, not propagated
+    through asyncio.gather -- a single unwritable bar must never kill the
+    whole consumer. The failure is injected via a flaky `write_closed_bar`
+    rather than a real FK violation against `db_conn`: `db_conn` is a
+    non-autocommit test transaction, and a genuine DB error would poison it
+    for every statement after (unlike production's `autocommit=True`
+    connection, per this fix's design), which would make the very
+    "subsequent write still succeeds" assertion this test exists to make
+    impossible to observe. A subsequent, valid tick-derived bar must still
+    get written afterwards -- that's the point of this test, not just "no
+    raise"."""
+    import psycopg
+
+    from trading.streaming import bar_aggregator as bar_aggregator_module
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    # Comfortably ahead of "now" -- same reasoning as the sibling tick-path
+    # tests above: both closed buckets must fall at or after the loop's
+    # first_complete_bucket, or _write_all discards them before ever
+    # calling write_closed_bar.
+    base = datetime.now(UTC) + timedelta(minutes=3)
+    tick1_ts = base
+    tick2_ts = base + timedelta(minutes=1, seconds=5)  # closes tick1's bucket (the bad one)
+    tick3_ts = base + timedelta(minutes=2, seconds=10)  # closes tick2's bucket (the good one)
+
+    real_write_closed_bar = bar_aggregator_module.write_closed_bar
+    call_count = {"n": 0}
+
+    def _flaky_write_closed_bar(conn: Any, closed: ClosedBar, **kwargs: Any) -> None:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise psycopg.errors.ForeignKeyViolation(
+                "simulated: instrument_id not present in instruments"
+            )
+        real_write_closed_bar(conn, closed, **kwargs)
+
+    monkeypatch.setattr(bar_aggregator_module, "write_closed_bar", _flaky_write_closed_bar)
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(
+            async_redis, db_conn, sleep=_no_sleep, max_bars_written=1, pattern=pattern
+        )
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)  # give psubscribe time to land before we publish
+            redis_client.publish(channel, _tick_json(iid, tick1_ts.isoformat(), "999.00"))
+            redis_client.publish(channel, _tick_json(iid, tick2_ts.isoformat(), "500.00"))
+            redis_client.publish(channel, _tick_json(iid, tick3_ts.isoformat(), "65000.00"))
+
+        # Wrapped in a timeout: without the fix, the bad write's exception
+        # kills consumer silently (an unretrieved task exception, never
+        # raised into this test), so `done` never gets set and `done.wait()`
+        # would otherwise hang forever instead of failing loudly.
+        asyncio.run(asyncio.wait_for(_run_both(loop_task, _publish_after_subscribed()), timeout=10))
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    assert call_count["n"] == 2  # the failing write was attempted, then the next one too
+    rows = db_conn.execute(
+        "SELECT ts, close FROM bars_intraday WHERE instrument_id = %s", (iid,)
+    ).fetchall()
+    # Only the second, valid bucket was persisted -- the first write's
+    # exception never reached the database at all.
+    assert rows == [(bucket_start(tick2_ts), Decimal("500.0000"))]
+
+
 def test_run_aggregation_loop_flushes_a_stale_bucket_via_the_periodic_safety_net(
     db_conn, redis_client: redis.Redis
 ) -> None:
@@ -550,6 +625,106 @@ def test_run_aggregation_loop_upserts_a_bars_message_with_upstox_ws_source(
         None,
         DataSource.UPSTOX_WS.value,
     )
+
+
+def test_run_aggregation_loop_skips_a_bar_whose_write_fails_and_keeps_going(
+    db_conn, redis_client: redis.Redis, monkeypatch
+) -> None:
+    """A `bars:*` write that raises (e.g. the real production crash: a
+    ForeignKeyViolation for an instrument_id absent from `instruments`) must
+    be logged and skipped, not propagated through asyncio.gather -- a single
+    unwritable bar must never kill the whole consumer. The failure is
+    injected via a flaky `write_upstox_bar` rather than a real FK violation
+    against `db_conn`: `db_conn` is a non-autocommit test transaction, and a
+    genuine DB error would poison it for every statement after (unlike
+    production's `autocommit=True` connection, per this fix's design), which
+    would make the very "subsequent write still succeeds" assertion this
+    test exists to make impossible to observe. A subsequent, valid bar on
+    the same channel must still get written afterwards -- that's the point
+    of this test, not just "no raise"."""
+    import psycopg
+
+    from trading.streaming import bar_aggregator as bar_aggregator_module
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_bars_channel_and_pattern(iid)
+    bad_bar_ts = datetime(2020, 1, 1, 9, 16, 0, tzinfo=UTC)
+    good_bar_ts = datetime(2020, 1, 1, 9, 17, 0, tzinfo=UTC)
+
+    real_write_upstox_bar = bar_aggregator_module.write_upstox_bar
+    call_count = {"n": 0}
+
+    def _flaky_write_upstox_bar(conn: Any, bar: Bar, **kwargs: Any) -> None:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise psycopg.errors.ForeignKeyViolation(
+                "simulated: instrument_id not present in instruments"
+            )
+        real_write_upstox_bar(conn, bar, **kwargs)
+
+    monkeypatch.setattr(bar_aggregator_module, "write_upstox_bar", _flaky_write_upstox_bar)
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(
+            async_redis, db_conn, sleep=_no_sleep, max_bars_written=1, bars_pattern=pattern
+        )
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)
+            redis_client.publish(channel, _bar_json(iid, bad_bar_ts, close="999.00"))
+            redis_client.publish(channel, _bar_json(iid, good_bar_ts, close="65000.00"))
+
+        # Wrapped in a timeout: without the fix, the bad write's exception
+        # kills bars_consumer silently (an unretrieved task exception, never
+        # raised into this test), so `done` never gets set and `done.wait()`
+        # would otherwise hang forever instead of failing loudly.
+        asyncio.run(asyncio.wait_for(_run_both(loop_task, _publish_after_subscribed()), timeout=10))
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    assert call_count["n"] == 2  # the failing write was attempted, then the next one too
+    rows = db_conn.execute(
+        "SELECT ts, close FROM bars_intraday WHERE instrument_id = %s", (iid,)
+    ).fetchall()
+    # Only the second, valid bar was persisted -- the first write's exception
+    # never reached the database at all.
+    assert rows == [(good_bar_ts, Decimal("65000.0000"))]
+
+
+def test_run_aggregation_loop_skips_a_malformed_bar_message_and_keeps_going(
+    db_conn, redis_client: redis.Redis
+) -> None:
+    """Same discipline as the tick path's identical test: a `bars:*` message
+    that fails `Bar` validation is logged and skipped by `_parse_bar`, never
+    killing the consumer. A subsequent valid bar on the same channel still
+    gets written."""
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_bars_channel_and_pattern(iid)
+    bar_ts = datetime(2020, 1, 1, 9, 16, 0, tzinfo=UTC)
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(
+            async_redis, db_conn, sleep=_no_sleep, max_bars_written=1, bars_pattern=pattern
+        )
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)
+            redis_client.publish(channel, "not json")
+            redis_client.publish(channel, _bar_json(iid, bar_ts, close="65000.00", volume="123"))
+
+        asyncio.run(asyncio.wait_for(_run_both(loop_task, _publish_after_subscribed()), timeout=10))
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    row = db_conn.execute(
+        "SELECT close FROM bars_intraday WHERE instrument_id = %s", (iid,)
+    ).fetchone()
+    assert row == (Decimal("65000.0000"),)
 
 
 def test_run_aggregation_loop_excludes_upstox_bound_instruments_from_tick_aggregation(

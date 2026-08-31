@@ -20,6 +20,8 @@ from tests.paper.fixtures.contract_notes import DELIVERY_BUY, DELIVERY_SELL
 from trading.paper.charges import compute_charges, load_schedules
 from trading.paper.enums import Product, Side
 
+pytestmark = pytest.mark.db
+
 
 @pytest.mark.golden
 @pytest.mark.parametrize(

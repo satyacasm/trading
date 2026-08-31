@@ -159,3 +159,84 @@ def test_replay_reproduces_the_cached_cash_and_positions(db_conn, prices) -> Non
     replayed_cash, replayed_pos = replay_portfolio(db_conn, pid)
     assert replayed_cash == cached_cash
     assert replayed_pos == cached_pos
+
+
+def test_replay_matches_cached_cash_for_a_fractional_crypto_fill(db_conn) -> None:
+    """Fix-round-1 regression: `orders.quantity`/`fills.quantity` are
+    `NUMERIC(18,8)` precisely because crypto fills are fractional. A single
+    0.00000001 BTC fill at 79090.0100 produces a notional with twelve
+    decimal places even though both inputs were exact -- Postgres rounds
+    that to `cash_balance`'s `NUMERIC(18,4)` on write, but a
+    `replay_portfolio` that summed in full precision and rounded only once
+    at the end would not reproduce the same rounded number. This is the
+    property test above's exact blind spot: it never generates a price
+    below 2dp or a quantity below a whole unit, so it could not have
+    caught this."""
+    pid = make_portfolio(db_conn, cash=Decimal("1000000"))
+    o = make_order(db_conn, pid, side=Side.BUY, quantity=Decimal("0.00000001"))
+    apply_fill(db_conn, o, decision_at(Decimal("79090.0100")), simple_charges())
+
+    cached_cash = db_conn.execute(
+        "SELECT cash_balance FROM portfolios WHERE portfolio_id=%s", (pid,)
+    ).fetchone()[0]
+    replayed_cash, _ = replay_portfolio(db_conn, pid)
+    assert replayed_cash == cached_cash
+
+
+def test_replay_matches_cached_cash_across_multiple_fractional_crypto_fills(db_conn) -> None:
+    """The multi-fill version of the regression above: accumulated
+    intermediate roundings, not a single rounding step, is what
+    `replay_portfolio` must get right. Quantizing cash once at the end
+    instead of after every fill would still diverge here even though it
+    would happen to pass the single-fill test."""
+    pid = make_portfolio(db_conn, cash=Decimal("1000000"))
+    for qty, price in (
+        (Decimal("0.00000001"), Decimal("79090.0100")),
+        (Decimal("0.00000003"), Decimal("31245.3333")),
+        (Decimal("0.00000007"), Decimal("100.0001")),
+    ):
+        o = make_order(db_conn, pid, side=Side.BUY, quantity=qty)
+        apply_fill(db_conn, o, decision_at(price), simple_charges())
+
+    cached_cash = db_conn.execute(
+        "SELECT cash_balance FROM portfolios WHERE portfolio_id=%s", (pid,)
+    ).fetchone()[0]
+    replayed_cash, _ = replay_portfolio(db_conn, pid)
+    assert replayed_cash == cached_cash
+
+
+@settings(
+    max_examples=15,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+@given(
+    fills=st.lists(
+        st.tuples(
+            # NUMERIC(18,8): quantity, at crypto precision.
+            st.decimals(min_value=Decimal("0.00000001"), max_value=Decimal("2"), places=8),
+            # NUMERIC(18,4): price.
+            st.decimals(min_value=Decimal("1"), max_value=Decimal("1000"), places=4),
+        ),
+        min_size=1,
+        max_size=6,
+    )
+)
+def test_replay_reproduces_cached_cash_at_crypto_precision(db_conn, fills) -> None:
+    """The 2dp-price/whole-share property test above can never generate the
+    >4-decimal-place notional a fractional crypto fill produces; this
+    widens the same invariant to quantity and price precision that
+    actually appears in the crypto path (`NUMERIC(18,8)` quantity against
+    `NUMERIC(18,4)` price). `max_examples` stays modest since each example
+    performs up to six real fills against the database."""
+    pid = make_portfolio(db_conn, cash=Decimal("1000000"))
+    for qty, price in fills:
+        o = make_order(db_conn, pid, side=Side.BUY, quantity=qty)
+        apply_fill(db_conn, o, decision_at(price), simple_charges())
+
+    cached_cash = db_conn.execute(
+        "SELECT cash_balance FROM portfolios WHERE portfolio_id=%s", (pid,)
+    ).fetchone()[0]
+    replayed_cash, replayed_pos = replay_portfolio(db_conn, pid)
+    assert replayed_cash == cached_cash
+    assert replayed_pos == _positions(db_conn, pid)

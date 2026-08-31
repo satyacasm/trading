@@ -8,17 +8,28 @@ is only acceptable because `replay_portfolio` can prove it never drifted.
 boundary -- that is what lets the engine commit fill, ledger, position,
 cash, and order status as one unit, and what lets tests roll back.
 
-`avg_cost` and `realised_pnl` are quantized to the same four decimal
-places as the `positions` table's `NUMERIC(18,4)` columns, at every
-mutation, using the same `ROUND_HALF_UP` convention `trading.paper.charges`
-uses. Without this, a weighted-average division that doesn't terminate in
-four decimal places (e.g. three buys totalling 7.00 over quantity 3,
-7/3 = 2.333...) would be written to Postgres already rounded by the
-column's declared scale, while `replay_portfolio`'s pure-Python
-recomputation kept full precision -- a silent mismatch `hypothesis`
-catches almost immediately across enough examples. Quantizing in Python
-at each step, identically in both functions, makes the two computations
-byte-for-byte reproducible rather than merely "close."
+`avg_cost`, `realised_pnl`, and `cash_balance` are quantized to the same
+four decimal places as their `NUMERIC(18,4)` columns, at every mutation,
+using the same `ROUND_HALF_UP` convention `trading.paper.charges` uses.
+Without this, a computation that doesn't terminate in four decimal places
+would be written to Postgres already rounded by the column's declared
+scale, while `replay_portfolio`'s pure-Python recomputation kept full
+precision -- a silent mismatch `hypothesis` catches almost immediately
+across enough examples. `avg_cost`/`realised_pnl` need this because a
+weighted-average division rarely terminates exactly (e.g. three buys
+totalling 7.00 over quantity 3, 7/3 = 2.333...); `cash_balance` needs it
+for a different reason -- `orders.quantity`/`fills.quantity` are
+`NUMERIC(18,8)` because crypto fills are fractional, so a notional like
+`0.00000001 * 79090.0100` carries twelve decimal places even though every
+input was exact. `apply_fill` never computes this in Python: Postgres
+rounds `cash_balance = cash_balance + %s` to 4dp *as it stores each row*,
+so `replay_portfolio` must quantize its running cash total after every
+single fill (not once at the end) to replicate that same sequence of
+roundings -- quantizing only the final total would still diverge whenever
+intermediate roundings compound differently than one final rounding
+would. Quantizing in Python at each step, identically in both functions,
+makes the two computations byte-for-byte reproducible rather than merely
+"close."
 """
 
 from __future__ import annotations
@@ -156,15 +167,20 @@ def replay_portfolio(conn: Connection, portfolio_id: int) -> tuple[Decimal, dict
 
     The invariant that earns the caches their place: this must reproduce
     `portfolios.cash_balance` and every `positions` row exactly. Mirrors
-    `_apply_position`'s quantization step for step -- see the module
-    docstring for why that is required, not cosmetic.
+    `apply_fill`/`_apply_position`'s quantization step for step -- see the
+    module docstring for why that is required, not cosmetic, and in
+    particular why cash must be quantized after *every* fill rather than
+    once at the end.
     """
     initial = conn.execute(
         "SELECT initial_capital FROM portfolios WHERE portfolio_id=%s",
         (portfolio_id,),
     ).fetchone()
     assert initial is not None
-    cash = Decimal(initial[0])
+    # initial_capital is already NUMERIC(18,4); quantize anyway so the
+    # running total starts from the same representation apply_fill's
+    # first UPDATE would have started from.
+    cash = _quantize(Decimal(initial[0]))
 
     rows = conn.execute(
         "SELECT o.instrument_id, o.side, f.quantity, f.price, f.total_charges"
@@ -177,7 +193,13 @@ def replay_portfolio(conn: Connection, portfolio_id: int) -> tuple[Decimal, dict
     for instrument_id, side, quantity, price, total_charges in rows:
         notional = quantity * price
         if side == Side.BUY:
-            cash -= notional + total_charges
+            # Quantized after every fill, not once at the end -- see the
+            # module docstring. Postgres rounds cash_balance to 4dp on
+            # every UPDATE apply_fill issues, so replaying the fills in
+            # full precision and rounding only the final sum would
+            # reproduce a different number whenever intermediate
+            # roundings compound differently than one final rounding.
+            cash = _quantize(cash - (notional + total_charges))
             held = positions.get(instrument_id)
             if held is None:
                 positions[instrument_id] = Position(
@@ -198,7 +220,7 @@ def replay_portfolio(conn: Connection, portfolio_id: int) -> tuple[Decimal, dict
                     }
                 )
         else:
-            cash += notional - total_charges
+            cash = _quantize(cash + (notional - total_charges))
             held = positions[instrument_id]
             positions[instrument_id] = held.model_copy(
                 update={

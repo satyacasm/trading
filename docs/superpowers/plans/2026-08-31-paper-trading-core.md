@@ -586,10 +586,17 @@ Create `src/trading/paper/models.py`:
 ```python
 """Pydantic models for the paper-trading subsystem.
 
-Money is Decimal everywhere -- never float. `MoneyModel` pins the JSON
-encoding to numbers rather than strings; pydantic v2's default renders
-Decimal as a string, which is the defect Task 7b fixed for the market-data
-API and which would silently break arithmetic in any consumer.
+Money is Decimal everywhere -- never float.
+
+Models that cross the API boundary (Order, Position, Portfolio,
+ChargeBreakdown) declare an explicit field serializer rendering Decimal as
+a JSON number. Pydantic v2 renders Decimal as a *string* by default, which
+is the defect Task 7b fixed for the market-data API and which silently
+breaks arithmetic in any consumer.
+
+ChargeSchedule and FillDecision deliberately carry no serializer: they are
+process-internal and never leave this process. If a later task returns
+either over HTTP, add the serializer there.
 """
 
 from __future__ import annotations

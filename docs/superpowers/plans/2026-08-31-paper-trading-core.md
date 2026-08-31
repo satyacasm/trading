@@ -113,9 +113,12 @@ def test_nse_transaction_charge_has_two_dated_regimes(db_conn: Connection) -> No
     2026-03-01. The backfill spans 2022-2026 and crosses that boundary,
     so a single row would misprice most of the historical period.
     """
+    # Filter by product: both DELIVERY and INTRADAY carry both date
+    # regimes, so an unfiltered query returns four rows, not two.
     rows = db_conn.execute(
         "SELECT rate, effective_from, effective_to FROM charge_schedules "
         "WHERE exchange='NSE' AND charge_type='EXCHANGE_TXN' "
+        "AND product='DELIVERY' "
         "ORDER BY effective_from"
     ).fetchall()
     assert len(rows) == 2
@@ -1845,7 +1848,9 @@ git commit -m "test(paper): bar-driven fills never beat tick-driven fills"
 
 - [ ] **Step 1: Write the failing tests**
 
-Cover: equity is cash plus marked positions; a loss inside the limit does not breach; a loss exceeding `max_daily_loss` breaches with that reason; a drawdown from peak exceeding `max_drawdown_pct` breaches; `None` limits never breach; `trip` sets the portfolio to `PAUSED`, cancels its `OPEN` and `PENDING` orders, writes a `circuit_breaker_events` row, and enqueues an alert; and a position with no mark available raises rather than being valued at zero.
+Cover: equity is cash plus marked positions; a loss inside the limit does not breach; a loss exceeding `max_daily_loss` breaches with that reason; a drawdown from peak exceeding `max_drawdown_pct` breaches; `None` limits never breach; `trip` sets the portfolio to `PAUSED`, cancels its `OPEN` and `PENDING` orders, and writes a `circuit_breaker_events` row; and a position with no mark available raises rather than being valued at zero.
+
+**`trip` does NOT enqueue an alert in this task.** `alerts.enqueue_alert` does not exist until Task 11, which owns wiring alerting into both the engine and the breaker. Do not create a stub for it here.
 
 Also cover `record_snapshot` specifically, because `peak_equity` is the only piece of breaker state that must survive a restart:
 
@@ -1923,7 +1928,7 @@ The `sender` is injected so tests never touch the network. The real sender posts
 
 - [ ] **Step 3: Wire `enqueue_alert` into the engine and breaker**
 
-Called inside the same transaction as the fill and the trip.
+Called inside the same transaction as the fill and the trip. Task 10 deliberately left `trip` without alerting, so add the call here and add the assertion that a trip enqueues a `BREACH` alert — that test belongs to this task, not Task 10.
 
 - [ ] **Step 4: Gate and commit**
 

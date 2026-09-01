@@ -37,6 +37,24 @@ notional is estimated from `limit_price` (LIMIT orders) or the latest
 `bars_intraday` close (MARKET orders, no charges included, since the
 actual fill price and charges are unknown until the engine fills it) --
 never the sole line of defence.
+
+**`DELETE /orders/{order_id}` also publishes to `orders:control`**, with
+`{"action": "cancel", "order_id": ...}`. The Task 8 engine holds open
+orders in memory and only reloads from the DB at startup -- without this
+publish, a cancellation made while the engine is running would be
+invisible to it until restart, and the next tick would fill an order the
+user already cancelled.
+
+**The idempotency-key check is itself racy against a second, concurrent
+identical submit** -- the pre-check `SELECT` finding nothing is not a
+guarantee the following `INSERT` won't collide with a request that
+committed in between. `_insert_order` wraps that `INSERT` in
+`conn.transaction()` (a `SAVEPOINT`, since the route has already run
+several `SELECT`s by this point, so the connection is always
+mid-transaction) so that a `UniqueViolation` rolls back to the savepoint
+instead of aborting the whole transaction, then re-reads the row the
+other request inserted and returns *that* -- the same response a
+sequential duplicate already gets, rather than a 500.
 """
 
 from __future__ import annotations
@@ -192,12 +210,22 @@ def _position_from_row(row: Sequence[Any]) -> Position:
     )
 
 
-def _publish_new_order(order_id: int) -> None:
+def _publish_order_control(action: str, order_id: int) -> None:
     client = redis.Redis.from_url(get_settings().redis_url)
     try:
-        client.publish(_ORDERS_CONTROL_CHANNEL, json.dumps({"action": "new", "order_id": order_id}))
+        client.publish(
+            _ORDERS_CONTROL_CHANNEL, json.dumps({"action": action, "order_id": order_id})
+        )
     finally:
         client.close()
+
+
+def _find_existing_order(conn: Connection, idempotency_key: str) -> Order | None:
+    row = conn.execute(
+        f"SELECT {_ORDER_COLUMNS} FROM orders WHERE idempotency_key = %s",
+        (idempotency_key,),
+    ).fetchone()
+    return _order_from_row(row) if row is not None else None
 
 
 def _require_market_open(conn: Connection, exchange: str, segment: str, today: date) -> None:
@@ -312,19 +340,68 @@ def list_portfolios(
     return [_portfolio_from_row(row) for row in rows]
 
 
+def _insert_order(conn: Connection, body: CreateOrderRequest) -> tuple[Order, bool]:
+    """Insert the order, or -- if a concurrent request committed the same
+    idempotency_key between the caller's pre-check and this INSERT --
+    return that other request's order instead of letting the unique
+    violation surface as a 500. Returns `(order, created)`.
+
+    `conn.transaction()` opens a SAVEPOINT here rather than a fresh
+    transaction: the route has already run several SELECTs by this point,
+    so the connection is always already mid-transaction. On
+    `UniqueViolation` it rolls back to that savepoint automatically
+    (and re-raises), leaving the connection usable for the recovery
+    SELECT below instead of stuck aborted.
+    """
+    try:
+        with conn.transaction():
+            row = conn.execute(
+                "INSERT INTO orders (portfolio_id, instrument_id, side, order_type, quantity,"
+                " limit_price, product, time_in_force, status, rationale, idempotency_key)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                f" RETURNING {_ORDER_COLUMNS}",
+                (
+                    body.portfolio_id,
+                    body.instrument_id,
+                    body.side.value,
+                    body.order_type.value,
+                    body.quantity,
+                    body.limit_price,
+                    body.product.value,
+                    body.time_in_force.value,
+                    OrderStatus.PENDING.value,
+                    body.rationale,
+                    body.idempotency_key,
+                ),
+            ).fetchone()
+        assert row is not None
+        return _order_from_row(row), True
+    except UniqueViolation:
+        # Deliberately not `_find_existing_order` -- that name is also the
+        # route's pre-check, and a test forcing the pre-check to miss (to
+        # exercise this exact recovery path) must not also blind this
+        # lookup, or recovery could never find the row that just won the
+        # race.
+        winner_row = conn.execute(
+            f"SELECT {_ORDER_COLUMNS} FROM orders WHERE idempotency_key = %s",
+            (body.idempotency_key,),
+        ).fetchone()
+        assert winner_row is not None, (
+            "UniqueViolation on idempotency_key but no matching order found"
+        )
+        return _order_from_row(winner_row), False
+
+
 @router.post("/orders", response_model=Order, status_code=status.HTTP_201_CREATED)
 def create_order(
     body: CreateOrderRequest,
     response: Response,
     conn: Connection = Depends(get_db_connection),  # noqa: B008
 ) -> Order:
-    existing = conn.execute(
-        f"SELECT {_ORDER_COLUMNS} FROM orders WHERE idempotency_key = %s",
-        (body.idempotency_key,),
-    ).fetchone()
+    existing = _find_existing_order(conn, body.idempotency_key)
     if existing is not None:
         response.status_code = status.HTTP_200_OK
-        return _order_from_row(existing)
+        return existing
 
     portfolio_row = conn.execute(
         "SELECT status, cash_balance FROM portfolios WHERE portfolio_id = %s",
@@ -373,28 +450,13 @@ def create_order(
         )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    row = conn.execute(
-        "INSERT INTO orders (portfolio_id, instrument_id, side, order_type, quantity,"
-        " limit_price, product, time_in_force, status, rationale, idempotency_key)"
-        " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
-        f" RETURNING {_ORDER_COLUMNS}",
-        (
-            body.portfolio_id,
-            body.instrument_id,
-            body.side.value,
-            body.order_type.value,
-            body.quantity,
-            body.limit_price,
-            body.product.value,
-            body.time_in_force.value,
-            OrderStatus.PENDING.value,
-            body.rationale,
-            body.idempotency_key,
-        ),
-    ).fetchone()
-    assert row is not None
-    order = _order_from_row(row)
-    _publish_new_order(order.order_id)
+    order, created = _insert_order(conn, body)
+    if created:
+        _publish_order_control("new", order.order_id)
+    else:
+        # Lost the race to a concurrent identical submit -- same response
+        # a sequential duplicate already gets.
+        response.status_code = status.HTTP_200_OK
     return order
 
 
@@ -421,7 +483,9 @@ def cancel_order(
         (OrderStatus.CANCELLED.value, order_id),
     ).fetchone()
     assert updated is not None
-    return _order_from_row(updated)
+    cancelled_order = _order_from_row(updated)
+    _publish_order_control("cancel", cancelled_order.order_id)
+    return cancelled_order
 
 
 @router.get("/portfolios/{portfolio_id}/positions", response_model=list[Position])

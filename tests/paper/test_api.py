@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 
 from tests.paper.helpers import make_order, make_portfolio
 from trading.config import get_settings
+from trading.paper import api as paper_api
 from trading.paper.api import router
 from trading.paper.enums import OrderStatus, Side
 from trading.streaming.db import get_db_connection
@@ -507,6 +508,64 @@ def test_repeated_idempotency_key_returns_the_original_order(
     assert count == 1
 
 
+def test_concurrent_identical_submit_returns_the_winners_order_without_duplicating(
+    client: TestClient,
+    db_conn,
+    monkeypatch: pytest.MonkeyPatch,
+    portfolio_id: int,
+    equity_instrument_id: int,
+    open_market: None,
+) -> None:
+    """The sequential-duplicate test above only proves the pre-check
+    SELECT works -- it would pass even if the INSERT had no race handling
+    at all, since the pre-check already finds the first order. This test
+    forces the exact race a pre-check cannot close: another request's
+    INSERT has already committed the same idempotency_key, but *this*
+    request's pre-check somehow still finds nothing (the real-world case
+    being "in between the two"). That must drive create_order's INSERT
+    into a UniqueViolation, which _insert_order must recover from -- by
+    returning the row that actually won -- rather than raising a 500 or
+    leaving the connection's transaction aborted.
+    """
+    winner = db_conn.execute(
+        "INSERT INTO orders (portfolio_id, instrument_id, side, order_type, quantity,"
+        " limit_price, product, time_in_force, status, rationale, idempotency_key)"
+        " VALUES (%s, %s, 'BUY', 'LIMIT', 10, 100.00, 'DELIVERY', 'DAY', 'PENDING',"
+        " 'the request that won the race', 'race-key')"
+        " RETURNING order_id",
+        (portfolio_id, equity_instrument_id),
+    ).fetchone()
+    assert winner is not None
+    winner_order_id = winner[0]
+
+    # Simulate "another request committed in between our pre-check and our
+    # INSERT" by making the pre-check itself report nothing found, even
+    # though the row above already exists.
+    monkeypatch.setattr(paper_api, "_find_existing_order", lambda conn, key: None)
+
+    response = client.post(
+        "/orders",
+        json=_valid_order_body(
+            portfolio_id=portfolio_id,
+            instrument_id=equity_instrument_id,
+            idempotency_key="race-key",
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["order_id"] == winner_order_id
+    assert response.json()["rationale"] == "the request that won the race"
+
+    count = db_conn.execute(
+        "SELECT count(*) FROM orders WHERE idempotency_key = 'race-key'"
+    ).fetchone()[0]
+    assert count == 1
+
+    # The connection must not be left in an aborted-transaction state by
+    # the caught UniqueViolation -- prove it is still usable.
+    db_conn.execute("SELECT 1").fetchone()
+
+
 # --- DELETE /orders/{id} -----------------------------------------------
 
 
@@ -526,6 +585,30 @@ def test_cancel_open_order_sets_cancelled(client: TestClient, db_conn, portfolio
     assert stored == "CANCELLED"
 
 
+def test_cancel_open_order_publishes_cancel_to_orders_control(
+    client: TestClient, redis_client: redis.Redis, db_conn, portfolio_id: int
+) -> None:
+    """The Task 8 engine holds open orders in memory and only reloads from
+    the DB at startup -- without this publish, a cancellation made while
+    the engine is running would be invisible to it, and the next tick
+    would fill an order the user already cancelled."""
+    order = make_order(
+        db_conn, portfolio_id, side=Side.BUY, quantity=Decimal("1"), status=OrderStatus.OPEN
+    )
+
+    pubsub = redis_client.pubsub()
+    pubsub.subscribe("orders:control")
+    pubsub.get_message(timeout=1)  # the subscribe confirmation itself
+
+    response = client.delete(f"/orders/{order.order_id}")
+    assert response.status_code == 200
+
+    message = pubsub.get_message(timeout=2)
+    assert message is not None
+    assert message["type"] == "message"
+    assert json.loads(message["data"]) == {"action": "cancel", "order_id": order.order_id}
+
+
 def test_cancel_filled_order_returns_409(client: TestClient, db_conn, portfolio_id: int) -> None:
     order = make_order(
         db_conn,
@@ -539,6 +622,30 @@ def test_cancel_filled_order_returns_409(client: TestClient, db_conn, portfolio_
     response = client.delete(f"/orders/{order.order_id}")
 
     assert response.status_code == 409
+
+
+def test_cancel_filled_order_does_not_publish(
+    client: TestClient, redis_client: redis.Redis, db_conn, portfolio_id: int
+) -> None:
+    """A rejected cancel (409) must not tell the engine to drop anything --
+    there is nothing for it to drop, and the order already finished."""
+    order = make_order(
+        db_conn,
+        portfolio_id,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        filled_quantity=Decimal("1"),
+        status=OrderStatus.FILLED,
+    )
+
+    pubsub = redis_client.pubsub()
+    pubsub.subscribe("orders:control")
+    pubsub.get_message(timeout=1)  # the subscribe confirmation itself
+
+    response = client.delete(f"/orders/{order.order_id}")
+    assert response.status_code == 409
+
+    assert pubsub.get_message(timeout=0.5) is None
 
 
 def test_cancel_unknown_order_returns_404(client: TestClient) -> None:

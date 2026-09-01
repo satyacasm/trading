@@ -24,6 +24,7 @@ from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
 
 from trading.config import get_settings
+from trading.paper import api as paper_api
 from trading.streaming import market_data_api
 from trading.streaming.db import get_db_connection
 from trading.streaming.seed_instruments import crypto_canonical_keys, seed_crypto_instruments
@@ -83,6 +84,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(market_data_api.router)
+app.include_router(paper_api.router)
 
 _STATIC_ROOT = Path(__file__).parent / "static"
 

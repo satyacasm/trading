@@ -5,7 +5,9 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
-from psycopg import Connection
+from psycopg import Connection, errors
+
+from tests.paper.helpers import _default_instrument, make_portfolio
 
 pytestmark = pytest.mark.db
 
@@ -129,3 +131,33 @@ def test_money_columns_are_numeric_not_float(db_conn: Connection) -> None:
     assert len(rows) == 9
     for name, dtype in rows:
         assert dtype == "numeric", f"{name} is {dtype}, must be numeric"
+
+
+def test_positions_no_negative_quantity_constraint_exists(db_conn: Connection) -> None:
+    """Migration 0008: positions.quantity gets the same DB-level floor
+    ck_no_negative_cash gives portfolios.cash_balance. Without it, a sell
+    exceeding the held quantity would silently drive a position negative
+    instead of raising."""
+    row = db_conn.execute(
+        "SELECT 1 FROM pg_constraint WHERE conname = 'ck_no_negative_position'"
+    ).fetchone()
+    assert row is not None, "ck_no_negative_position constraint was not created"
+
+
+def test_oversell_below_zero_raises_at_the_database(db_conn: Connection) -> None:
+    """The API validates sufficient position before submit (Task 7), but
+    that check is exactly the thing a DB constraint exists to distrust --
+    this proves the database itself refuses to go along with an oversell."""
+    portfolio_id = make_portfolio(db_conn, cash=Decimal("100000"))
+    instrument_id = _default_instrument(db_conn)
+    db_conn.execute(
+        "INSERT INTO positions (portfolio_id, instrument_id, quantity, avg_cost, realised_pnl)"
+        " VALUES (%s, %s, 5, 100, 0)",
+        (portfolio_id, instrument_id),
+    )
+    with pytest.raises(errors.CheckViolation):
+        db_conn.execute(
+            "UPDATE positions SET quantity = quantity - 10"
+            " WHERE portfolio_id = %s AND instrument_id = %s",
+            (portfolio_id, instrument_id),
+        )

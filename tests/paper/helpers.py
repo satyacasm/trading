@@ -7,14 +7,14 @@ uses for `seeded_instrument`. Nothing here commits -- `tests/conftest.py`'s
 `db_conn` fixture rolls back at teardown, and every helper in this module
 relies on that for isolation between tests.
 
-`decision_at` defaults its quantity to the most recently created order's
-remaining quantity (tracked in `_last_order`, set by `make_order`). This
-mirrors real usage -- `decide_fill` always returns a decision sized to
-`order.remaining` -- and it is what lets the brief's test calls read as
-plain `decision_at(price)` while still filling a 4-quantity sell order for
-exactly 4 and a 10-quantity buy order for exactly 10, without every call
-site threading a redundant quantity through by hand. Pass `quantity=`
-explicitly to override it.
+`decision_at` takes `quantity` as a required keyword argument. An earlier
+version defaulted it to "whichever order `make_order` created most
+recently" via module-level state, which is exactly the silent-fallback
+failure mode this project designs against elsewhere: Tasks 8 and 11
+import this module, and a test that creates two orders before calling
+`decision_at()` for the first one would get a wrong fill size with no
+error, only a baffling assertion failure. Every call site names its
+quantity explicitly instead.
 """
 
 from __future__ import annotations
@@ -42,9 +42,6 @@ _CHARGE_FIELDS = (
 )
 
 _seq = count(1)
-
-# Set by `make_order`, read by `decision_at`'s default. See module docstring.
-_last_order: Order | None = None
 
 _TEST_INSTRUMENT_KEY = "TEST/LEDGER/INSTRUMENT"
 
@@ -108,7 +105,6 @@ def make_order(
 ) -> Order:
     """Insert an order and return it as the `Order` model `apply_fill`
     consumes."""
-    global _last_order
     iid = instrument_id if instrument_id is not None else _default_instrument(conn)
     ts = submitted_at or datetime.now(UTC)
     row = conn.execute(
@@ -150,7 +146,6 @@ def make_order(
         rationale="test order",
         submitted_at=submitted_at_db,
     )
-    _last_order = order
     return order
 
 
@@ -164,14 +159,11 @@ def simple_charges(**overrides: Decimal) -> ChargeBreakdown:
 def decision_at(
     price: Decimal,
     *,
-    quantity: Decimal | None = None,
+    quantity: Decimal,
     tick_ts: datetime | None = None,
 ) -> FillDecision:
-    """A `FillDecision` at `price`. `quantity` defaults to the remaining
-    quantity of the most recently created order (see module docstring)."""
-    if quantity is None:
-        assert _last_order is not None, "decision_at needs a prior make_order call"
-        quantity = _last_order.remaining
+    """A `FillDecision` at `price` for `quantity` -- always named
+    explicitly by the caller (see module docstring for why)."""
     return FillDecision(quantity=quantity, price=price, tick_ts=tick_ts or datetime.now(UTC))
 
 

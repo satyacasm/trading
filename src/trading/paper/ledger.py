@@ -30,6 +30,24 @@ intermediate roundings compound differently than one final rounding
 would. Quantizing in Python at each step, identically in both functions,
 makes the two computations byte-for-byte reproducible rather than merely
 "close."
+
+**Precondition on `decision.price`, made explicit rather than assumed:**
+`replay_portfolio` only ever sees a fill's price after it has round-tripped
+through `fills.price`, a `NUMERIC(18,4)` column -- so its recomputation is
+structurally rounded to 4dp even when it doesn't call `_quantize`
+directly. `apply_fill`, by contrast, computes notional and `avg_cost` from
+`decision.price` *before* that round trip. If `decision.price` ever
+carried more than four decimal places, the two would diverge -- the
+identical bug class as the cash defect above, on the price axis instead
+of the quantity axis. Today it's unreachable only because
+`trading.paper.fills.decide_fill` quantizes market prices to 2dp and
+passes limit prices through from a `NUMERIC(18,4)` column already -- a
+fact this module must not rely on silently. `apply_fill` therefore
+quantizes `decision.price` itself, defensively, as its first step, so the
+value it uses for notional, `avg_cost`, and the `fills.price` insert is
+provably the same value `replay_portfolio` will later read back,
+regardless of what a future `FillDecision` producer does or doesn't
+round.
 """
 
 from __future__ import annotations
@@ -55,6 +73,12 @@ def apply_fill(
     charges: ChargeBreakdown,
 ) -> int:
     """Record a fill and update ledger, position, cash, and order status."""
+    # Quantize defensively to the same 4dp fills.price will hold once
+    # stored -- see the module docstring's "Precondition on decision.price"
+    # section. Every use of decision.price below (notional, avg_cost, the
+    # fills insert) reads this already-quantized value.
+    decision = decision.model_copy(update={"price": _quantize(decision.price)})
+
     notional = decision.quantity * decision.price
     total_charges = charges.total
     # Charges always leave the account, whichever side the trade is.

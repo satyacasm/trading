@@ -38,7 +38,7 @@ def test_buy_decreases_cash_by_notional_plus_charges(db_conn) -> None:
     pid = make_portfolio(db_conn, cash=Decimal("100000"))
     order = make_order(db_conn, pid, side=Side.BUY, quantity=Decimal("10"))
     charges = simple_charges(brokerage=Decimal("20"))
-    apply_fill(db_conn, order, decision_at(Decimal("100")), charges)
+    apply_fill(db_conn, order, decision_at(Decimal("100"), quantity=Decimal("10")), charges)
 
     cash = db_conn.execute(
         "SELECT cash_balance FROM portfolios WHERE portfolio_id=%s", (pid,)
@@ -49,12 +49,12 @@ def test_buy_decreases_cash_by_notional_plus_charges(db_conn) -> None:
 def test_sell_increases_cash_by_notional_minus_charges(db_conn) -> None:
     pid = make_portfolio(db_conn, cash=Decimal("100000"))
     buy = make_order(db_conn, pid, side=Side.BUY, quantity=Decimal("10"))
-    apply_fill(db_conn, buy, decision_at(Decimal("100")), simple_charges())
+    apply_fill(db_conn, buy, decision_at(Decimal("100"), quantity=Decimal("10")), simple_charges())
     sell = make_order(db_conn, pid, side=Side.SELL, quantity=Decimal("10"))
     apply_fill(
         db_conn,
         sell,
-        decision_at(Decimal("110")),
+        decision_at(Decimal("110"), quantity=Decimal("10")),
         simple_charges(brokerage=Decimal("20")),
     )
 
@@ -68,7 +68,7 @@ def test_position_average_cost_after_two_buys(db_conn) -> None:
     pid = make_portfolio(db_conn, cash=Decimal("100000"))
     for price in (Decimal("100"), Decimal("120")):
         o = make_order(db_conn, pid, side=Side.BUY, quantity=Decimal("10"))
-        apply_fill(db_conn, o, decision_at(price), simple_charges())
+        apply_fill(db_conn, o, decision_at(price, quantity=Decimal("10")), simple_charges())
     qty, avg = db_conn.execute(
         "SELECT quantity, avg_cost FROM positions WHERE portfolio_id=%s", (pid,)
     ).fetchone()
@@ -79,9 +79,9 @@ def test_position_average_cost_after_two_buys(db_conn) -> None:
 def test_sell_records_realised_pnl(db_conn) -> None:
     pid = make_portfolio(db_conn, cash=Decimal("100000"))
     b = make_order(db_conn, pid, side=Side.BUY, quantity=Decimal("10"))
-    apply_fill(db_conn, b, decision_at(Decimal("100")), simple_charges())
+    apply_fill(db_conn, b, decision_at(Decimal("100"), quantity=Decimal("10")), simple_charges())
     s = make_order(db_conn, pid, side=Side.SELL, quantity=Decimal("4"))
-    apply_fill(db_conn, s, decision_at(Decimal("130")), simple_charges())
+    apply_fill(db_conn, s, decision_at(Decimal("130"), quantity=Decimal("4")), simple_charges())
     realised = db_conn.execute(
         "SELECT realised_pnl FROM positions WHERE portfolio_id=%s", (pid,)
     ).fetchone()[0]
@@ -91,7 +91,7 @@ def test_sell_records_realised_pnl(db_conn) -> None:
 def test_order_status_advances_in_the_same_transaction(db_conn) -> None:
     pid = make_portfolio(db_conn, cash=Decimal("100000"))
     o = make_order(db_conn, pid, side=Side.BUY, quantity=Decimal("10"))
-    apply_fill(db_conn, o, decision_at(Decimal("100")), simple_charges())
+    apply_fill(db_conn, o, decision_at(Decimal("100"), quantity=Decimal("10")), simple_charges())
     status, filled = db_conn.execute(
         "SELECT status, filled_quantity FROM orders WHERE order_id=%s",
         (o.order_id,),
@@ -104,7 +104,9 @@ def test_buy_exceeding_cash_is_refused(db_conn) -> None:
     pid = make_portfolio(db_conn, cash=Decimal("500"))
     o = make_order(db_conn, pid, side=Side.BUY, quantity=Decimal("10"))
     with pytest.raises(Exception):  # noqa: B017 -- the DB's own constraint error type
-        apply_fill(db_conn, o, decision_at(Decimal("100")), simple_charges())
+        apply_fill(
+            db_conn, o, decision_at(Decimal("100"), quantity=Decimal("10")), simple_charges()
+        )
 
 
 def test_apply_fill_does_not_commit(db_conn) -> None:
@@ -116,13 +118,47 @@ def test_apply_fill_does_not_commit(db_conn) -> None:
     behavioural assertions above, which pass identically either way."""
     pid = make_portfolio(db_conn, cash=Decimal("100000"))
     o = make_order(db_conn, pid, side=Side.BUY, quantity=Decimal("10"))
-    apply_fill(db_conn, o, decision_at(Decimal("100")), simple_charges())
+    apply_fill(db_conn, o, decision_at(Decimal("100"), quantity=Decimal("10")), simple_charges())
     db_conn.rollback()
 
     # The portfolio itself was created and rolled back away, so any
     # trace of the fill going through implies apply_fill committed.
     row = db_conn.execute("SELECT 1 FROM portfolios WHERE portfolio_id=%s", (pid,)).fetchone()
     assert row is None
+
+
+def test_apply_fill_quantizes_a_price_with_more_than_four_decimal_places(db_conn) -> None:
+    """Fix-round-2 regression: `decide_fill` only ever hands `apply_fill` a
+    price already at <=4dp (2dp for a market fill, or a limit price sourced
+    straight from a `NUMERIC(18,4)` column), so this path is unreachable
+    through today's only `FillDecision` producer -- but nothing in
+    `ledger.py` stated that as a precondition. `decision_at` builds a
+    `FillDecision` directly with no rounding of its own, standing in for a
+    future producer (Task 8 or 11) that might not quantize either. A price
+    carrying six decimal places must still round-trip exactly: `apply_fill`
+    quantizes `decision.price` to 4dp before computing notional or
+    avg_cost, so `replay_portfolio` -- which only ever sees the
+    already-4dp value read back from `fills.price` -- reproduces both cash
+    and avg_cost exactly rather than diverging on the price axis the same
+    way the fix-round-1 cash defect diverged on the quantity axis."""
+    pid = make_portfolio(db_conn, cash=Decimal("1000000"))
+    o = make_order(db_conn, pid, side=Side.BUY, quantity=Decimal("10"))
+    apply_fill(
+        db_conn,
+        o,
+        decision_at(Decimal("100.123456"), quantity=Decimal("10")),
+        simple_charges(),
+    )
+
+    cached_cash, cached_pos = (
+        db_conn.execute(
+            "SELECT cash_balance FROM portfolios WHERE portfolio_id=%s", (pid,)
+        ).fetchone()[0],
+        _positions(db_conn, pid),
+    )
+    replayed_cash, replayed_pos = replay_portfolio(db_conn, pid)
+    assert replayed_cash == cached_cash
+    assert replayed_pos == cached_pos
 
 
 @settings(
@@ -148,7 +184,7 @@ def test_replay_reproduces_the_cached_cash_and_positions(db_conn, prices) -> Non
     pid = make_portfolio(db_conn, cash=Decimal("1000000"))
     for p in prices:
         o = make_order(db_conn, pid, side=Side.BUY, quantity=Decimal("1"))
-        apply_fill(db_conn, o, decision_at(Decimal(p)), simple_charges())
+        apply_fill(db_conn, o, decision_at(Decimal(p), quantity=Decimal("1")), simple_charges())
 
     cached_cash, cached_pos = (
         db_conn.execute(
@@ -174,7 +210,12 @@ def test_replay_matches_cached_cash_for_a_fractional_crypto_fill(db_conn) -> Non
     caught this."""
     pid = make_portfolio(db_conn, cash=Decimal("1000000"))
     o = make_order(db_conn, pid, side=Side.BUY, quantity=Decimal("0.00000001"))
-    apply_fill(db_conn, o, decision_at(Decimal("79090.0100")), simple_charges())
+    apply_fill(
+        db_conn,
+        o,
+        decision_at(Decimal("79090.0100"), quantity=Decimal("0.00000001")),
+        simple_charges(),
+    )
 
     cached_cash = db_conn.execute(
         "SELECT cash_balance FROM portfolios WHERE portfolio_id=%s", (pid,)
@@ -196,7 +237,7 @@ def test_replay_matches_cached_cash_across_multiple_fractional_crypto_fills(db_c
         (Decimal("0.00000007"), Decimal("100.0001")),
     ):
         o = make_order(db_conn, pid, side=Side.BUY, quantity=qty)
-        apply_fill(db_conn, o, decision_at(price), simple_charges())
+        apply_fill(db_conn, o, decision_at(price, quantity=qty), simple_charges())
 
     cached_cash = db_conn.execute(
         "SELECT cash_balance FROM portfolios WHERE portfolio_id=%s", (pid,)
@@ -232,7 +273,7 @@ def test_replay_reproduces_cached_cash_at_crypto_precision(db_conn, fills) -> No
     pid = make_portfolio(db_conn, cash=Decimal("1000000"))
     for qty, price in fills:
         o = make_order(db_conn, pid, side=Side.BUY, quantity=qty)
-        apply_fill(db_conn, o, decision_at(price), simple_charges())
+        apply_fill(db_conn, o, decision_at(price, quantity=qty), simple_charges())
 
     cached_cash = db_conn.execute(
         "SELECT cash_balance FROM portfolios WHERE portfolio_id=%s", (pid,)

@@ -69,6 +69,16 @@ def portfolio_id(db_conn) -> int:
 
 
 @pytest.fixture
+def usdt_portfolio_id(db_conn) -> int:
+    """CRIT-1: a USDT-base-currency portfolio, for tests that must submit
+    a crypto order without tripping the currency-mismatch gate -- crypto
+    instruments are seeded/resolved with currency='USDT' (see
+    trading.streaming.seed_instruments and trading.resolver.instruments),
+    never 'INR'."""
+    return make_portfolio(db_conn, cash=Decimal("100000"), base_currency="USDT")
+
+
+@pytest.fixture
 def equity_instrument_id(db_conn) -> int:
     row = db_conn.execute(
         "INSERT INTO instruments (asset_class, exchange, segment, symbol, status, canonical_key)"
@@ -97,9 +107,16 @@ def open_market(db_conn, equity_instrument_id: int) -> None:
 
 @pytest.fixture
 def crypto_instrument_id(db_conn) -> int:
+    """currency='USDT' explicitly -- matching how a real crypto instrument
+    is actually seeded/resolved (trading.streaming.seed_instruments,
+    trading.resolver.instruments), never the `instruments.currency`
+    column's own 'INR' server default, which would silently make this
+    fixture pass CRIT-1's currency gate against an INR portfolio for the
+    wrong reason."""
     row = db_conn.execute(
-        "INSERT INTO instruments (asset_class, exchange, segment, symbol, status, canonical_key)"
-        " VALUES ('CRYPTO', 'BINANCE', 'SPOT', 'APICOIN', 'ACTIVE', 'TEST/API/CRYPTO')"
+        "INSERT INTO instruments"
+        " (asset_class, exchange, segment, symbol, currency, status, canonical_key)"
+        " VALUES ('CRYPTO', 'BINANCE', 'SPOT', 'APICOIN', 'USDT', 'ACTIVE', 'TEST/API/CRYPTO')"
         " RETURNING instrument_id"
     ).fetchone()
     assert row is not None
@@ -327,15 +344,18 @@ def test_order_with_no_trading_calendar_entry_is_rejected_400(
 
 
 def test_crypto_order_skips_the_calendar_check(
-    client: TestClient, portfolio_id: int, crypto_instrument_id: int
+    client: TestClient, usdt_portfolio_id: int, crypto_instrument_id: int
 ) -> None:
     """Crypto is 24/7 -- no trading_calendar row exists for it at all, and
     the order must still be accepted (BINANCE/CRYPTO/DELIVERY has a seeded
-    charge schedule from migration 0007)."""
+    charge schedule from migration 0007). Uses a USDT-base-currency
+    portfolio (CRIT-1): crypto_instrument_id is USDT-denominated, and an
+    INR portfolio buying it would now be rejected by the currency gate --
+    a *different* concern from the one this test proves."""
     response = client.post(
         "/orders",
         json=_valid_order_body(
-            portfolio_id=portfolio_id,
+            portfolio_id=usdt_portfolio_id,
             instrument_id=crypto_instrument_id,
             idempotency_key="crypto-key-1",
         ),
@@ -455,15 +475,16 @@ def test_market_buy_uses_latest_bar_close_for_the_cash_check(
 
 
 def test_order_for_instrument_with_no_charge_schedule_is_rejected_400_naming_it(
-    client: TestClient, portfolio_id: int, crypto_instrument_id: int
+    client: TestClient, usdt_portfolio_id: int, crypto_instrument_id: int
 ) -> None:
     """Migration 0007 seeds BINANCE/CRYPTO/DELIVERY but not INTRADAY --
     this must be a hard rejection naming the gap, never a silent
-    zero-charge order."""
+    zero-charge order. Uses usdt_portfolio_id (CRIT-1) so this stays a
+    pure missing-charge-schedule test, not a currency-mismatch one."""
     response = client.post(
         "/orders",
         json=_valid_order_body(
-            portfolio_id=portfolio_id, instrument_id=crypto_instrument_id, product="INTRADAY"
+            portfolio_id=usdt_portfolio_id, instrument_id=crypto_instrument_id, product="INTRADAY"
         ),
     )
     assert response.status_code == 400
@@ -472,19 +493,108 @@ def test_order_for_instrument_with_no_charge_schedule_is_rejected_400_naming_it(
     assert "intraday" in detail
 
 
+def test_order_with_ambiguous_charge_schedule_is_rejected_400(
+    client: TestClient, db_conn, usdt_portfolio_id: int, crypto_instrument_id: int
+) -> None:
+    """IMP-3 fallout: load_schedules can now raise AmbiguousChargeSchedule
+    (a data defect -- two in-force rows for one charge type on the same
+    date), not just return an empty list. create_order must turn that into
+    a 400 like every other charge-schedule failure, not let it surface as
+    an unhandled 500."""
+    db_conn.execute(
+        "INSERT INTO charge_schedules (broker, exchange, asset_class, product,"
+        " charge_type, basis, applies_to_side, rate, cap, rounding,"
+        " gst_base_types, effective_from, effective_to, source_note)"
+        " VALUES ('BINANCE','BINANCE','CRYPTO','DELIVERY','BROKERAGE',"
+        " 'PERCENT_OF_TURNOVER', 'BOTH', 0.002, NULL, 'TWO_DECIMALS', NULL,"
+        " '2024-06-01', NULL, 'dup test')"
+    )
+    response = client.post(
+        "/orders",
+        json=_valid_order_body(
+            portfolio_id=usdt_portfolio_id,
+            instrument_id=crypto_instrument_id,
+            idempotency_key="ambiguous-schedule-1",
+        ),
+    )
+    assert response.status_code == 400
+    assert "brokerage" in response.json()["detail"].lower()
+
+    count = db_conn.execute(
+        "SELECT count(*) FROM orders WHERE portfolio_id = %s", (usdt_portfolio_id,)
+    ).fetchone()[0]
+    assert count == 0
+
+
 def test_missing_charge_schedule_does_not_write_a_row(
+    client: TestClient, db_conn, usdt_portfolio_id: int, crypto_instrument_id: int
+) -> None:
+    client.post(
+        "/orders",
+        json=_valid_order_body(
+            portfolio_id=usdt_portfolio_id, instrument_id=crypto_instrument_id, product="INTRADAY"
+        ),
+    )
+    count = db_conn.execute(
+        "SELECT count(*) FROM orders WHERE portfolio_id = %s", (usdt_portfolio_id,)
+    ).fetchone()[0]
+    assert count == 0
+
+
+# --- CRIT-1: portfolio base_currency must match the instrument's --------
+
+
+def test_order_with_mismatched_currency_is_rejected_400(
+    client: TestClient, portfolio_id: int, crypto_instrument_id: int
+) -> None:
+    """An INR portfolio buying a USDT instrument must be rejected --
+    otherwise the cash check compares a USDT notional against an INR
+    balance and apply_fill subtracts USDT from INR cash, both silently
+    wrong by ~90x (no FX conversion anywhere; a portfolio is
+    single-currency, spec decision #6)."""
+    response = client.post(
+        "/orders",
+        json=_valid_order_body(
+            portfolio_id=portfolio_id,  # INR
+            instrument_id=crypto_instrument_id,  # USDT
+            idempotency_key="currency-mismatch-1",
+        ),
+    )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "INR" in detail
+    assert "USDT" in detail
+
+
+def test_order_with_mismatched_currency_does_not_write_a_row(
     client: TestClient, db_conn, portfolio_id: int, crypto_instrument_id: int
 ) -> None:
     client.post(
         "/orders",
         json=_valid_order_body(
-            portfolio_id=portfolio_id, instrument_id=crypto_instrument_id, product="INTRADAY"
+            portfolio_id=portfolio_id,
+            instrument_id=crypto_instrument_id,
+            idempotency_key="currency-mismatch-2",
         ),
     )
     count = db_conn.execute(
         "SELECT count(*) FROM orders WHERE portfolio_id = %s", (portfolio_id,)
     ).fetchone()[0]
     assert count == 0
+
+
+def test_order_with_matching_currency_is_accepted(
+    client: TestClient, usdt_portfolio_id: int, crypto_instrument_id: int
+) -> None:
+    response = client.post(
+        "/orders",
+        json=_valid_order_body(
+            portfolio_id=usdt_portfolio_id,
+            instrument_id=crypto_instrument_id,
+            idempotency_key="currency-match-1",
+        ),
+    )
+    assert response.status_code == 201
 
 
 # --- Idempotency --------------------------------------------------------

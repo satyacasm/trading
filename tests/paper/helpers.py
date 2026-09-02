@@ -72,18 +72,21 @@ def _default_instrument(conn: Connection) -> int:
     return int(row[0])
 
 
-def make_portfolio(conn: Connection, *, cash: Decimal) -> int:
+def make_portfolio(conn: Connection, *, cash: Decimal, base_currency: str = "INR") -> int:
     """Insert a portfolio owned by migration 0007's seeded local user,
     with `cash` as both `initial_capital` and `cash_balance` -- the state
-    a freshly funded, untraded portfolio is in."""
+    a freshly funded, untraded portfolio is in. `base_currency` defaults
+    to `INR` (the column's own server default) -- pass `USDT` for a
+    crypto-denominated portfolio (CRIT-1)."""
     user_row = conn.execute(
         "SELECT user_id FROM users WHERE email='local@paper.trading'"
     ).fetchone()
     assert user_row is not None, "migration 0007 must seed the local user"
     row = conn.execute(
-        "INSERT INTO portfolios (user_id, name, initial_capital, cash_balance, status)"
-        " VALUES (%s, %s, %s, %s, 'ACTIVE') RETURNING portfolio_id",
-        (user_row[0], f"test-portfolio-{next(_seq)}", cash, cash),
+        "INSERT INTO portfolios (user_id, name, base_currency, initial_capital,"
+        " cash_balance, status)"
+        " VALUES (%s, %s, %s, %s, %s, 'ACTIVE') RETURNING portfolio_id",
+        (user_row[0], f"test-portfolio-{next(_seq)}", base_currency, cash, cash),
     ).fetchone()
     assert row is not None
     return int(row[0])

@@ -72,7 +72,7 @@ from psycopg.errors import UniqueViolation
 from pydantic import BaseModel, Field, model_validator
 
 from trading.config import get_settings
-from trading.paper.charges import MissingChargeSchedule, load_schedules
+from trading.paper.charges import AmbiguousChargeSchedule, MissingChargeSchedule, load_schedules
 from trading.paper.enums import OrderStatus, OrderType, Product, Side, TimeInForce
 from trading.paper.models import Order, Portfolio, Position
 from trading.streaming.db import get_db_connection
@@ -404,14 +404,14 @@ def create_order(
         return existing
 
     portfolio_row = conn.execute(
-        "SELECT status, cash_balance FROM portfolios WHERE portfolio_id = %s",
+        "SELECT status, cash_balance, base_currency FROM portfolios WHERE portfolio_id = %s",
         (body.portfolio_id,),
     ).fetchone()
     if portfolio_row is None:
         raise HTTPException(
             status_code=404, detail=f"no portfolio with portfolio_id={body.portfolio_id}"
         )
-    portfolio_status, cash_balance = portfolio_row
+    portfolio_status, cash_balance, base_currency = portfolio_row
     if portfolio_status != "ACTIVE":
         raise HTTPException(
             status_code=400,
@@ -419,14 +419,15 @@ def create_order(
         )
 
     instrument_row = conn.execute(
-        "SELECT asset_class, exchange, segment FROM instruments WHERE instrument_id = %s",
+        "SELECT asset_class, exchange, segment, currency FROM instruments"
+        " WHERE instrument_id = %s",
         (body.instrument_id,),
     ).fetchone()
     if instrument_row is None:
         raise HTTPException(
             status_code=404, detail=f"no instrument with instrument_id={body.instrument_id}"
         )
-    asset_class, exchange, segment = instrument_row
+    asset_class, exchange, segment, instrument_currency = instrument_row
 
     today = date.today()
     if asset_class != "CRYPTO":
@@ -437,18 +438,41 @@ def create_order(
     else:
         _require_sufficient_position(conn, body)
 
+    # CRIT-1 (Ruling 26): a portfolio is single-currency -- no FX
+    # conversion anywhere (spec decision #6). Without this gate, an INR
+    # portfolio could buy a USDT instrument: the cash check above would
+    # compare a USDT notional against an INR balance, and apply_fill would
+    # later subtract USDT from INR cash, both silently wrong by ~90x.
+    # Checked here, beside the charge-schedule lookup below, which already
+    # holds the instrument row -- and only here: the engine never adds a
+    # second check, since orders enter only through this route (an
+    # engine-side check would be unreachable dead code).
+    if instrument_currency != base_currency:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"portfolio {body.portfolio_id} has base_currency={base_currency!r}; "
+                f"instrument_id={body.instrument_id} is denominated in "
+                f"{instrument_currency!r} -- a portfolio is single-currency, no FX "
+                "conversion"
+            ),
+        )
+
     broker = _BROKER_BY_ASSET_CLASS.get(asset_class)
-    schedules = (
-        load_schedules(conn, broker, exchange, asset_class, body.product, today)
-        if broker is not None
-        else []
-    )
+    try:
+        schedules = (
+            load_schedules(conn, broker, exchange, asset_class, body.product, today)
+            if broker is not None
+            else []
+        )
+    except AmbiguousChargeSchedule as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not schedules:
-        exc = MissingChargeSchedule(
+        missing_exc = MissingChargeSchedule(
             f"no charge schedule for broker={broker!r} exchange={exchange!r} "
             f"asset_class={asset_class!r} product={body.product.value!r} on {today.isoformat()}"
         )
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(missing_exc)) from missing_exc
 
     order, created = _insert_order(conn, body)
     if created:

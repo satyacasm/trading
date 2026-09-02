@@ -10,8 +10,9 @@
 >
 > It is published in this state deliberately. The contract is the platform's
 > interface to the outside world, and the cheapest time to find out that it is
-> confusing is before the runtime is built around it. Sections marked
-> **UNDECIDED** are open questions, not omissions — see [Open decisions](#open-decisions).
+> confusing is before the runtime is built around it. Most of the interface is
+> settled; what is not is listed under [Open decisions](#open-decisions) with
+> its reasoning, rather than papered over.
 
 ---
 
@@ -31,8 +32,8 @@ The bundle is three files:
 | File | Purpose |
 |---|---|
 | `STRATEGY_CONTRACT.md` | This file. The full specification. |
-| `schema.json` | JSON Schemas for the manifest, instruments, bars, ticks, and orders — so conformance can be checked mechanically. **Not yet written.** |
-| `platform_sdk.py` | Typed no-op stubs of every interface below, so generated code can be lint-checked and dry-run locally before upload. **Not yet written.** |
+| `schema.json` | JSON Schemas for the manifest, instruments, bars, ticks, and orders. Its enumerations are **generated from the platform's own enums and pinned by a test**, so a value it accepts is a value the order API accepts. Source: `src/trading/agent_contract/schema.json`. |
+| `platform_sdk.py` | Typed no-op stubs of every interface below, so generated code can be lint-checked and dry-run locally before upload. Every stub **raises** rather than returning a plausible value — see §11. Source: `src/trading/agent_contract/platform_sdk.py`. |
 
 ---
 
@@ -54,9 +55,13 @@ class Strategy:
 
     def on_bar(self, ctx: Context, bars: dict[InstrumentId, Bar]) -> None:
         """Called once per completed bar interval, with every subscribed
-        instrument that produced a bar in that interval. An instrument that
-        did not trade is absent from the dict rather than present with stale
-        values."""
+        instrument that produced a bar in that interval.
+
+        An instrument that did not trade is ABSENT from the dict -- never
+        present with the previous close carried forward. Carrying forward
+        would be friendlier and would invent a trade that did not happen,
+        letting a strategy act on liquidity that was not there. Use
+        `ctx.data.last()` when you want the last known price regardless."""
 
     def on_tick(self, ctx: Context, tick: Tick) -> None:
         """Called per trade for tick-subscribed instruments. Optional, and
@@ -64,8 +69,13 @@ class Strategy:
         sub-bar granularity."""
 
     def on_order_update(self, ctx: Context, update: OrderUpdate) -> None:
-        """Called when one of your orders changes state — filled, partially
-        filled, cancelled, rejected, or expired."""
+        """Called on EVERY state change -- including each partial fill, not
+        only on reaching a terminal state. A GTC limit can rest partially
+        filled indefinitely, and a strategy sizing its next order from
+        `filled_quantity` needs to see that as it happens.
+
+        A rejection arrives here too, and is a normal outcome rather than
+        an exception. Your strategy must survive one."""
 
     def on_expiry(self, ctx: Context, event: ExpiryEvent) -> None:
         """F&O only. Called at settlement for a position in an expiring
@@ -106,7 +116,7 @@ StrategyManifest(
         history_bars=200,        # bars of warm-up before the first on_bar
     ),
     capital=Decimal("1000000"),
-    base_currency="INR",         # a portfolio holds ONE currency (§5)
+    base_currency="INR",         # one strategy -> one portfolio -> ONE currency
     params={
         "fast": Param(int, default=10, bounds=(2, 100)),
         "slow": Param(int, default=30, bounds=(5, 400)),
@@ -118,18 +128,26 @@ StrategyManifest(
 
 ### Universe
 
-**UNDECIDED — see [Open decisions](#open-decisions) D1.** The intent is that a
-universe is *resolved point-in-time*, so a strategy backtested over 2023 sees
-the instruments that existed in 2023, including ones since delisted. Two
-candidate spellings:
+Either an explicit list or a query. Both are accepted, because they answer
+different needs:
 
 ```python
-# explicit
+# explicit -- what you write for a handful of named instruments
 universe=[InstrumentRef(exchange="NSE", segment="CM", symbol="RELIANCE")]
 
-# query
+# query -- resolved point-in-time
 universe=Query(asset_class="EQUITY", exchange="NSE", index="NIFTY50")
 ```
+
+**A universe is always resolved point-in-time**, whichever spelling you use:
+against `listed_on`/`delisted_on` at `ctx.now`. A backtest over 2023 sees the
+instruments that existed in 2023, including ones since delisted.
+
+That is the survivorship-bias guarantee, and it is why the query form exists at
+all. Hardcoding today's NIFTY 50 constituents into a 2022 backtest silently
+tests a portfolio of companies selected *for having survived to 2026* — one of
+the classic ways a retail backtest lies to its author. A query cannot make that
+mistake.
 
 ### Circuit breaker
 
@@ -276,9 +294,13 @@ every other structure references.
 | `status` | str | `ACTIVE`, and others |
 
 **Lot size is not a field on the instrument.** Lot sizes are revised over time,
-so they are dated: a lot-size lookup takes an instrument *and a date*. A
-backtest in 2022 must use the 2022 lot size. **UNDECIDED (D2)**: how this is
-exposed on `ctx`.
+so they are dated. Read it through `ctx.data.lot_size(instrument_id)`, which
+resolves the size in force at `ctx.now` and returns `None` where the instrument
+has no lot concept (equity cash, crypto).
+
+A method on `ctx.data` rather than a field on the instrument record,
+deliberately: a static field invites caching a 2026 lot size into a 2022
+backtest and sizing every F&O order wrong.
 
 ### Bar
 
@@ -405,8 +427,11 @@ An edge thinner than that is not an edge.
 Strategy code runs isolated: **no network, read-only filesystem**, hard CPU,
 memory, and wall-clock limits, non-root.
 
-**UNDECIDED (D3).** The specific limits, the allowed-import list, and the
-timeout are not settled, because the sandbox is not built. The intended shape:
+**Partly settled.** The sandbox will run under gVisor inside **Docker
+Desktop's Linux VM** on the development machine (gVisor is Linux-only and
+cannot run on macOS directly); a VPS becomes relevant only for scale, not for
+correctness. The specific limits, the allowed-import list, and the timeout are
+still open (D3) because the sandbox is not built. The intended shape:
 `numpy`, `pandas`, `ta-lib`, and a standard-library subset permitted;
 `open`, `socket`, `exec`, `subprocess`, and dunder escapes rejected by static
 analysis before the code ever runs.
@@ -453,20 +478,45 @@ They get written, and **run**, as the runtime lands.
 
 ---
 
+## 11. Using the SDK stub offline
+
+Before uploading, import your strategy against `platform_sdk.py` and run your
+type checker and linter over it. That catches a misspelled method, a call that
+does not exist, or the wrong argument type without a round trip.
+
+**Every runtime call in the stub raises `NotOnThisPlatform`.** Seeing that
+exception means your code reached a real call with the right shape — it is the
+expected outcome of a local dry run, not a defect.
+
+Nothing returns a plausible value on purpose. A stub that handed back an empty
+bar list and a zero cash balance would let a broken strategy "run" locally,
+produce no orders, and look fine. An import error is a far better outcome than
+a green run that proves nothing.
+
+Three rules are checked eagerly, because they are the ones generated code
+breaks most often and each is cheaper to find here than as a rejection after
+upload:
+
+- a blank `rationale` raises `ValueError`
+- a `float` quantity or price raises `TypeError` (money is `Decimal` end to end)
+- reading `ctx.now` raises rather than falling back to the wall clock
+
+---
+
 ## Open decisions
 
 These need resolving before v1.0. Each changes what a generated strategy looks
 like, so each is worth settling deliberately.
 
-| # | Decision | Why it matters |
+| # | Decision | State |
 |---|---|---|
-| **D1** | Universe: explicit `InstrumentRef` list, a `Query`, or both? | Point-in-time resolution (delisted instruments staying in history) is a survivorship-bias guarantee. A query form makes it automatic; an explicit list makes it the author's problem. |
-| **D2** | How dated lot size is exposed on `ctx`. | F&O sizing is wrong without it, and it must be point-in-time. |
-| **D3** | Sandbox limits and the import allowlist. | Blocked on building the sandbox. Note gVisor is Linux-only — it cannot run on the macOS dev machine and needs the VPS. |
-| **D4** | Worked examples. | Blocked on the runtime; they must be executed before publication. |
-| **D5** | Does `on_bar` fire for an instrument that did not trade in the interval? | Drafted above as "absent from the dict". The alternative — carrying the previous close forward — is friendlier but invents a trade that did not happen. |
-| **D6** | Can one strategy hold more than one portfolio? | Currently drafted as one strategy, one portfolio, one currency. Multi-currency strategies are impossible under that rule. |
-| **D7** | How partial fills are surfaced. | `on_order_update` per partial, or only on terminal state? Affects every position-sizing loop an agent writes. |
+| **D1** | Universe: explicit list, query, or both? | **Settled — both.** An explicit `InstrumentRef` list for a handful of named instruments; a `Query` when the universe is dynamic. Resolution is point-in-time either way, which is where the survivorship guarantee lives. The query form exists because hardcoding today's index constituents into a 2022 backtest silently selects for survival. |
+| **D2** | How dated lot size reaches `ctx`. | **Settled.** `ctx.data.lot_size(instrument_id)`, resolved at `ctx.now`, `None` where there is no lot concept. A method on `ctx.data`, not a field on the instrument, so a 2026 lot size cannot be cached into a 2022 backtest. |
+| **D3** | Sandbox limits and the import allowlist. | **Partly settled.** gVisor runs inside Docker Desktop's Linux VM on the dev machine; a VPS is a scale question, not a correctness one. Specific limits, timeout, and allowlist remain open until the sandbox exists. |
+| **D4** | Worked examples. | **Open, deliberately.** Blocked on the runtime — each must be *executed* before publication, because an example is a promise the code runs. |
+| **D5** | Does `on_bar` fire for an instrument that did not trade? | **Settled — absent from the dict.** Carrying the previous close forward invents a trade that did not happen and lets a strategy act on liquidity that was not there. `ctx.data.last()` covers the "last known price" need. |
+| **D6** | Can one strategy hold more than one portfolio? | **Settled — no.** One strategy, one portfolio, one currency. This matches the platform: the currency gate is enforced at order submission and there is no FX mark model. **Consequence, stated plainly:** a single strategy cannot trade NSE equities and crypto together in V1. Revisit when multi-currency portfolios exist. |
+| **D7** | How partial fills surface. | **Settled.** `on_order_update` fires on every state change, each partial included. A GTC limit can rest partially filled indefinitely; only firing at terminal state would make that invisible to a strategy sizing from `filled_quantity`. |
 
 ## Verification standard
 

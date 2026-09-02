@@ -27,6 +27,8 @@ dev = [
     "grpcio-tools>=1.60",
     "types-protobuf>=5.0",
     "hypothesis>=6.167.1",
+    "jsonschema>=4.26.0",
+    "types-jsonschema>=4.26.0.20260518",
 ]
 
 [tool.pytest.ini_options]

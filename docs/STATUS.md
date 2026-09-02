@@ -59,7 +59,7 @@ ec6fa0c  Merge 'paper-trading-core': paper trading core (Phase 1)
 Both feature branches (`paper-trading-core`, `frontend-paper-trading`) still
 exist as local refs. Fully merged; safe to delete with `git branch -d`.
 
-Test counts: **794 backend** (8 golden deselected), **36 frontend**. ruff,
+Test counts: **810 backend** (8 golden deselected), **36 frontend**. ruff,
 mypy, eslint, tsc all clean.
 
 ---
@@ -71,20 +71,33 @@ about the built platform (real field names, real enums, real charge figures
 computed from the seeded schedules) and explicit that the runtime does not
 exist.
 
-**Seven open decisions** are listed at the bottom of that file (D1–D7). Each
-changes what a generated strategy looks like, so each deserves a deliberate
-answer rather than a default. The two that block real progress:
+**Five of the seven open decisions are settled** (D1, D2, D5, D6, D7 — each
+with its reasoning in the contract's decisions table). Two remain:
 
-- **D3 (sandbox)** — §5 of the plan specifies gVisor (`runsc`), which is
-  **Linux-only**. It cannot run on the macOS dev machine. It needs Docker
-  Desktop's Linux VM or the VPS that §9 anticipates. Everything else in Phase 2
-  develops fine locally.
+- **D3 (sandbox limits)** — the *environment* is decided: gVisor runs inside
+  **Docker Desktop's Linux VM** on this machine (gVisor is Linux-only and
+  cannot run on macOS directly); a VPS is a scale question, not a correctness
+  one. The specific limits, timeout, and import allowlist stay open until the
+  sandbox is built.
 - **D4 (worked examples)** — deliberately unwritten. An example in a contract
   is a promise the code runs; none can be executed until the runtime exists,
   and an agent copying a broken example produces broken strategies
   confidently.
 
-Still to write in the bundle: `schema.json` and `platform_sdk.py`.
+Consequence of D6 worth remembering: **one strategy → one portfolio → one
+currency**, so a single strategy cannot trade NSE equities and crypto together
+in V1.
+
+`schema.json` and `platform_sdk.py` are **written**, at
+`src/trading/agent_contract/`. They live in the package rather than under
+`docs/` so they fall under `mypy src` and the drift test — the schema's
+enumerations are generated from `trading.paper.enums` and pinned by
+`tests/agent_contract/test_contract_bundle.py`, so a value the schema accepts
+is a value the order API accepts. Verified by mutation: appending a bogus
+status to the schema fails the suite.
+
+Next in Phase 2: the validation pipeline (manifest check, import allowlist, AST
+scan) and the sandbox, then the worked examples once something can run them.
 
 **Acceptance bar** (plan §10): the contract is not done until *three different
 frontier agents*, each given only that file, each produce a working strategy

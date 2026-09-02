@@ -113,9 +113,12 @@ def test_nse_transaction_charge_has_two_dated_regimes(db_conn: Connection) -> No
     2026-03-01. The backfill spans 2022-2026 and crosses that boundary,
     so a single row would misprice most of the historical period.
     """
+    # Filter by product: both DELIVERY and INTRADAY carry both date
+    # regimes, so an unfiltered query returns four rows, not two.
     rows = db_conn.execute(
         "SELECT rate, effective_from, effective_to FROM charge_schedules "
         "WHERE exchange='NSE' AND charge_type='EXCHANGE_TXN' "
+        "AND product='DELIVERY' "
         "ORDER BY effective_from"
     ).fetchall()
     assert len(rows) == 2
@@ -379,9 +382,9 @@ def _seed(conn) -> None:  # noqa: ANN001 - alembic bind
         ("INTRADAY", "STAMP_DUTY", "PERCENT_OF_TURNOVER", "BUY",
          "0.00003", None, "TWO_DECIMALS", None, "2024-10-01", None, src_up),
         ("DELIVERY", "IPFT", "PERCENT_OF_TURNOVER", "BOTH",
-         "0.0000001", None, "TWO_DECIMALS", None, "2024-10-01", None, src_up),
+         "0.000000001", None, "TWO_DECIMALS", None, "2024-10-01", None, src_up),
         ("INTRADAY", "IPFT", "PERCENT_OF_TURNOVER", "BOTH",
-         "0.0000001", None, "TWO_DECIMALS", None, "2024-10-01", None, src_up),
+         "0.000000001", None, "TWO_DECIMALS", None, "2024-10-01", None, src_up),
         ("DELIVERY", "DP_CHARGES", "FLAT_PER_SCRIP_PER_DAY", "SELL",
          "20", None, "TWO_DECIMALS", None, "2024-10-01", None, src_up),
         ("DELIVERY", "GST", "PERCENT_OF_CHARGES", "BOTH",
@@ -583,10 +586,17 @@ Create `src/trading/paper/models.py`:
 ```python
 """Pydantic models for the paper-trading subsystem.
 
-Money is Decimal everywhere -- never float. `MoneyModel` pins the JSON
-encoding to numbers rather than strings; pydantic v2's default renders
-Decimal as a string, which is the defect Task 7b fixed for the market-data
-API and which would silently break arithmetic in any consumer.
+Money is Decimal everywhere -- never float.
+
+Models that cross the API boundary (Order, Position, Portfolio,
+ChargeBreakdown) declare an explicit field serializer rendering Decimal as
+a JSON number. Pydantic v2 renders Decimal as a *string* by default, which
+is the defect Task 7b fixed for the market-data API and which silently
+breaks arithmetic in any consumer.
+
+ChargeSchedule and FillDecision deliberately carry no serializer: they are
+process-internal and never leave this process. If a later task returns
+either over HTTP, add the serializer there.
 """
 
 from __future__ import annotations
@@ -1084,8 +1094,8 @@ DELIVERY_BUY = {
         "exchange_txn": Decimal("4.02"),
         "sebi_fee": Decimal("0.13"),
         "stamp_duty": Decimal("19.66"),
-        "ipft": Decimal("0.01"),
-        "gst": Decimal("4.33"),
+        "ipft": Decimal("0.00"),
+        "gst": Decimal("4.32"),
         "dp_charges": Decimal("0.00"),
     },
 }
@@ -1102,8 +1112,8 @@ DELIVERY_SELL = {
         "exchange_txn": Decimal("4.14"),
         "sebi_fee": Decimal("0.14"),
         "stamp_duty": Decimal("0.00"),
-        "ipft": Decimal("0.01"),
-        "gst": Decimal("7.94"),
+        "ipft": Decimal("0.00"),
+        "gst": Decimal("7.95"),
         "dp_charges": Decimal("20.00"),
     },
 }
@@ -1845,7 +1855,9 @@ git commit -m "test(paper): bar-driven fills never beat tick-driven fills"
 
 - [ ] **Step 1: Write the failing tests**
 
-Cover: equity is cash plus marked positions; a loss inside the limit does not breach; a loss exceeding `max_daily_loss` breaches with that reason; a drawdown from peak exceeding `max_drawdown_pct` breaches; `None` limits never breach; `trip` sets the portfolio to `PAUSED`, cancels its `OPEN` and `PENDING` orders, writes a `circuit_breaker_events` row, and enqueues an alert; and a position with no mark available raises rather than being valued at zero.
+Cover: equity is cash plus marked positions; a loss inside the limit does not breach; a loss exceeding `max_daily_loss` breaches with that reason; a drawdown from peak exceeding `max_drawdown_pct` breaches; `None` limits never breach; `trip` sets the portfolio to `PAUSED`, cancels its `OPEN` and `PENDING` orders, and writes a `circuit_breaker_events` row; and a position with no mark available raises rather than being valued at zero.
+
+**`trip` does NOT enqueue an alert in this task.** `alerts.enqueue_alert` does not exist until Task 11, which owns wiring alerting into both the engine and the breaker. Do not create a stub for it here.
 
 Also cover `record_snapshot` specifically, because `peak_equity` is the only piece of breaker state that must survive a restart:
 
@@ -1923,7 +1935,7 @@ The `sender` is injected so tests never touch the network. The real sender posts
 
 - [ ] **Step 3: Wire `enqueue_alert` into the engine and breaker**
 
-Called inside the same transaction as the fill and the trip.
+Called inside the same transaction as the fill and the trip. Task 10 deliberately left `trip` without alerting, so add the call here and add the assertion that a trip enqueues a `BREACH` alert — that test belongs to this task, not Task 10.
 
 - [ ] **Step 4: Gate and commit**
 

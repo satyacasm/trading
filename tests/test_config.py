@@ -1,3 +1,4 @@
+from decimal import Decimal
 from pathlib import Path
 
 from trading.config import Settings
@@ -43,3 +44,48 @@ def test_real_credentials_in_env_local_do_not_break_the_suite(monkeypatch, tmp_p
     s = Settings(_env_file=None)
 
     assert s.upstox_api_key is None
+
+
+def test_paper_slippage_bps_defaults_to_five(monkeypatch, tmp_path):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+
+    s = Settings(_env_file=None)
+
+    assert s.paper_slippage_bps == Decimal("5")
+
+
+def test_paper_slippage_bps_is_tunable_via_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("PAPER_SLIPPAGE_BPS", "12.5")
+
+    s = Settings(_env_file=None)
+
+    assert s.paper_slippage_bps == Decimal("12.5")
+
+
+def test_telegram_settings_default_to_none(monkeypatch, tmp_path):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+
+    s = Settings(_env_file=None)
+
+    assert s.telegram_bot_token is None  # unconfigured bot is a valid state, not an error
+    assert s.telegram_chat_id is None
+
+
+def test_telegram_settings_are_tunable_via_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "987654")
+
+    s = Settings(_env_file=None)
+
+    assert s.telegram_bot_token == "123456:test-token"
+    assert s.telegram_chat_id == "987654"

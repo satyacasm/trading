@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 
@@ -21,6 +22,27 @@ class Settings(BaseSettings):
     upstox_access_token: str | None = None
     dhan_client_id: str | None = None
     dhan_access_token: str | None = None
+
+    # `paper_engine`'s market-order slippage, in basis points, always moved
+    # against the order (trading.paper.fills.decide_fill). 5 bps is
+    # deliberately conservative -- roughly ₹0.65 on RELIANCE at 1310, and
+    # wider than typical Binance spot spreads on BTC -- because
+    # understating your edge is the safe direction to err (this project's
+    # correctness doctrine). Tunable per-deployment without a code change;
+    # trading.paper.engine.validate_slippage_bps rejects a negative value
+    # at startup, whatever supplies it.
+    paper_slippage_bps: Decimal = Decimal("5")
+
+    # Telegram Bot API credentials for `trading.paper.alerts`' outbox worker
+    # (Task 11). Both optional: an unconfigured bot is a deliberate
+    # configuration state for this personal, single-user system, not an
+    # error -- `run_alert_worker` idles rather than crashing when either is
+    # unset (`build_telegram_sender` returns None, which is the signal it
+    # checks). Not validated against each other at startup (a bot token with
+    # no chat id, or vice versa, is still "unconfigured" as far as sending
+    # is concerned) because nothing downstream needs one without the other.
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
 
     @property
     def raw_archive_root(self) -> Path:

@@ -41,6 +41,19 @@ do the same with a rolled-back-at-teardown `db_conn`, specifically so they
 can inspect that *same* transaction afterward. Either caller would break
 if this module closed the connection itself.
 
+**Known limitation: no reconnect on a dropped connection.** If the one
+connection `run_alert_worker` holds dies mid-run, every subsequent batch's
+`_drain_pending` raises, is caught, logged, and the loop continues rather
+than crashing (see the outer `try`/`except` below, including the nested
+guard around `conn.rollback()` itself -- a dead connection can raise
+*there* too, and that must not propagate either). But nothing reconnects:
+the worker will keep failing every batch, forever, until its process is
+restarted. This mirrors an identical, already-accepted gap in this
+project's Redis consumers (`trading.streaming.crypto_ingestor` et al.)
+and is deliberately out of scope here -- these processes need a
+supervisor (e.g. systemd `Restart=on-failure`) rather than in-process
+reconnect logic, which is a larger change than this task owns.
+
 **Retry/backoff shape.** `alert_deliveries` (migration 0007) carries
 `attempts` and `last_error` but no per-row "next retry at" timestamp, so
 there is no per-row elapsed-time backoff to compute here. Instead,
@@ -230,8 +243,22 @@ def run_alert_worker(
             _drain_pending(conn, sender, max_attempts)
         except Exception as exc:  # noqa: BLE001 - one batch's failure (e.g. a transient
             # DB error) must never kill a long-running worker.
-            conn.rollback()
             log.warning("alerts.batch_failed", reason=str(exc))
+            try:
+                conn.rollback()
+            except Exception as rollback_exc:  # noqa: BLE001 - a connection that is
+                # already dead (the common cause of the original failure --
+                # a dropped socket, say) can itself raise on rollback().
+                # Failing to roll back a dead connection is not, on its
+                # own, worth killing the process over: this is deliberately
+                # swallowed rather than re-raised, so the loop can still
+                # reach the next `sleep`/batch instead of propagating out
+                # of run_alert_worker entirely. (No reconnect logic here by
+                # design -- see the module docstring's "known limitation"
+                # note; a dead connection just keeps failing every
+                # subsequent batch, logged each time, until the process is
+                # restarted by its supervisor.)
+                log.warning("alerts.rollback_failed", reason=str(rollback_exc))
         batches += 1
         if max_batches is not None and batches >= max_batches:
             break

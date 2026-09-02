@@ -180,6 +180,42 @@ def test_run_alert_worker_marks_failed_after_max_attempts_and_stops_retrying(db_
     assert calls == 2
 
 
+class _DeadConnection:
+    """A connection double whose every operation raises -- the exact shape
+    of an already-dropped connection. `execute` raises inside
+    `_drain_pending` (a transient DB error, e.g. a severed socket), and
+    `rollback` raises too when `run_alert_worker`'s outer handler then
+    tries to recover (Fix round 1: an already-dead connection cannot be
+    rolled back, and the first version of this code let that second
+    exception propagate and kill the worker process). A test that only
+    makes `execute` raise would pass without that fix -- `rollback` must
+    raise too to actually exercise the guard.
+    """
+
+    def execute(self, *_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("connection already closed")
+
+    def rollback(self) -> None:
+        raise RuntimeError("rollback failed: connection already closed")
+
+
+def test_run_alert_worker_survives_a_batch_where_rollback_itself_raises() -> None:
+    """The load-bearing regression test for Fix round 1: a batch failure
+    whose own rollback() also raises must be logged and swallowed, not
+    propagated -- the worker must complete all max_batches rather than
+    crashing the process on what both the original design and the outer
+    except intended to be a recoverable failure."""
+    conn = _DeadConnection()
+
+    with structlog.testing.capture_logs() as cap:
+        run_alert_worker(lambda: conn, lambda _t: None, max_batches=3, sleep=_sync_no_sleep)
+
+    batch_failed = [e for e in cap if e.get("event") == "alerts.batch_failed"]
+    rollback_failed = [e for e in cap if e.get("event") == "alerts.rollback_failed"]
+    assert len(batch_failed) == 3  # one per batch -- the loop kept going
+    assert len(rollback_failed) == 3  # rollback failed every time too, and was swallowed
+
+
 def test_run_alert_worker_does_not_close_the_connection_it_is_given(db_conn) -> None:
     """`run_alert_worker` treats the connection's lifecycle as the
     caller's -- unlike `trading.paper.engine`'s per-operation fresh

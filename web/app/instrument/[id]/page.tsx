@@ -17,6 +17,7 @@ import {
 } from "@/lib/api";
 import { mergeTickIntoCandles, type ChartCandle } from "@/lib/candles";
 import { useTickStream, type Tick } from "@/lib/useTickStream";
+import { OrderTicket } from "@/components/OrderTicket";
 
 const INTERVALS: Interval[] = ["1m", "5m", "15m", "1h", "1d"];
 
@@ -319,19 +320,29 @@ export default function InstrumentPage() {
         </div>
       </div>
 
-      <div className="relative flex-1 px-4 pb-8 sm:px-8">
-        {candlesError && (
-          <p className="text-down text-sm mb-2">Failed to load candles: {candlesError}</p>
-        )}
-        <div className="relative w-full max-w-full overflow-hidden" style={{ height: 440 }}>
-          <div ref={containerRef} className="w-full h-full" />
-          {isEmpty && !candlesError && (
-            <div className="absolute inset-0 flex items-center justify-center bg-ground/80 pointer-events-none">
-              <p className="text-muted text-sm text-center px-4">
-                No {interval} bars for this instrument yet.
-              </p>
-            </div>
+      <div className="flex flex-col lg:flex-row gap-6 flex-1 px-4 pb-8 sm:px-8">
+        <div className="relative flex-1 min-w-0">
+          {candlesError && (
+            <p className="text-down text-sm mb-2">Failed to load candles: {candlesError}</p>
           )}
+          <div className="relative w-full max-w-full overflow-hidden" style={{ height: 440 }}>
+            <div ref={containerRef} className="w-full h-full" />
+            {isEmpty && !candlesError && (
+              <div className="absolute inset-0 flex items-center justify-center bg-ground/80 pointer-events-none">
+                <p className="text-muted text-sm text-center px-4">
+                  No {interval} bars for this instrument yet.
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="w-full lg:w-80 shrink-0">
+          <OrderTicket
+            instrumentId={instrumentId}
+            symbol={symbolLabel}
+            referencePrice={header.price}
+          />
         </div>
       </div>
     </main>

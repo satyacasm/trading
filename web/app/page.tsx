@@ -157,9 +157,14 @@ export default function WatchlistPage() {
     <main className="min-h-screen bg-ground text-text font-sans">
       <header className="flex items-center justify-between border-b border-line px-4 py-4 sm:px-8">
         <h1 className="font-display text-xl tracking-wide">TERMINAL</h1>
-        <div className="flex items-center gap-2 text-xs text-muted">
-          <span className="inline-block h-2 w-2 rounded-full bg-live" aria-hidden="true" />
-          <span>{liveCount} streaming</span>
+        <div className="flex items-center gap-4 text-xs text-muted">
+          <Link href="/portfolio" className="hover:text-text">
+            Portfolio
+          </Link>
+          <span className="flex items-center gap-2">
+            <span className="inline-block h-2 w-2 rounded-full bg-live" aria-hidden="true" />
+            <span>{liveCount} streaming</span>
+          </span>
         </div>
       </header>
 

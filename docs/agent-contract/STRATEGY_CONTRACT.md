@@ -1,0 +1,476 @@
+# Strategy Contract
+
+**Version 0.1 — DRAFT. The runtime described here does not exist yet.**
+
+> Read this before generating anything: this document describes a platform
+> whose data layer, cost model, fill engine, and order lifecycle are built and
+> tested, but whose **strategy runtime is not**. There is currently no sandbox,
+> no uploader, and no `Context` implementation. A strategy written against this
+> draft cannot be run today.
+>
+> It is published in this state deliberately. The contract is the platform's
+> interface to the outside world, and the cheapest time to find out that it is
+> confusing is before the runtime is built around it. Sections marked
+> **UNDECIDED** are open questions, not omissions — see [Open decisions](#open-decisions).
+
+---
+
+## 1. What this is
+
+This platform is a **simulation-only** trading sandbox for Indian retail
+markets. It does not route real orders to any broker or exchange. Nothing here
+is investment advice, and simulated results do not represent actual trading.
+
+You are reading the specification an external AI agent needs in order to write
+a strategy that runs here. Hand this file to any capable model — Claude,
+ChatGPT, Gemini, a local model — with no other context, and it should produce
+conforming code. If it cannot, that is a defect in this document.
+
+The bundle is three files:
+
+| File | Purpose |
+|---|---|
+| `STRATEGY_CONTRACT.md` | This file. The full specification. |
+| `schema.json` | JSON Schemas for the manifest, instruments, bars, ticks, and orders — so conformance can be checked mechanically. **Not yet written.** |
+| `platform_sdk.py` | Typed no-op stubs of every interface below, so generated code can be lint-checked and dry-run locally before upload. **Not yet written.** |
+
+---
+
+## 2. The strategy interface
+
+A strategy is a single Python class named `Strategy`. Every method except
+`configure` and `initialize` is optional; implement only the events you need.
+
+```python
+class Strategy:
+    def configure(self) -> StrategyManifest:
+        """Declare universe, data needs, capital, schedule, and parameters.
+        Called once, before anything else, outside the simulation clock.
+        Must be a pure function of nothing: no I/O, no randomness, no clock."""
+
+    def initialize(self, ctx: Context) -> None:
+        """Called once at the start of the run, after the manifest is
+        accepted. Set up indicators and state here."""
+
+    def on_bar(self, ctx: Context, bars: dict[InstrumentId, Bar]) -> None:
+        """Called once per completed bar interval, with every subscribed
+        instrument that produced a bar in that interval. An instrument that
+        did not trade is absent from the dict rather than present with stale
+        values."""
+
+    def on_tick(self, ctx: Context, tick: Tick) -> None:
+        """Called per trade for tick-subscribed instruments. Optional, and
+        expensive: prefer on_bar unless the strategy genuinely needs
+        sub-bar granularity."""
+
+    def on_order_update(self, ctx: Context, update: OrderUpdate) -> None:
+        """Called when one of your orders changes state — filled, partially
+        filled, cancelled, rejected, or expired."""
+
+    def on_expiry(self, ctx: Context, event: ExpiryEvent) -> None:
+        """F&O only. Called at settlement for a position in an expiring
+        contract."""
+```
+
+`InstrumentId` is an `int`.
+
+### Determinism
+
+The same strategy, over the same data, must produce the same orders. This is
+what makes a backtest comparable to a forward paper run, and it is enforced,
+not merely requested:
+
+- **Never read the wall clock.** `datetime.now()`, `time.time()`, and
+  `date.today()` are unavailable. The only time is `ctx.now`.
+- **Never use unseeded randomness.** `random` and `numpy.random` are seeded
+  per-run from the run id and reset before `initialize`.
+- **Never depend on iteration order of sets.** Dict order is insertion-ordered
+  and safe; `set` iteration order is not.
+- **Never reach the network or filesystem.** Neither is available (§8). All
+  data comes through `ctx`.
+
+---
+
+## 3. The manifest
+
+`configure()` returns a `StrategyManifest`:
+
+```python
+StrategyManifest(
+    name="sma-crossover",
+    version="1.0.0",
+    universe=[...],              # see below
+    data=DataRequest(
+        bars="1m",               # "1m" | "5m" | "15m" | "1h" | "1d"
+        ticks=False,             # True routes on_tick
+        history_bars=200,        # bars of warm-up before the first on_bar
+    ),
+    capital=Decimal("1000000"),
+    base_currency="INR",         # a portfolio holds ONE currency (§5)
+    params={
+        "fast": Param(int, default=10, bounds=(2, 100)),
+        "slow": Param(int, default=30, bounds=(5, 400)),
+    },
+    max_daily_loss=Decimal("20000"),      # optional; arms the circuit breaker
+    max_drawdown_pct=Decimal("10"),       # optional; arms the circuit breaker
+)
+```
+
+### Universe
+
+**UNDECIDED — see [Open decisions](#open-decisions) D1.** The intent is that a
+universe is *resolved point-in-time*, so a strategy backtested over 2023 sees
+the instruments that existed in 2023, including ones since delisted. Two
+candidate spellings:
+
+```python
+# explicit
+universe=[InstrumentRef(exchange="NSE", segment="CM", symbol="RELIANCE")]
+
+# query
+universe=Query(asset_class="EQUITY", exchange="NSE", index="NIFTY50")
+```
+
+### Circuit breaker
+
+If `max_daily_loss` or `max_drawdown_pct` is declared and breached, the
+platform **pauses the strategy's portfolio and cancels its resting orders**,
+then notifies. This is not advisory. It is also runaway-loop protection: a
+strategy that malfunctions cannot dig indefinitely.
+
+Both are evaluated against equity (cash plus positions marked to last traded
+price), quantized to 4 decimal places, and the comparison is strict — a loss
+landing *exactly* on `max_daily_loss` does not breach.
+
+---
+
+## 4. The Context API
+
+`ctx` is the only way a strategy touches the outside world.
+
+### `ctx.now -> datetime`
+
+The simulation clock, timezone-aware UTC. In a backtest this is the timestamp
+of the event being processed; in a forward paper run it tracks real time. It is
+the only clock available.
+
+### `ctx.data` — point-in-time history
+
+```python
+ctx.data.bars(instrument_id, interval="1m", count=200) -> list[Bar]
+ctx.data.last(instrument_id) -> Bar | None
+```
+
+**This API physically cannot return data later than `ctx.now`.** Lookahead bias
+is prevented by construction rather than by discipline: there is no argument
+you can pass that reaches into the future. Bars are returned oldest-first, and
+a bar's timestamp marks the **start** of its interval while its values are only
+knowable at the interval's **end** — so the most recent bar `ctx.data.bars`
+returns is always one that has closed.
+
+Fewer than `count` bars may be returned (a newly listed instrument, a gap in
+recording). Never assume the list is full.
+
+### `ctx.portfolio` — cash and positions
+
+```python
+ctx.portfolio.cash          -> Decimal
+ctx.portfolio.positions     -> dict[InstrumentId, Position]
+ctx.portfolio.equity        -> Decimal   # cash + positions at last mark
+```
+
+A position whose `quantity` is `0` may still be present (it has realised P&L
+history). Check `quantity != 0` for "held".
+
+### `ctx.order(...)` and `ctx.cancel(...)`
+
+```python
+ctx.order(
+    instrument_id,
+    side="BUY" | "SELL",
+    quantity=Decimal("10"),
+    order_type="MARKET" | "LIMIT",
+    limit_price=Decimal("1300.00"),      # required for LIMIT, forbidden for MARKET
+    product="DELIVERY" | "INTRADAY",
+    time_in_force="DAY" | "GTC",
+    rationale="fast crossed above slow",  # REQUIRED, non-empty
+) -> OrderId
+
+ctx.cancel(order_id) -> None
+```
+
+`rationale` is mandatory and must be non-empty. Every order on this platform
+carries a reason, so that a trade log can be read back and confronted with what
+actually happened. Write something a human would find useful six months later,
+not `"buy"`.
+
+Orders are validated at submission and can be **rejected outright** — see §6.
+A rejection is a normal outcome, not an exception: your strategy learns about
+it through `on_order_update`, and must survive it.
+
+### `ctx.log(...)`
+
+```python
+ctx.log("crossover", fast=fast_ma, slow=slow_ma, position=qty)
+```
+
+Structured logging. Retained with the run and shown in its report. Not stdout —
+`print()` is captured but discouraged.
+
+### `ctx.state`
+
+A persisted key-value store surviving restarts within a run. Values must be
+JSON-serializable.
+
+```python
+ctx.state["entry_price"] = str(price)   # Decimals as strings; see §5
+```
+
+### `ctx.intel` — market intelligence
+
+**Not available.** Ships in Phase 2.5. It will expose news, sentiment, and flow
+features as point-in-time per-instrument numbers (`ctx.intel.features(...)`).
+Do not write strategies against it yet.
+
+---
+
+## 5. The data model
+
+### Money and precision — read this before writing arithmetic
+
+**All money is `decimal.Decimal`. Never `float`.** This is not stylistic. A
+platform whose headline feature is an honest cost model cannot afford binary
+floating point in its money path, and the runtime rejects a strategy that
+submits a float quantity or price.
+
+| Value | Type | Scale |
+|---|---|---|
+| Prices (`open`/`high`/`low`/`close`, `limit_price`, `avg_cost`) | `Decimal` | 4 dp |
+| Quantities | `Decimal` | 8 dp (crypto needs it; equities are whole numbers) |
+| Charges, cash, equity | `Decimal` | 4 dp internally, 2 dp for charges |
+
+Timestamps are **timezone-aware UTC** `datetime`. A naive datetime is an error,
+not a convenience. Indian market sessions are Asia/Kolkata; convert for
+display, never for storage or comparison.
+
+### Instrument
+
+The canonical identity of every tradable thing. `instrument_id` is the key
+every other structure references.
+
+| Field | Type | Notes |
+|---|---|---|
+| `instrument_id` | int | Primary key |
+| `asset_class` | str | `EQUITY`, `FUTURE`, `OPTION`, `CRYPTO`, `MF` |
+| `exchange` | str | `NSE`, `BSE`, `BINANCE`, `AMFI` |
+| `segment` | str | `CM` (cash), `FO` (F&O), `SPOT`, `MF` |
+| `symbol` | str | `RELIANCE`, `BTC-USDT` |
+| `currency` | str | `INR`, `USDT`. **Load-bearing** — see §6 |
+| `underlying_id` | int \| None | F&O: the instrument this derives from |
+| `expiry` | date \| None | F&O |
+| `strike` | Decimal \| None | Options |
+| `option_type` | str \| None | `CE`, `PE` |
+| `tick_size` | Decimal \| None | Minimum price increment |
+| `isin`, `name`, `series` | str \| None | Reference data |
+| `listed_on`, `delisted_on` | date \| None | Point-in-time universe resolution |
+| `status` | str | `ACTIVE`, and others |
+
+**Lot size is not a field on the instrument.** Lot sizes are revised over time,
+so they are dated: a lot-size lookup takes an instrument *and a date*. A
+backtest in 2022 must use the 2022 lot size. **UNDECIDED (D2)**: how this is
+exposed on `ctx`.
+
+### Bar
+
+| Field | Type | Notes |
+|---|---|---|
+| `instrument_id` | int | |
+| `ts` | datetime | UTC. Marks the **start** of the interval |
+| `interval_sec` | int | 60, 300, 900, 3600, 86400 |
+| `open`/`high`/`low`/`close` | Decimal | |
+| `volume` | Decimal \| None | |
+| `trades` | int \| None | Trade count in the interval |
+| `open_interest`, `oi_change` | int \| None | F&O |
+| `delivery_qty`, `delivery_pct` | — | Equities, EOD only |
+
+### Tick
+
+| Field | Type | Notes |
+|---|---|---|
+| `instrument_id` | int | |
+| `ts` | datetime | UTC, always timezone-aware |
+| `price` | Decimal | Strictly positive |
+| `quantity` | Decimal | May be **zero** — an index tick has no traded size |
+| `side` | str \| None | Aggressor side where the feed provides it |
+
+### Order
+
+| Field | Type | Notes |
+|---|---|---|
+| `order_id` | int | |
+| `instrument_id` | int | |
+| `side` | str | `BUY`, `SELL` |
+| `order_type` | str | `MARKET`, `LIMIT` |
+| `quantity`, `filled_quantity` | Decimal | |
+| `limit_price` | Decimal \| None | |
+| `product` | str | `DELIVERY`, `INTRADAY` |
+| `time_in_force` | str | `DAY`, `GTC` |
+| `status` | str | See below |
+| `rationale` | str | Non-empty, yours |
+| `rejection_reason` | str \| None | Populated when `status == REJECTED` |
+
+**Statuses:** `PENDING` (accepted, not yet working), `OPEN` (resting),
+`PARTIALLY_FILLED`, `FILLED`, `CANCELLED`, `REJECTED`, `EXPIRED`.
+Terminal: `FILLED`, `CANCELLED`, `REJECTED`, `EXPIRED`.
+
+A `DAY` order that has not filled by session close becomes `EXPIRED`.
+
+### Position
+
+`instrument_id`, `quantity`, `avg_cost`, `realised_pnl` — all `Decimal`.
+
+---
+
+## 6. Order rules and rejections
+
+Orders are checked at submission. Each of these produces a rejection whose
+message names exactly what is wrong.
+
+**Currency must match.** A portfolio holds **one** currency and performs no FX
+conversion. An INR portfolio cannot buy a USDT-denominated instrument. This
+rejects rather than converting, because a silent conversion at an invented rate
+would misstate P&L by roughly the exchange rate.
+
+**The market must be open**, per the exchange trading calendar for that
+instrument's exchange and segment. `CRYPTO` is exempt — Binance is 24/7. An
+unknown calendar state is treated as *closed*, never optimistically as open.
+
+**Cash or position must suffice.** A buy needs cash for notional plus charges;
+a sell needs the position.
+
+**A charge schedule must cover the instrument, product, and date.** If no rule
+covers this fill, the order is rejected rather than priced at zero. A silently
+zero charge produces a P&L that looks correct and is systematically optimistic,
+which is the most dangerous failure mode in a simulator.
+
+**Fills happen on subsequent price events, never on the submitting bar.** A
+market order fills at the next available price plus slippage, moved against you
+(5 bps default). A limit order rests until the price crosses it and then fills
+**at the limit price**, never at the price that crossed it — so a bar-driven
+backtest can never obtain a better price than a tick-driven forward run would
+have. Your strategy must tolerate an order that never fills.
+
+---
+
+## 7. The cost model
+
+Every fill is charged the real Indian statutory costs, itemised. **Rates are
+dated data, not constants** — NSE cash transaction charges changed on
+2026-03-01, and a backtest spanning that date uses the correct rate on each
+side of it.
+
+Components: `brokerage`, `stt`, `exchange_txn`, `sebi_fee`, `stamp_duty`,
+`ipft`, `gst`, `dp_charges`, `tds`.
+
+Worked example, RELIANCE 100 @ ₹1,313.10 (turnover ₹131,310):
+
+| | Delivery BUY | Delivery SELL | Intraday BUY | Intraday SELL |
+|---|---|---|---|---|
+| Brokerage | 20.00 | 20.00 | 20.00 | 20.00 |
+| STT | 131.00 | 131.00 | — | 33.00 |
+| Exchange txn | 4.03 | 4.03 | 4.03 | 4.03 |
+| SEBI fee | 0.13 | 0.13 | 0.13 | 0.13 |
+| Stamp duty | 19.70 | — | 3.94 | — |
+| GST | 4.33 | 7.93 | 4.33 | 4.33 |
+| DP charges | — | 20.00 | — | — |
+| **Total** | **179.19** | **183.09** | **32.43** | **61.49** |
+
+The asymmetries are real and worth internalising: delivery STT applies to
+**both** sides, stamp duty is **buy-side only**, DP charges are **sell-side
+only** and only on delivery — and only **once per scrip per day**, so a second
+same-day delivery sell of the same scrip pays no DP (and correspondingly less
+GST, since GST's base includes it).
+
+Crypto on Binance is a flat 0.1% taker fee. The 1% VDA TDS is plumbed through
+but not currently switched on.
+
+**Write cost-aware strategies.** A strategy trading 100 shares of a ₹1,300
+stock intraday pays ~₹94 round-trip against ₹131,310 of turnover — about 7 bps.
+An edge thinner than that is not an edge.
+
+---
+
+## 8. Sandbox limits
+
+Strategy code runs isolated: **no network, read-only filesystem**, hard CPU,
+memory, and wall-clock limits, non-root.
+
+**UNDECIDED (D3).** The specific limits, the allowed-import list, and the
+timeout are not settled, because the sandbox is not built. The intended shape:
+`numpy`, `pandas`, `ta-lib`, and a standard-library subset permitted;
+`open`, `socket`, `exec`, `subprocess`, and dunder escapes rejected by static
+analysis before the code ever runs.
+
+Do not write code that reads files, opens sockets, spawns processes, or imports
+anything not on the final allowlist.
+
+---
+
+## 9. Upload, validation, and the feedback loop
+
+1. **Static validation** — manifest schema check, import allowlist, AST scan.
+2. **Smoke run** — five simulated days in a throwaway sandbox. Must not crash
+   and must parse orders correctly.
+3. **Registration** — versioned and stored, ready to backtest or forward-run.
+
+Every rejection returns a structured report **written to be pasted back into
+the agent that generated the code**:
+
+```
+REJECTED: static validation
+  line 42: imports `requests`, which is not permitted.
+  See STRATEGY_CONTRACT.md §8 for the allowlist.
+  Data reaches a strategy only through `ctx`; there is no network.
+```
+
+Fix, resubmit, repeat. Closing that loop is the point.
+
+---
+
+## 10. Worked examples
+
+**UNDECIDED (D4).** §5 of the implementation plan calls for four: SMA crossover
+on equity, an iron condor on NIFTY weeklies, BTC momentum, and a multi-asset
+rebalancer.
+
+They are deliberately **not** written yet. An example in a contract is a
+promise that the code runs, and none of these can be executed until the runtime
+exists. Writing four plausible-looking examples now would mean shipping four
+untested claims in the most load-bearing part of the document — and an agent
+copying a broken example produces broken strategies with full confidence.
+
+They get written, and **run**, as the runtime lands.
+
+---
+
+## Open decisions
+
+These need resolving before v1.0. Each changes what a generated strategy looks
+like, so each is worth settling deliberately.
+
+| # | Decision | Why it matters |
+|---|---|---|
+| **D1** | Universe: explicit `InstrumentRef` list, a `Query`, or both? | Point-in-time resolution (delisted instruments staying in history) is a survivorship-bias guarantee. A query form makes it automatic; an explicit list makes it the author's problem. |
+| **D2** | How dated lot size is exposed on `ctx`. | F&O sizing is wrong without it, and it must be point-in-time. |
+| **D3** | Sandbox limits and the import allowlist. | Blocked on building the sandbox. Note gVisor is Linux-only — it cannot run on the macOS dev machine and needs the VPS. |
+| **D4** | Worked examples. | Blocked on the runtime; they must be executed before publication. |
+| **D5** | Does `on_bar` fire for an instrument that did not trade in the interval? | Drafted above as "absent from the dict". The alternative — carrying the previous close forward — is friendlier but invents a trade that did not happen. |
+| **D6** | Can one strategy hold more than one portfolio? | Currently drafted as one strategy, one portfolio, one currency. Multi-currency strategies are impossible under that rule. |
+| **D7** | How partial fills are surfaced. | `on_order_update` per partial, or only on terminal state? Affects every position-sizing loop an agent writes. |
+
+## Verification standard
+
+Per §10 of the implementation plan, this contract is **not done** until three
+different frontier agents, each given only this file, each produce a working
+strategy on the first try. Until then it is a draft, whatever its version
+number says.

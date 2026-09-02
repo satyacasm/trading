@@ -237,6 +237,56 @@ def test_replay_reproduces_the_cached_cash_and_positions(db_conn, prices) -> Non
     assert replayed_pos == cached_pos
 
 
+@settings(
+    max_examples=25,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+@given(data=st.data())
+def test_replay_reproduces_cached_cash_and_positions_with_sells(db_conn, data) -> None:
+    """COV-1: every property test above (and the fixed examples elsewhere
+    in this file) only ever generates BUYs, so `_apply_position`'s and
+    `replay_portfolio`'s SELL branches -- including the `realised_pnl`
+    quantization that was one of the five previously-fixed defects on this
+    branch -- are exercised only by round-number fixed examples like
+    `test_sell_records_realised_pnl`.
+
+    Uses `st.data()` (an interactive strategy) rather than pre-generating a
+    list of sides, because a valid SELL quantity depends on the position
+    *already built* by prior fills in the same example: filtering a
+    pre-generated sequence down to only-valid sells (`assume(...)`) would
+    make Hypothesis discard the large majority of examples and warn or
+    fail on `too_slow`/`filter_too_much`. Drawing the sell quantity from
+    `held` at each step, as this does, respects the long-only constraint
+    by construction instead."""
+    pid = make_portfolio(db_conn, cash=Decimal("1000000"))
+    held = Decimal("0")
+    num_fills = data.draw(st.integers(min_value=1, max_value=8))
+    for _ in range(num_fills):
+        price = data.draw(st.decimals(min_value=Decimal("1"), max_value=Decimal("500"), places=2))
+        if held >= Decimal("0.01") and data.draw(st.booleans()):
+            side = Side.SELL
+            quantity = data.draw(st.decimals(min_value=Decimal("0.01"), max_value=held, places=2))
+        else:
+            side = Side.BUY
+            quantity = data.draw(
+                st.decimals(min_value=Decimal("0.01"), max_value=Decimal("100"), places=2)
+            )
+        o = make_order(db_conn, pid, side=side, quantity=quantity)
+        apply_fill(db_conn, o, decision_at(price, quantity=quantity), simple_charges())
+        held = held + quantity if side is Side.BUY else held - quantity
+
+    cached_cash, cached_pos = (
+        db_conn.execute(
+            "SELECT cash_balance FROM portfolios WHERE portfolio_id=%s", (pid,)
+        ).fetchone()[0],
+        _positions(db_conn, pid),
+    )
+    replayed_cash, replayed_pos = replay_portfolio(db_conn, pid)
+    assert replayed_cash == cached_cash
+    assert replayed_pos == cached_pos
+
+
 def test_replay_matches_cached_cash_for_a_fractional_crypto_fill(db_conn) -> None:
     """Fix-round-1 regression: `orders.quantity`/`fills.quantity` are
     `NUMERIC(18,8)` precisely because crypto fills are fractional. A single

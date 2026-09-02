@@ -175,6 +175,72 @@ def test_evaluate_breach_checks_daily_loss_before_drawdown() -> None:
     assert reason.startswith(REASON_MAX_DAILY_LOSS)
 
 
+# --- evaluate_breach: the exact threshold boundary ------------------------------
+#
+# `evaluate_breach` compares with strict `>`, so a loss or drawdown landing
+# *exactly* on its declared limit does not breach; it takes one more paisa (or
+# one more basis point) to trip. These four tests lock that in from both sides.
+# They are characterization tests -- they record the behaviour the code has, not
+# a policy decision made here -- and each "exactly at" case is paired with a
+# "one increment past" case so the pair cannot be satisfied by a breaker that
+# simply never trips. Verified non-vacuous by flipping `>` to `>=` in
+# `evaluate_breach` and confirming both "does_not_trip" tests fail.
+
+
+def test_loss_exactly_at_max_daily_loss_does_not_trip() -> None:
+    """A loss landing precisely on the limit is within it, not past it."""
+    reason = evaluate_breach(
+        equity=Decimal("9000"),
+        day_open_equity=Decimal("10000"),  # loss of exactly 1000
+        peak_equity=Decimal("10000"),
+        max_daily_loss=Decimal("1000"),
+        max_drawdown_pct=None,
+    )
+    assert reason is None
+
+
+def test_loss_one_paisa_past_max_daily_loss_does_trip() -> None:
+    """The companion to the boundary test above: one paisa further and it
+    breaches, which is what proves the boundary is where it is rather than
+    the breaker being inert."""
+    reason = evaluate_breach(
+        equity=Decimal("8999.99"),
+        day_open_equity=Decimal("10000"),  # loss of 1000.01
+        peak_equity=Decimal("10000"),
+        max_daily_loss=Decimal("1000"),
+        max_drawdown_pct=None,
+    )
+    assert reason is not None
+    assert reason.startswith(REASON_MAX_DAILY_LOSS)
+
+
+def test_drawdown_exactly_at_max_drawdown_pct_does_not_trip() -> None:
+    """Same boundary, the other limit: a drawdown of exactly 5.0000% against
+    a 5% limit is within it. Chosen so the division is exact in `Decimal`
+    ((10000 - 9500) / 10000 * 100 == 5), leaving nothing for a rounding
+    artefact to hide behind."""
+    reason = evaluate_breach(
+        equity=Decimal("9500"),
+        day_open_equity=Decimal("9500"),
+        peak_equity=Decimal("10000"),
+        max_daily_loss=None,
+        max_drawdown_pct=Decimal("5"),
+    )
+    assert reason is None
+
+
+def test_drawdown_one_basis_point_past_max_drawdown_pct_does_trip() -> None:
+    reason = evaluate_breach(
+        equity=Decimal("9499"),
+        day_open_equity=Decimal("9499"),
+        peak_equity=Decimal("10000"),  # 5.01% drawdown
+        max_daily_loss=None,
+        max_drawdown_pct=Decimal("5"),
+    )
+    assert reason is not None
+    assert reason.startswith(REASON_MAX_DRAWDOWN)
+
+
 # --- record_snapshot ------------------------------------------------------------
 
 

@@ -48,6 +48,7 @@ from redis.asyncio import Redis as AsyncRedis
 from tests.paper.helpers import make_order, make_portfolio
 from trading.config import get_settings
 from trading.contracts.enums import DataSource
+from trading.paper.breaker import REASON_MAX_DRAWDOWN, record_snapshot
 from trading.paper.engine import (
     OpenOrderBook,
     _handle_tick_message,
@@ -236,12 +237,21 @@ def _run_engine_with_publish(
     `publish` (channel, payload) pairs shortly after subscription lands,
     then wait for both to finish.
 
-    `reconcile_check_seconds` defaults far out of range for the same
-    reason `sweep_check_seconds` does: `sleep=_no_sleep` makes every
-    periodic task fire almost continuously, and the reconcile sweep -- IMP-1's
-    backstop -- actively mutates `book` (re-adopting anything OPEN in the
-    DB but missing from it), which most of this helper's callers don't
-    want interfering with a scenario they built by hand.
+    The out-of-range `sweep_check_seconds`/`reconcile_check_seconds`
+    defaults do **not** switch those tasks off here, despite how they
+    read. `_no_sleep` discards its `seconds` argument entirely, so under
+    it every periodic task -- sweep, breaker, and reconcile alike -- fires
+    continuously whatever interval it was given. (Verified by setting both
+    defaults to `0.0` and re-running this module: 43 passed, unchanged.)
+    The scenarios below are undisturbed because the sweeps are no-ops
+    against the data they build -- nothing is a stale DAY order, and
+    anything OPEN in the database is already in `book` -- not because the
+    intervals suppressed them.
+
+    The large values are kept for consistency with the direct `run_engine`
+    call sites further down this file, which pass `sleep=asyncio.sleep`
+    and there genuinely do rely on a big interval to park the tasks they
+    are not testing while a small one drives the task they are.
     """
     async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
     try:
@@ -2011,6 +2021,79 @@ def test_evaluate_breaker_for_portfolio_quantizes_equity_before_it_reaches_trip(
     finally:
         setup_conn.execute("DELETE FROM positions WHERE portfolio_id=%s", (pid,))
         _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+def test_evaluate_breaker_for_portfolio_hands_trip_the_drawdown_limit_quantized_as_a_pct(
+    setup_conn, conn_factory, monkeypatch
+) -> None:
+    """The sibling of the `quantize_money` regression above, for the other
+    branch -- and, as it turns out, the only engine-level coverage the
+    drawdown path has at all.
+
+    `evaluate_breaker_for_portfolio` picks the `threshold` it hands `trip`
+    from the *prefix* of `evaluate_breach`'s reason, because the two limits
+    live on columns with different scales (`max_daily_loss`:
+    `NUMERIC(18,4)` money; `max_drawdown_pct`: `NUMERIC(9,4)` percentage)
+    and so need different quantizers. Nothing exercised the drawdown side
+    of that choice, so a branch that picked `max_daily_loss` for a drawdown
+    breach would have shipped green.
+
+    `max_daily_loss` is set here to a deliberately large, non-breaching
+    999999 rather than left `None`: if the wrong limit were selected, the
+    threshold would come back as 999999.0000 and this test fails loudly,
+    rather than the two limits happening to agree.
+    """
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    setup_conn.execute(
+        "UPDATE portfolios SET max_daily_loss = %s, max_drawdown_pct = %s WHERE portfolio_id = %s",
+        (Decimal("999999"), Decimal("5"), pid),
+    )
+    # An earlier snapshot establishes the peak at 100000; equity then falls
+    # to 80000, a 20% drawdown against a 5% limit. No positions are needed
+    # -- with an empty book, equity is just cash, which keeps this test on
+    # the branch it is about rather than on marking.
+    record_snapshot(setup_conn, pid, _T0 - timedelta(days=1), Decimal("100000"))
+    setup_conn.execute(
+        "UPDATE portfolios SET cash_balance = %s WHERE portfolio_id = %s", (Decimal("80000"), pid)
+    )
+    setup_conn.commit()
+    book = OpenOrderBook()
+
+    import trading.paper.engine as engine_module
+
+    real_trip = engine_module.trip
+    captured: dict[str, Decimal | str] = {}
+
+    def _capturing_trip(
+        conn: Connection, portfolio_id: int, reason: str, equity: Decimal, threshold: Decimal
+    ) -> None:
+        captured["reason"] = reason
+        captured["equity"] = equity
+        captured["threshold"] = threshold
+        real_trip(conn, portfolio_id, reason, equity, threshold)
+
+    monkeypatch.setattr(engine_module, "trip", _capturing_trip)
+
+    try:
+        evaluate_breaker_for_portfolio(conn_factory, book, pid, _T0)
+
+        status = setup_conn.execute(
+            "SELECT status FROM portfolios WHERE portfolio_id=%s", (pid,)
+        ).fetchone()
+        assert status == ("PAUSED",)
+
+        assert str(captured["reason"]).startswith(REASON_MAX_DRAWDOWN)
+        # The drawdown limit at NUMERIC(9,4)'s scale -- not 999999.0000,
+        # which is what selecting the money limit by mistake would give.
+        assert captured["threshold"] == Decimal("5.0000")
+        assert captured["equity"] == Decimal("80000.0000")
+
+        event_threshold = setup_conn.execute(
+            "SELECT threshold FROM circuit_breaker_events WHERE portfolio_id=%s", (pid,)
+        ).fetchone()[0]
+        assert event_threshold == Decimal("5.0000")
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[])
 
 
 def test_evaluate_breaker_for_portfolio_skips_and_logs_on_a_missing_mark(

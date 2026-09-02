@@ -610,6 +610,11 @@ def test_repeated_idempotency_key_returns_the_original_order(
     second = client.post("/orders", json=body)
 
     assert first.status_code == 201
+    # 200, not 201: `create_order` rewrites the status code when it returns
+    # an order it did not create. Its sibling race test asserts the same
+    # thing; a duplicate that silently reported 201 would tell a client it
+    # had just placed a second order.
+    assert second.status_code == 200
     assert second.json()["order_id"] == first.json()["order_id"]
 
     count = db_conn.execute(

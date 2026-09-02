@@ -1436,6 +1436,85 @@ def test_run_engine_rejects_an_unaffordable_fill_instead_of_retrying(
         _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
 
 
+def test_run_engine_rejects_a_fill_whose_schedule_carries_an_invalid_basis(
+    setup_conn, conn_factory
+) -> None:
+    """M-d, and the test that earns `InvalidChargeSchedule` its own class.
+
+    `compute_charges` now raises rather than skipping a row whose `basis`
+    cannot apply to its `charge_type`. That raise is only an improvement
+    if `_process_fill` treats it as *permanent*: membership in the
+    `except (...)` tuple is what rejects the order, and anything outside
+    that tuple falls through to `run_engine`'s generic handler, which
+    deliberately leaves the order OPEN and in the book to retry on the
+    next tick. For a data defect no retry can fix, that would be an
+    infinite log-and-fail loop on every tick -- strictly worse than the
+    silent zero it replaced. So the wiring, not just the raise, is the
+    thing under test here.
+
+    The bad row is a crypto TDS charge given GST's `PERCENT_OF_CHARGES`
+    basis: realistic (TDS is seeded as its own charge type precisely so it
+    stays visible), and safe to insert because BINANCE/CRYPTO/DELIVERY
+    seeds only a BROKERAGE row -- so this cannot collide into an
+    `AmbiguousChargeSchedule` and pass for the wrong reason.
+    """
+    pid = make_portfolio(setup_conn, cash=Decimal("1000000"))
+    iid = _make_crypto_instrument(setup_conn)
+    setup_conn.execute(
+        "INSERT INTO charge_schedules (broker, exchange, asset_class, product,"
+        " charge_type, basis, applies_to_side, rate, cap, rounding,"
+        " gst_base_types, effective_from, effective_to, source_note)"
+        " VALUES ('BINANCE','BINANCE','CRYPTO','DELIVERY','TDS',"
+        " 'PERCENT_OF_CHARGES','BOTH',0.01,NULL,'TWO_DECIMALS',NULL,"
+        " '2024-01-01',NULL,'M-d test: deliberately invalid basis')"
+    )
+    order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    try:
+        _run_engine_with_publish(
+            conn_factory=conn_factory,
+            max_ticks=1,
+            publish=[(channel, _tick_json(iid, datetime.now(UTC), "1000.00"))],
+            pattern=pattern,
+        )
+
+        row = setup_conn.execute(
+            "SELECT status, rejection_reason FROM orders WHERE order_id=%s", (order.order_id,)
+        ).fetchone()
+        assert row is not None
+        status, reason = row
+        # REJECTED, not OPEN: this is the assertion that fails if the
+        # exception is ever dropped from _process_fill's except tuple.
+        assert status == "REJECTED"
+        assert "invalid charge schedule" in reason
+        assert "TDS" in reason
+
+        # Nothing was priced at zero and written anyway.
+        fills = setup_conn.execute(
+            "SELECT 1 FROM fills WHERE order_id=%s", (order.order_id,)
+        ).fetchall()
+        assert fills == []
+        cash = setup_conn.execute(
+            "SELECT cash_balance FROM portfolios WHERE portfolio_id=%s", (pid,)
+        ).fetchone()[0]
+        assert cash == Decimal("1000000.0000")
+    finally:
+        setup_conn.execute(
+            "DELETE FROM charge_schedules WHERE source_note = %s",
+            ("M-d test: deliberately invalid basis",),
+        )
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
 def test_run_engine_enqueues_a_rejected_alert_on_an_unaffordable_fill(
     setup_conn, conn_factory
 ) -> None:

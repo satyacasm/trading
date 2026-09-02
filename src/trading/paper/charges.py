@@ -50,6 +50,32 @@ class AmbiguousChargeSchedule(Exception):
     """
 
 
+class InvalidChargeSchedule(Exception):
+    """A schedule row whose `basis` cannot apply to its `charge_type` --
+    in practice `PERCENT_OF_CHARGES`, which is GST's basis (GST is the
+    only charge that is a percentage *of other charges*, which is why it
+    is computed in its own pass after every other charge has settled),
+    appearing under some other `charge_type`.
+
+    A third sibling of `MissingChargeSchedule`/`AmbiguousChargeSchedule`
+    rather than a reuse of either, on the same reasoning that separated
+    those two: all three are data defects, but each has a different
+    remedy -- add a row, close off a date range, or fix this row's basis
+    (or implement that basis for this charge type) -- and `trading.paper.
+    engine`'s rejection message names which one happened.
+
+    Raised rather than skipping the row, which is what this code did
+    before: a skipped row leaves its charge at the zero every charge type
+    is pre-seeded to, so the fill completes with a total that is
+    well-formed, unlogged, and systematically too low -- the precise
+    failure `MissingChargeSchedule` exists to prevent, and the reason the
+    basis dispatch below has no silent default arm. That matters beyond
+    `PERCENT_OF_CHARGES`: any future `ChargeBasis` member reaches the same
+    arm, so this raise is what stops a newly-added basis from silently
+    pricing at zero until someone notices the P&L is too good.
+    """
+
+
 def load_schedules(
     conn: Connection,
     broker: str,
@@ -181,7 +207,15 @@ def compute_charges(
         ):
             raw = s.rate
         else:
-            continue  # PERCENT_OF_CHARGES only ever applies to GST
+            # No silent default arm -- see InvalidChargeSchedule. A GST
+            # row never reaches here (it was captured and skipped at the
+            # top of this loop), so any row landing in this branch is
+            # carrying a basis that cannot apply to it.
+            raise InvalidChargeSchedule(
+                f"charge_type {s.charge_type.value} carries basis {s.basis.value}, "
+                f"which cannot be computed for it (PERCENT_OF_CHARGES applies only to "
+                f"GST); refusing to skip the row and price it at zero"
+            )
 
         if s.cap is not None:
             raw = min(raw, s.cap)

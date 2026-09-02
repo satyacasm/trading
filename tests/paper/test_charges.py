@@ -17,6 +17,7 @@ from psycopg import Connection
 
 from trading.paper.charges import (
     AmbiguousChargeSchedule,
+    InvalidChargeSchedule,
     MissingChargeSchedule,
     compute_charges,
     load_schedules,
@@ -233,6 +234,51 @@ def test_gst_schedule_row_itself_respects_side() -> None:
     ]
     assert compute_charges(s, Side.BUY, Decimal("1"), Decimal("100")).gst == Decimal("0")
     assert compute_charges(s, Side.SELL, Decimal("1"), Decimal("100")).gst == Decimal("3.60")
+
+
+def test_percent_of_charges_on_the_gst_row_itself_is_still_computed_normally() -> None:
+    """The guard must not catch the one row `PERCENT_OF_CHARGES` is *for*.
+    GST is captured and skipped at the top of the dispatch loop, then
+    applied in its own pass over the settled amounts -- so a schedule
+    whose only percent-of-charges row is GST prices as it always did."""
+    schedules = [
+        _sched(ChargeType.BROKERAGE, ChargeBasis.FLAT_PER_ORDER, "BOTH", "20"),
+        _sched(
+            ChargeType.GST,
+            ChargeBasis.PERCENT_OF_CHARGES,
+            "BOTH",
+            "0.18",
+            gst_base=(ChargeType.BROKERAGE,),
+        ),
+    ]
+    charges = compute_charges(schedules, Side.BUY, Decimal("10"), Decimal("100"))
+    assert charges.brokerage == Decimal("20.00")
+    assert charges.gst == Decimal("3.60")
+
+
+def test_percent_of_charges_on_a_non_gst_row_is_rejected_not_silently_zero() -> None:
+    """`PERCENT_OF_CHARGES` is the GST basis: GST is the only charge that
+    is a percentage *of other charges*, and it is handled by its own pass
+    after every other charge has settled. A row carrying that basis under
+    any other `charge_type` is therefore a data defect, and before this
+    fix it fell through `compute_charges`'s basis dispatch and contributed
+    zero -- silently, producing a total that looks right and is
+    systematically too low, which is precisely the failure mode
+    `MissingChargeSchedule` exists to prevent.
+
+    Unreachable from the seeded schedules, so this constructs the row
+    directly. It is covered anyway because the no-silent-fallbacks rule in
+    the charge path is a global constraint, not a property of the current
+    seed data.
+    """
+    schedules = [
+        _sched(ChargeType.BROKERAGE, ChargeBasis.PERCENT_OF_CHARGES, "BOTH", "0.18"),
+    ]
+    with pytest.raises(InvalidChargeSchedule) as exc_info:
+        compute_charges(schedules, Side.BUY, Decimal("10"), Decimal("100"))
+    message = str(exc_info.value)
+    assert "BROKERAGE" in message
+    assert "PERCENT_OF_CHARGES" in message
 
 
 @pytest.mark.db

@@ -118,6 +118,7 @@ from trading.paper.breaker import (
 )
 from trading.paper.charges import (
     AmbiguousChargeSchedule,
+    InvalidChargeSchedule,
     MissingChargeSchedule,
     compute_charges,
     load_schedules,
@@ -642,7 +643,7 @@ def _parse_tick(raw: str) -> Tick | None:
 
 
 def _rejection_reason(
-    exc: CheckViolation | MissingChargeSchedule | AmbiguousChargeSchedule,
+    exc: CheckViolation | MissingChargeSchedule | AmbiguousChargeSchedule | InvalidChargeSchedule,
 ) -> str:
     if isinstance(exc, CheckViolation):
         constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
@@ -651,6 +652,8 @@ def _rejection_reason(
         return f"fill rejected: {exc}"
     if isinstance(exc, AmbiguousChargeSchedule):
         return f"fill rejected: ambiguous charge schedule at fill time: {exc}"
+    if isinstance(exc, InvalidChargeSchedule):
+        return f"fill rejected: invalid charge schedule at fill time: {exc}"
     return f"fill rejected: no charge schedule available at fill time: {exc}"
 
 
@@ -731,7 +734,12 @@ async def _process_fill(
             book.remove(order.order_id)
             log.info("paper_engine.fill_lost_race", order_id=order.order_id, reason=str(exc))
             return
-        except (CheckViolation, MissingChargeSchedule, AmbiguousChargeSchedule) as exc:
+        except (
+            CheckViolation,
+            MissingChargeSchedule,
+            AmbiguousChargeSchedule,
+            InvalidChargeSchedule,
+        ) as exc:
             # All three are permanent, not transient: an unaffordable fill
             # will still be unaffordable on retry (barring a cash deposit
             # this engine has no way to observe); a missing charge schedule
@@ -739,7 +747,8 @@ async def _process_fill(
             # control -- a long-resting GTC order can genuinely outlive its
             # charge_schedules row's effective_to; and an ambiguous schedule
             # (two in-force rows for one charge type) needs a human to fix
-            # the data, not a retry. Either way, leaving the order OPEN
+            # the data, not a retry, as does an invalid one (a basis that
+            # cannot apply to its charge type). Either way, leaving the order OPEN
             # would retry -- and fail, and log -- on every subsequent tick
             # forever. Reject it instead, exactly like the CheckViolation
             # path already did before MissingChargeSchedule joined it here.

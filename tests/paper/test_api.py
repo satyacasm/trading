@@ -597,6 +597,142 @@ def test_order_with_matching_currency_is_accepted(
     assert response.status_code == 201
 
 
+# --- GET /orders (the blotter's data source) --------------------------------
+
+
+def test_list_orders_returns_this_portfolios_orders_newest_first(
+    client: TestClient, db_conn, portfolio_id: int, equity_instrument_id: int
+) -> None:
+    """The frontend blotter's one query. Newest-first because a blotter is
+    read top-down and the order you just placed is the one you are looking
+    for."""
+    first = make_order(
+        db_conn,
+        portfolio_id,
+        side=Side.BUY,
+        quantity=Decimal("10"),
+        instrument_id=equity_instrument_id,
+    )
+    second = make_order(
+        db_conn,
+        portfolio_id,
+        side=Side.SELL,
+        quantity=Decimal("5"),
+        instrument_id=equity_instrument_id,
+    )
+
+    response = client.get(f"/orders?portfolio_id={portfolio_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [o["order_id"] for o in body] == [second.order_id, first.order_id]
+
+
+def test_list_orders_excludes_another_portfolios_orders(
+    client: TestClient, db_conn, portfolio_id: int, equity_instrument_id: int
+) -> None:
+    """Portfolios are independent track records (plan §4.3) -- one
+    portfolio's blotter must never show another's orders."""
+    mine = make_order(
+        db_conn,
+        portfolio_id,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=equity_instrument_id,
+    )
+    other_portfolio = make_portfolio(db_conn, cash=Decimal("100000"))
+    make_order(
+        db_conn,
+        other_portfolio,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=equity_instrument_id,
+    )
+
+    response = client.get(f"/orders?portfolio_id={portfolio_id}")
+
+    assert response.status_code == 200
+    assert [o["order_id"] for o in response.json()] == [mine.order_id]
+
+
+def test_list_orders_404s_for_an_unknown_portfolio(client: TestClient) -> None:
+    """Mirrors get_positions: an unknown portfolio is a 404, not an empty
+    list, so a typo in the id is visible instead of looking like a
+    portfolio that simply has not traded."""
+    response = client.get("/orders?portfolio_id=99999999")
+    assert response.status_code == 404
+    assert "99999999" in response.json()["detail"]
+
+
+def test_list_orders_respects_limit(
+    client: TestClient, db_conn, portfolio_id: int, equity_instrument_id: int
+) -> None:
+    for _ in range(3):
+        make_order(
+            db_conn,
+            portfolio_id,
+            side=Side.BUY,
+            quantity=Decimal("1"),
+            instrument_id=equity_instrument_id,
+        )
+
+    response = client.get(f"/orders?portfolio_id={portfolio_id}&limit=2")
+
+    assert response.status_code == 200
+    assert len(response.json()) == 2
+
+
+def test_list_orders_exposes_the_rejection_reason(
+    client: TestClient, db_conn, portfolio_id: int, equity_instrument_id: int
+) -> None:
+    """A blotter that shows *that* an order was rejected without showing
+    *why* is the silent-failure shape this project spends its effort
+    avoiding: the engine writes a precise reason (a currency mismatch, an
+    unaffordable fill, a missing charge schedule) and it must reach the
+    screen. `Order` carries the column the table has always had."""
+    order = make_order(
+        db_conn,
+        portfolio_id,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=equity_instrument_id,
+    )
+    db_conn.execute(
+        "UPDATE orders SET status=%s, rejection_reason=%s WHERE order_id=%s",
+        (
+            OrderStatus.REJECTED.value,
+            "fill rejected: insufficient cash at fill time",
+            order.order_id,
+        ),
+    )
+
+    response = client.get(f"/orders?portfolio_id={portfolio_id}")
+
+    assert response.status_code == 200
+    row = response.json()[0]
+    assert row["status"] == "REJECTED"
+    assert row["rejection_reason"] == "fill rejected: insufficient cash at fill time"
+
+
+def test_list_orders_reports_a_null_rejection_reason_for_a_live_order(
+    client: TestClient, db_conn, portfolio_id: int, equity_instrument_id: int
+) -> None:
+    """The field is optional, not an empty string -- a resting order has no
+    reason, and the UI distinguishes "no reason" from "reason we failed to
+    read"."""
+    make_order(
+        db_conn,
+        portfolio_id,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=equity_instrument_id,
+    )
+
+    response = client.get(f"/orders?portfolio_id={portfolio_id}")
+
+    assert response.json()[0]["rejection_reason"] is None
+
+
 # --- Idempotency --------------------------------------------------------
 
 

@@ -112,3 +112,13 @@ def test_decode_rejects_a_payload_without_a_mode() -> None:
     raw = gzip.compress(json.dumps({"source": "x"}).encode())
     with pytest.raises(ValueError, match="mode"):
         decode_payload(raw)
+
+
+def test_the_payload_default_matches_the_registry_contract_version() -> None:
+    # payload.py cannot import the constant -- registry.py imports psycopg
+    # and trading.runtime ships into a container with no database -- so the
+    # literal is duplicated deliberately. This test is what keeps the
+    # duplicate honest; it runs on the host, where psycopg exists.
+    from trading.agent_contract.registry import CONTRACT_VERSION
+
+    assert SmokePayload(mode="smoke", source="x").contract_version == CONTRACT_VERSION

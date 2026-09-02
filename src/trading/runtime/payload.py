@@ -110,10 +110,11 @@ def encode_payload(payload: SmokePayload) -> bytes:
             str(instrument_id): _encode_series(series)
             for instrument_id, series in payload.bars.items()
         },
-        # ChargeSchedule serialises Decimals as floats via its own
-        # field_serializer, which is right for the API and wrong here --
-        # so the schedules cross as JSON produced by pydantic's own
-        # round-trip-safe mode instead.
+        # ChargeSchedule deliberately has no money field_serializer (it is
+        # process-internal and never crosses HTTP), so model_dump_json()
+        # already round-trips its Decimals losslessly as strings -- the
+        # schedules can cross the envelope via pydantic's own JSON instead
+        # of the field-by-field string encoding the bars need above.
         "charge_schedules": [
             json.loads(schedule.model_dump_json()) for schedule in payload.charge_schedules
         ],

@@ -29,7 +29,7 @@ from tests.paper.helpers import (
     simple_charges,
 )
 from trading.paper.enums import OrderStatus, Side
-from trading.paper.ledger import apply_fill, replay_portfolio
+from trading.paper.ledger import OrderNoLongerFillable, apply_fill, replay_portfolio
 
 pytestmark = pytest.mark.db
 
@@ -107,6 +107,46 @@ def test_buy_exceeding_cash_is_refused(db_conn) -> None:
         apply_fill(
             db_conn, o, decision_at(Decimal("100"), quantity=Decimal("10")), simple_charges()
         )
+
+
+def test_apply_fill_raises_and_rolls_back_when_order_status_changed_concurrently(
+    db_conn,
+) -> None:
+    """Optimistic concurrency control (Task 8 fix round 2): a fill is
+    decided against a snapshot of `order` that can go stale by the time
+    `apply_fill`'s final, guarded UPDATE runs -- most concretely, a
+    `cancel` that committed elsewhere in between. Simulated here by
+    cancelling the order directly, on the same connection, before calling
+    `apply_fill`. Proves both that `apply_fill` raises `OrderNoLongerFillable`
+    AND that nothing it already wrote (fill row, ledger entry, cash,
+    position) survives the caller's rollback -- run inside a savepoint
+    (`conn.transaction()`, the same pattern `api.py`'s `_insert_order`
+    uses) so the CANCELLED status set just above, *outside* the savepoint,
+    stays visible afterward for inspection instead of also being wiped by
+    a full rollback."""
+    pid = make_portfolio(db_conn, cash=Decimal("100000"))
+    o = make_order(db_conn, pid, side=Side.BUY, quantity=Decimal("10"))
+    db_conn.execute("UPDATE orders SET status='CANCELLED' WHERE order_id=%s", (o.order_id,))
+
+    with pytest.raises(OrderNoLongerFillable), db_conn.transaction():
+        apply_fill(
+            db_conn, o, decision_at(Decimal("100"), quantity=Decimal("10")), simple_charges()
+        )
+
+    fills = db_conn.execute("SELECT 1 FROM fills WHERE order_id=%s", (o.order_id,)).fetchall()
+    assert fills == []
+    ledger = db_conn.execute(
+        "SELECT 1 FROM ledger_entries WHERE portfolio_id=%s", (pid,)
+    ).fetchall()
+    assert ledger == []
+    cash = db_conn.execute(
+        "SELECT cash_balance FROM portfolios WHERE portfolio_id=%s", (pid,)
+    ).fetchone()
+    assert cash == (Decimal("100000.0000"),)  # untouched by the rolled-back attempt
+    status = db_conn.execute(
+        "SELECT status FROM orders WHERE order_id=%s", (o.order_id,)
+    ).fetchone()
+    assert status == ("CANCELLED",)  # never overwritten with FILLED
 
 
 def test_apply_fill_does_not_commit(db_conn) -> None:

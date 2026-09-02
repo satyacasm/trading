@@ -50,6 +50,25 @@ same instrument -- the failing order is left exactly as it was (`OPEN`,
 still in the book, retried on the next tick), and, critically, a healthy
 neighbour resting on the same instrument still fills on the *same* tick
 instead of being starved by the first order's trouble.
+
+**A fill can lose a race against a concurrent cancel -- closed in two
+layers.** `_handle_tick_message` snapshots the resting orders for an
+instrument at tick start, then `await`s each fill in turn; the
+`orders:control` consumer is a *separate* task, so control can yield
+between orders and a `cancel` can remove one mid-snapshot. Layer one is a
+cheap, best-effort recheck against `book.order_index` immediately before
+each `_process_fill` call -- it catches the case where the cancel has
+already reached this process's in-memory book. Layer two, the one that
+actually closes the race, lives in `apply_fill` itself
+(`trading.paper.ledger.OrderNoLongerFillable`): its final order-status
+UPDATE is guarded by `WHERE status IN (...)`, so a cancel that committed
+on another connection -- even one this process hasn't heard about yet via
+`orders:control`, since the API publishes that message *before* its own
+commit (`trading.streaming.db.get_db_connection` commits after the route
+body returns) -- still wins. When that guard trips, the whole transaction
+rolls back and `_process_fill` treats it as success, not error: the order
+is dropped from the book and nothing is written, because the order's real
+status already reflects the correct outcome.
 """
 
 from __future__ import annotations
@@ -74,7 +93,7 @@ from trading.config import get_settings
 from trading.paper.charges import MissingChargeSchedule, compute_charges, load_schedules
 from trading.paper.enums import OrderStatus, OrderType, Product, Side, TimeInForce
 from trading.paper.fills import decide_fill
-from trading.paper.ledger import apply_fill
+from trading.paper.ledger import OrderNoLongerFillable, apply_fill
 from trading.paper.models import FillDecision, Order
 from trading.streaming.models import Tick
 
@@ -358,6 +377,21 @@ async def _process_fill(
             charges = compute_charges(schedules, order.side, decision.quantity, decision.price)
             fill_id = apply_fill(conn, order, decision, charges)
             conn.commit()
+        except OrderNoLongerFillable as exc:
+            # Not an error, and not one of the permanent-rejection cases
+            # below: the order's status changed underneath us -- most
+            # concretely, a `cancel` published on orders:control that
+            # committed on another connection after this fill was decided
+            # but before apply_fill's final, guarded UPDATE ran. Rolling
+            # back undoes everything apply_fill already wrote (fill row,
+            # cash, ledger entry, position) for this no-longer-fillable
+            # order; the order's real current status (e.g. CANCELLED)
+            # already reflects the correct outcome, so there is nothing
+            # further to write here -- just stop tracking it.
+            conn.rollback()
+            book.remove(order.order_id)
+            log.info("paper_engine.fill_lost_race", order_id=order.order_id, reason=str(exc))
+            return
         except (CheckViolation, MissingChargeSchedule) as exc:
             # Both are permanent, not transient: an unaffordable fill will
             # still be unaffordable on retry (barring a cash deposit this
@@ -418,6 +452,16 @@ async def _handle_tick_message(
     if not orders:
         return
     for order in list(orders):
+        if order.order_id not in book.order_index:
+            # Removed from the book since this tick's snapshot was taken
+            # -- almost always a `cancel` the control-channel consumer
+            # (a separate task; control can yield between orders in this
+            # loop) processed in between. Cheap, best-effort skip: this
+            # can only see a cancel this process already knows about.
+            # apply_fill's OrderNoLongerFillable guard is what closes the
+            # race for a cancel that committed elsewhere but hasn't
+            # reached this process yet.
+            continue
         decision = decide_fill(order, tick.price, tick.ts, slippage_bps)
         if decision is None:
             continue

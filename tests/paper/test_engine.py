@@ -49,6 +49,7 @@ from tests.paper.helpers import make_order, make_portfolio
 from trading.config import get_settings
 from trading.paper.engine import (
     OpenOrderBook,
+    _handle_tick_message,
     load_open_orders,
     run_engine,
     sweep_expired_day_orders,
@@ -775,6 +776,193 @@ def test_run_engine_new_control_message_adds_and_fills_an_order(setup_conn, conn
     try:
         fills = setup_conn.execute("SELECT 1 FROM fills WHERE order_id=%s", (order_id,)).fetchall()
         assert len(fills) == 1
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+# --- Fix round 2: a fill losing a race against a concurrent cancel -------
+
+
+def test_handle_tick_message_skips_an_order_removed_from_the_book_mid_snapshot(
+    setup_conn, conn_factory, monkeypatch
+) -> None:
+    """Layer 1 of the concurrent-cancel fix: `_handle_tick_message` snapshots
+    the resting orders for an instrument at tick start, then processes them
+    one at a time -- if the `orders:control` consumer (a separate asyncio
+    task) removes one from `book` in between, a cheap recheck against
+    `book.order_index` must skip it rather than fill it from the stale
+    snapshot.
+
+    Simulated deterministically rather than by racing two real asyncio
+    tasks: `apply_fill` is monkeypatched so that, as a side effect of
+    processing the *first* order, it removes the *second* order from the
+    very same `book` object passed into `_handle_tick_message` -- standing
+    in for "the control task ran in between." Calls `_handle_tick_message`
+    directly (not through `run_engine`) specifically so this test can hold
+    a reference to `book` and inspect/mutate it, which a full `run_engine`
+    run never exposes."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_crypto_instrument(setup_conn)
+    order_a = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    order_b = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+
+    book = OpenOrderBook()
+    book.add(order_a, meta=("CRYPTO", "BINANCE", "SPOT"))
+    book.add(order_b, meta=("CRYPTO", "BINANCE", "SPOT"))
+
+    import trading.paper.engine as engine_module
+
+    real_apply_fill = engine_module.apply_fill
+
+    def _apply_fill_with_concurrent_cancel(conn, order, decision, charges):
+        if order.order_id == order_a.order_id:
+            book.remove(order_b.order_id)  # simulate the concurrent cancel
+        return real_apply_fill(conn, order, decision, charges)
+
+    monkeypatch.setattr(engine_module, "apply_fill", _apply_fill_with_concurrent_cancel)
+
+    raw_tick = _tick_json(iid, datetime.now(UTC), "10.00")
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+
+    async def _run() -> None:
+        # Disconnect the pool inside the same asyncio.run() call that used
+        # it, not a separate one afterward -- a connection opened under
+        # this event loop cannot be closed from a different one (the same
+        # reasoning run_engine's own finally block documents).
+        await _handle_tick_message(conn_factory, async_redis, book, raw_tick, Decimal("0"))
+        await async_redis.connection_pool.disconnect()
+
+    try:
+        asyncio.run(_run())
+
+        a_fills = setup_conn.execute(
+            "SELECT 1 FROM fills WHERE order_id=%s", (order_a.order_id,)
+        ).fetchall()
+        assert len(a_fills) == 1  # order_a, processed first, still fills
+
+        # The proof of isolation: order_b was skipped via the in-memory
+        # recheck -- no fill, no DB write of any kind for it.
+        b_fills = setup_conn.execute(
+            "SELECT 1 FROM fills WHERE order_id=%s", (order_b.order_id,)
+        ).fetchall()
+        assert b_fills == []
+        b_status = setup_conn.execute(
+            "SELECT status FROM orders WHERE order_id=%s", (order_b.order_id,)
+        ).fetchone()
+        assert b_status == ("OPEN",)
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+def test_run_engine_loses_a_race_against_a_db_committed_cancel_and_fills_its_neighbour(
+    setup_conn, conn_factory
+) -> None:
+    """The tighter race Task 7's own report flagged: the API publishes
+    `cancel` on `orders:control` *before* its own commit
+    (`trading.streaming.db.get_db_connection` commits only after the route
+    body returns), so an order's real DB status can already be CANCELLED
+    before this process's control-channel subscription has delivered (or,
+    as here, will ever deliver) the cancel message. `flaky_order` stays in
+    the in-memory book the whole time -- layer 1's recheck cannot catch
+    this, only `apply_fill`'s own status-guarded UPDATE
+    (`OrderNoLongerFillable`) can.
+
+    `flaky_order` is created OPEN and loaded normally at startup (so it's
+    genuinely resting in the book, unlike the "new" control-message test's
+    scenario), then cancelled directly in the database -- with no
+    `orders:control` message ever published for it -- from inside the
+    publisher coroutine, after `run_engine`'s synchronous startup section
+    has already run and yielded control at its first `await`."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_crypto_instrument(setup_conn)
+    flaky_order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    healthy_order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    channel, pattern = _isolated_channel_and_pattern(iid)
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_engine(
+            async_redis,
+            conn_factory,
+            slippage_bps=Decimal("0"),
+            sleep=_no_sleep,
+            max_ticks=1,
+            pattern=pattern,
+            sweep_check_seconds=9999.0,
+        )
+
+        async def _cancel_then_publish() -> None:
+            await asyncio.sleep(0.2)  # let run_engine's startup load finish first
+            setup_conn.execute(
+                "UPDATE orders SET status='CANCELLED' WHERE order_id=%s",
+                (flaky_order.order_id,),
+            )
+            r = redis.Redis.from_url(get_settings().redis_url, decode_responses=True)
+            try:
+                r.publish(channel, _tick_json(iid, datetime.now(UTC), "10.00"))
+            finally:
+                r.close()
+
+        with structlog.testing.capture_logs() as cap:
+            asyncio.run(_run_both(loop_task, _cancel_then_publish()))
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    try:
+        flaky_row = setup_conn.execute(
+            "SELECT status FROM orders WHERE order_id=%s", (flaky_order.order_id,)
+        ).fetchone()
+        assert flaky_row == ("CANCELLED",)  # never overwritten with FILLED
+        flaky_fills = setup_conn.execute(
+            "SELECT 1 FROM fills WHERE order_id=%s", (flaky_order.order_id,)
+        ).fetchall()
+        assert flaky_fills == []
+
+        # The proof of isolation: the healthy neighbour still filled on
+        # the very same tick, despite flaky_order's lost race.
+        healthy_fills = setup_conn.execute(
+            "SELECT 1 FROM fills WHERE order_id=%s", (healthy_order.order_id,)
+        ).fetchall()
+        assert len(healthy_fills) == 1
+
+        warnings = [e for e in cap if e.get("event") == "paper_engine.fill_lost_race"]
+        assert len(warnings) == 1
     finally:
         _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
 

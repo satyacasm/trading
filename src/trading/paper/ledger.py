@@ -8,6 +8,21 @@ is only acceptable because `replay_portfolio` can prove it never drifted.
 boundary -- that is what lets the engine commit fill, ledger, position,
 cash, and order status as one unit, and what lets tests roll back.
 
+The final order-status write is guarded by an optimistic-concurrency
+check (`WHERE status IN ('OPEN','PARTIALLY_FILLED','PENDING')`, rowcount
+checked): a fill is decided against a snapshot of `order` that can go
+stale before this transaction's last statement runs -- concretely, the
+paper_engine holds orders in memory and reacts to a Redis `cancel`
+message that can outrace the API's own commit of `CANCELLED` (see
+`trading.streaming.db.get_db_connection`, which commits only after the
+route body returns). Without this guard, that race lets a fill silently
+overwrite a user's cancellation. `apply_fill` raises
+`OrderNoLongerFillable` when the guard trips, rather than silently
+no-op'ing, so the caller's `except` rolls back the whole transaction --
+the fill row, cash update, ledger entry, and position update this
+function already wrote must never survive an order that turned out not
+to be fillable after all.
+
 `avg_cost`, `realised_pnl`, and `cash_balance` are quantized to the same
 four decimal places as their `NUMERIC(18,4)` columns, at every mutation,
 using the same `ROUND_HALF_UP` convention `trading.paper.charges` uses.
@@ -64,6 +79,24 @@ _MONEY_DP = Decimal("0.0001")
 
 def _quantize(value: Decimal) -> Decimal:
     return value.quantize(_MONEY_DP, rounding=ROUND_HALF_UP)
+
+
+class OrderNoLongerFillable(Exception):
+    """`apply_fill`'s final order-status UPDATE found the order was no
+    longer OPEN/PARTIALLY_FILLED/PENDING -- something else (a `cancel`
+    that committed after this fill's decision was made, most concretely)
+    changed its status concurrently, between the caller reading it into
+    memory and this transaction's final write.
+
+    Raised, not silently ignored, specifically so the caller's `except`
+    block rolls back the *whole* transaction: the fill row, cash update,
+    ledger entry, and position update this function already wrote (all
+    still uncommitted at this point) must never survive if the order they
+    belong to turned out to no longer be fillable. This is optimistic
+    concurrency control, not an error condition -- the caller should treat
+    it as "the system did the right thing," not as a failure to log and
+    retry.
+    """
 
 
 def apply_fill(
@@ -129,11 +162,31 @@ def apply_fill(
 
     filled = order.filled_quantity + decision.quantity
     status = OrderStatus.FILLED if filled >= order.quantity else OrderStatus.PARTIALLY_FILLED
-    conn.execute(
+    # Optimistic concurrency control: this fill was decided against a
+    # snapshot of `order` that may already be stale by the time this
+    # transaction reaches its final write -- most concretely, a `cancel`
+    # that committed on another connection in between. The status guard
+    # below is what actually closes that race (an in-memory recheck in the
+    # caller is best-effort only; it cannot see a commit made by another
+    # process). A 0 rowcount means the order changed underneath us.
+    cursor = conn.execute(
         "UPDATE orders SET filled_quantity = %s, status = %s, updated_at = now()"
-        " WHERE order_id = %s",
-        (filled, status.value, order.order_id),
+        " WHERE order_id = %s"
+        "   AND status IN (%s, %s, %s)",
+        (
+            filled,
+            status.value,
+            order.order_id,
+            OrderStatus.OPEN.value,
+            OrderStatus.PARTIALLY_FILLED.value,
+            OrderStatus.PENDING.value,
+        ),
     )
+    if cursor.rowcount == 0:
+        raise OrderNoLongerFillable(
+            f"order {order.order_id} is no longer OPEN/PARTIALLY_FILLED/PENDING; "
+            "refusing to overwrite its status with a fill decided before that change"
+        )
     return fill_id
 
 

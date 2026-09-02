@@ -51,6 +51,20 @@ still in the book, retried on the next tick), and, critically, a healthy
 neighbour resting on the same instrument still fills on the *same* tick
 instead of being starved by the first order's trouble.
 
+**The circuit breaker (Task 10) is evaluated on a 5-second timer and
+immediately after every fill**, never per-tick -- a threshold that moves
+in minutes doesn't need ~107 evaluations a second. `evaluate_breaker_for_
+portfolio` is the one function both triggers call; on a breach it calls
+`trading.paper.breaker.trip` (database-only: pauses the portfolio,
+cancels its resting orders, writes a `circuit_breaker_events` row) and
+then, critically, drops every order belonging to that `portfolio_id` from
+this process's in-memory `book` directly -- the same class of bug this
+module has already been bitten by twice: a DB-only cancel the in-memory
+book never hears about still fills on the next tick, doing the opposite
+of what was intended. `apply_fill`'s `OrderNoLongerFillable` guard would
+catch a stale fill at the database layer as a backstop, but the book is
+never allowed to rely on it here.
+
 **A fill can lose a race against a concurrent cancel -- closed in two
 layers.** `_handle_tick_message` snapshots the resting orders for an
 instrument at tick start, then `await`s each fill in turn; the
@@ -90,11 +104,20 @@ from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
 
 from trading.config import get_settings
+from trading.paper.breaker import (
+    REASON_MAX_DAILY_LOSS,
+    MissingMark,
+    compute_equity,
+    evaluate_breach,
+    load_day_open_equity,
+    record_snapshot,
+    trip,
+)
 from trading.paper.charges import MissingChargeSchedule, compute_charges, load_schedules
 from trading.paper.enums import OrderStatus, OrderType, Product, Side, TimeInForce
 from trading.paper.fills import decide_fill
 from trading.paper.ledger import OrderNoLongerFillable, apply_fill
-from trading.paper.models import FillDecision, Order
+from trading.paper.models import FillDecision, Order, Position
 from trading.streaming.models import Tick
 
 log = structlog.get_logger(__name__)
@@ -126,6 +149,12 @@ _ORDER_COLUMNS = (
     " filled_quantity, limit_price, product, time_in_force, status,"
     " rationale, submitted_at"
 )
+
+# Matches trading.paper.api's own literal-string status check -- no
+# PortfolioStatus enum exists in this codebase (trading.paper.enums has
+# none, and portfolios.status has no CHECK constraint), so this mirrors
+# the established convention rather than introducing a new one here.
+_PORTFOLIO_STATUS_ACTIVE = "ACTIVE"
 
 
 async def _default_sleep(seconds: float) -> None:
@@ -190,6 +219,169 @@ def _load_instrument_meta(conn: Connection, instrument_id: int) -> tuple[str, st
     ).fetchone()
     assert row is not None, f"order references instrument_id={instrument_id}, which doesn't exist"
     return (row[0], row[1], row[2])
+
+
+def _load_positions(conn: Connection, portfolio_id: int) -> list[Position]:
+    rows = conn.execute(
+        "SELECT instrument_id, quantity, avg_cost, realised_pnl"
+        " FROM positions WHERE portfolio_id = %s",
+        (portfolio_id,),
+    ).fetchall()
+    return [
+        Position(
+            portfolio_id=portfolio_id,
+            instrument_id=instrument_id,
+            quantity=quantity,
+            avg_cost=avg_cost,
+            realised_pnl=realised_pnl,
+        )
+        for instrument_id, quantity, avg_cost, realised_pnl in rows
+    ]
+
+
+def _load_marks(conn: Connection, positions: Sequence[Position]) -> dict[int, Decimal]:
+    """Latest `bars_intraday` close per held instrument -- the same
+    "reference price" source `trading.paper.api._require_sufficient_cash`
+    already uses for a MARKET order's submit-time cash estimate. A
+    position with `quantity == 0` needs no mark (see `compute_equity`),
+    so it's skipped here too rather than spending a query on it. A
+    position with no `bars_intraday` row at all is simply left out of the
+    returned mapping -- `compute_equity` is what turns that into a loud
+    `MissingMark`, not this loader.
+    """
+    marks: dict[int, Decimal] = {}
+    for position in positions:
+        if position.quantity == 0:
+            continue
+        row = conn.execute(
+            "SELECT close FROM bars_intraday WHERE instrument_id = %s ORDER BY ts DESC LIMIT 1",
+            (position.instrument_id,),
+        ).fetchone()
+        if row is not None:
+            marks[position.instrument_id] = row[0]
+    return marks
+
+
+def _drop_portfolio_orders_from_book(book: OpenOrderBook, portfolio_id: int) -> list[int]:
+    """Every order belonging to `portfolio_id`, across every instrument,
+    removed from `book` directly. This is the engine-side half of a trip:
+    `trading.paper.breaker.trip` only ever touches the database, so
+    nothing removes a just-cancelled order from this process's in-memory
+    book unless this function (or its caller) does -- see the module
+    docstring's circuit-breaker paragraph for why that gap is dangerous.
+    """
+    order_ids = [
+        order.order_id
+        for orders in book.open_orders.values()
+        for order in orders
+        if order.portfolio_id == portfolio_id
+    ]
+    for order_id in order_ids:
+        book.remove(order_id)
+    return order_ids
+
+
+def evaluate_breaker_for_portfolio(
+    conn_factory: ConnFactory, book: OpenOrderBook, portfolio_id: int, now: datetime
+) -> None:
+    """Snapshot `portfolio_id`'s equity, then pause it if that snapshot
+    breaches its declared limits -- the one function both the 5-second
+    timer and the post-fill trigger call.
+
+    Already-`PAUSED`, `LIQUIDATED`, or otherwise non-`ACTIVE` portfolios
+    are skipped entirely: re-evaluating a paused portfolio would either
+    no-op harmlessly against `trip`'s own idempotent UPDATEs, or -- worse,
+    if a status ever gained meaning beyond "paused" -- silently write a
+    second `circuit_breaker_events` row for a portfolio that already
+    stopped trading. `record_snapshot` still ought to run for every
+    *active* portfolio's equity curve (Phase 3 needs the history), but a
+    paused portfolio's curve is frozen by construction: nothing can
+    change its cash or positions once every resting order is cancelled.
+
+    A `MissingMark` (a held position with no available price) is caught
+    here, logged, and swallowed -- not re-raised -- exactly like every
+    other per-item failure in this engine (a malformed tick, a rejected
+    fill): one portfolio's pricing gap must never abort the sweep for its
+    neighbours, and must certainly never crash the loop.
+    """
+    conn = conn_factory()
+    reason: str | None = None
+    try:
+        row = conn.execute(
+            "SELECT cash_balance, status, max_daily_loss, max_drawdown_pct"
+            " FROM portfolios WHERE portfolio_id = %s",
+            (portfolio_id,),
+        ).fetchone()
+        if row is None:
+            return
+        cash, portfolio_status, max_daily_loss, max_drawdown_pct = row
+        if portfolio_status != _PORTFOLIO_STATUS_ACTIVE:
+            return
+
+        positions = _load_positions(conn, portfolio_id)
+        marks = _load_marks(conn, positions)
+        equity = compute_equity(cash, positions, marks)
+
+        day_open_equity = load_day_open_equity(conn, portfolio_id, now)
+        peak_equity = record_snapshot(conn, portfolio_id, now, equity)
+        reason = evaluate_breach(
+            equity, day_open_equity, peak_equity, max_daily_loss, max_drawdown_pct
+        )
+        if reason is not None:
+            # evaluate_breach prefixes its reason with whichever limit
+            # breached, precisely so this decision doesn't have to
+            # re-derive which one it was.
+            threshold = (
+                max_daily_loss if reason.startswith(REASON_MAX_DAILY_LOSS) else max_drawdown_pct
+            )
+            assert threshold is not None, f"breach reason {reason!r} named a limit that is None"
+            trip(conn, portfolio_id, reason, equity, threshold)
+        conn.commit()
+    except MissingMark as exc:
+        conn.rollback()
+        log.warning("paper_engine.breaker_missing_mark", portfolio_id=portfolio_id, reason=str(exc))
+        return
+    finally:
+        conn.close()
+
+    if reason is not None:
+        dropped = _drop_portfolio_orders_from_book(book, portfolio_id)
+        log.warning(
+            "paper_engine.breaker_tripped",
+            portfolio_id=portfolio_id,
+            reason=reason,
+            dropped_order_ids=dropped,
+        )
+
+
+def evaluate_breaker_for_all_active_portfolios(
+    conn_factory: ConnFactory, book: OpenOrderBook, now: datetime
+) -> None:
+    """The 5-second timer's entry point: every `ACTIVE` portfolio, each
+    evaluated in its own transaction so one portfolio's failure -- a
+    missing mark, a transient DB error -- can never block its
+    neighbours, mirroring `_handle_tick_message`'s per-order isolation.
+    """
+    conn = conn_factory()
+    try:
+        portfolio_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT portfolio_id FROM portfolios WHERE status = %s",
+                (_PORTFOLIO_STATUS_ACTIVE,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    for portfolio_id in portfolio_ids:
+        try:
+            evaluate_breaker_for_portfolio(conn_factory, book, portfolio_id, now)
+        except Exception as exc:  # noqa: BLE001 - one portfolio's failure must never block its
+            # neighbours, and must never kill the periodic check itself.
+            log.warning(
+                "paper_engine.breaker_check_failed", portfolio_id=portfolio_id, reason=str(exc)
+            )
 
 
 @dataclass
@@ -424,6 +616,20 @@ async def _process_fill(
     else:
         book.replace(order.model_copy(update={"filled_quantity": filled, "status": status}))
 
+    # Circuit breaker, trigger 2 of 2 -- "immediately after every fill" (see
+    # the module docstring). A failure here must never suppress a fill that
+    # already committed; the fill is real regardless of whether the
+    # portfolio can be evaluated for a breach right now.
+    try:
+        evaluate_breaker_for_portfolio(conn_factory, book, order.portfolio_id, datetime.now(UTC))
+    except Exception as exc:  # noqa: BLE001 - see comment above
+        log.warning(
+            "paper_engine.post_fill_breaker_check_failed",
+            order_id=order.order_id,
+            portfolio_id=order.portfolio_id,
+            reason=str(exc),
+        )
+
     payload = {
         "fill_id": fill_id,
         "order_id": order.order_id,
@@ -544,6 +750,7 @@ async def run_engine(
     *,
     slippage_bps: Decimal = Decimal("5"),
     sweep_check_seconds: float = 30.0,
+    breaker_check_seconds: float = 5.0,
     sleep: Sleeper = _default_sleep,
     max_ticks: int | None = None,
     pattern: str = _TICK_PATTERN,
@@ -610,6 +817,14 @@ async def run_engine(
             finally:
                 sweep_conn.close()
 
+    async def _periodic_breaker_check() -> None:
+        while not done.is_set():
+            await sleep(breaker_check_seconds)
+            try:
+                evaluate_breaker_for_all_active_portfolios(conn_factory, book, datetime.now(UTC))
+            except Exception as exc:  # noqa: BLE001 - a breaker-check failure must never kill the loop
+                log.warning("paper_engine.breaker_sweep_failed", reason=str(exc))
+
     tick_pubsub = redis.pubsub()
     await tick_pubsub.psubscribe(pattern)
     control_pubsub = redis.pubsub()
@@ -618,15 +833,17 @@ async def run_engine(
     tick_task = asyncio.create_task(_consume_ticks(tick_pubsub))
     control_task = asyncio.create_task(_consume_control(control_pubsub))
     sweep_task = asyncio.create_task(_periodic_sweep())
+    breaker_task = asyncio.create_task(_periodic_breaker_check())
     try:
         if max_ticks is None:
-            await asyncio.gather(tick_task, control_task, sweep_task)
+            await asyncio.gather(tick_task, control_task, sweep_task, breaker_task)
         else:
             await done.wait()
     finally:
         tick_task.cancel()
         control_task.cancel()
         sweep_task.cancel()
+        breaker_task.cancel()
         try:
             await tick_pubsub.punsubscribe()
             await tick_pubsub.aclose()  # type: ignore[no-untyped-call]

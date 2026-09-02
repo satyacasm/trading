@@ -47,9 +47,12 @@ from redis.asyncio import Redis as AsyncRedis
 
 from tests.paper.helpers import make_order, make_portfolio
 from trading.config import get_settings
+from trading.contracts.enums import DataSource
 from trading.paper.engine import (
     OpenOrderBook,
     _handle_tick_message,
+    evaluate_breaker_for_all_active_portfolios,
+    evaluate_breaker_for_portfolio,
     load_open_orders,
     run_engine,
     sweep_expired_day_orders,
@@ -151,6 +154,12 @@ def _mark_market_open_today(conn: Connection, session_close: str = "15:30") -> N
 
 def _cleanup(conn: Connection, *, portfolio_ids: list[int], instrument_ids: list[int]) -> None:
     if portfolio_ids:
+        conn.execute(
+            "DELETE FROM circuit_breaker_events WHERE portfolio_id = ANY(%s)", (portfolio_ids,)
+        )
+        conn.execute(
+            "DELETE FROM portfolio_equity_snapshots WHERE portfolio_id = ANY(%s)", (portfolio_ids,)
+        )
         conn.execute("DELETE FROM ledger_entries WHERE portfolio_id = ANY(%s)", (portfolio_ids,))
         conn.execute(
             "DELETE FROM fills WHERE order_id IN"
@@ -161,6 +170,7 @@ def _cleanup(conn: Connection, *, portfolio_ids: list[int], instrument_ids: list
         conn.execute("DELETE FROM orders WHERE portfolio_id = ANY(%s)", (portfolio_ids,))
         conn.execute("DELETE FROM portfolios WHERE portfolio_id = ANY(%s)", (portfolio_ids,))
     if instrument_ids:
+        conn.execute("DELETE FROM bars_intraday WHERE instrument_id = ANY(%s)", (instrument_ids,))
         conn.execute("DELETE FROM instruments WHERE instrument_id = ANY(%s)", (instrument_ids,))
     # `_mark_market_open_today` writes to a private 'TEST-NSE'/'CM' pair
     # (never the real 'NSE'/'CM' other tests -- e.g. test_api.py's
@@ -1271,3 +1281,372 @@ def test_run_engine_sweeps_a_day_order_via_the_periodic_check(setup_conn, conn_f
         assert fills == []
     finally:
         _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+# --- Task 10: circuit breaker wiring -----------------------------------------
+
+
+def _insert_bar(
+    conn: Connection, instrument_id: int, close: Decimal, ts: datetime | None = None
+) -> None:
+    conn.execute(
+        "INSERT INTO bars_intraday"
+        " (instrument_id, ts, interval_sec, open, high, low, close, source)"
+        " VALUES (%s, %s, 60, %s, %s, %s, %s, %s)",
+        (
+            instrument_id,
+            ts or datetime.now(UTC),
+            close,
+            close,
+            close,
+            close,
+            int(DataSource.BINANCE_WS),
+        ),
+    )
+
+
+def test_evaluate_breaker_for_portfolio_trips_drops_the_book_and_prevents_a_later_fill(
+    setup_conn, conn_factory
+) -> None:
+    """The cross-boundary requirement the brief calls out explicitly:
+    `trip` only ever touches the database, so `evaluate_breaker_for_
+    portfolio` must drop the tripped portfolio's orders from the
+    in-memory `book` itself -- proven here by feeding a tick for the same
+    instrument straight into `_handle_tick_message` afterwards and
+    asserting it produces no fill, not merely by asserting the DB state.
+    """
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    setup_conn.execute(
+        "UPDATE portfolios SET max_daily_loss = %s, cash_balance = %s WHERE portfolio_id = %s",
+        (Decimal("100"), Decimal("89000"), pid),  # a pre-existing 11000 loss, no positions
+    )
+    iid = _make_crypto_instrument(setup_conn)
+    order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    book = OpenOrderBook()
+    book.add(order, meta=("CRYPTO", "BINANCE", "SPOT"))
+    try:
+        with structlog.testing.capture_logs() as cap:
+            evaluate_breaker_for_portfolio(conn_factory, book, pid, _T0)
+
+        status = setup_conn.execute(
+            "SELECT status FROM portfolios WHERE portfolio_id=%s", (pid,)
+        ).fetchone()
+        assert status == ("PAUSED",)
+
+        order_status = setup_conn.execute(
+            "SELECT status FROM orders WHERE order_id=%s", (order.order_id,)
+        ).fetchone()
+        assert order_status == ("CANCELLED",)
+
+        event = setup_conn.execute(
+            "SELECT reason FROM circuit_breaker_events WHERE portfolio_id=%s", (pid,)
+        ).fetchone()
+        assert event is not None
+        assert event[0].startswith("max_daily_loss")
+
+        # Dropped from the in-memory book, not merely cancelled in the DB.
+        assert iid not in book.open_orders
+        assert order.order_id not in book.order_index
+
+        tripped_logs = [e for e in cap if e.get("event") == "paper_engine.breaker_tripped"]
+        assert len(tripped_logs) == 1
+
+        # The proof that actually matters: a tick for this instrument, fed
+        # straight into the engine's tick handler, produces no fill --
+        # not "the DB says CANCELLED", but "the running engine cannot
+        # possibly fill this order again".
+        raw_tick = _tick_json(iid, datetime.now(UTC), "10.00")
+        async_redis: AsyncRedis = AsyncRedis.from_url(
+            get_settings().redis_url, decode_responses=True
+        )
+
+        async def _run() -> None:
+            await _handle_tick_message(conn_factory, async_redis, book, raw_tick, Decimal("0"))
+            await async_redis.connection_pool.disconnect()
+
+        asyncio.run(_run())
+
+        fills = setup_conn.execute(
+            "SELECT 1 FROM fills WHERE order_id=%s", (order.order_id,)
+        ).fetchall()
+        assert fills == []
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+def test_evaluate_breaker_for_portfolio_marks_positions_from_bars_intraday(
+    setup_conn, conn_factory
+) -> None:
+    """No limits are set, so this never breaches -- the point is proving
+    the engine's own mark-sourcing (`bars_intraday`, the same reference
+    price `trading.paper.api._require_sufficient_cash` already uses)
+    feeds `compute_equity` correctly, by reading back the persisted
+    snapshot's equity."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_crypto_instrument(setup_conn)
+    setup_conn.execute(
+        "INSERT INTO positions (portfolio_id, instrument_id, quantity, avg_cost, realised_pnl)"
+        " VALUES (%s, %s, %s, %s, 0)",
+        (pid, iid, Decimal("10"), Decimal("90")),
+    )
+    _insert_bar(setup_conn, iid, Decimal("100.00"))
+    book = OpenOrderBook()
+    try:
+        evaluate_breaker_for_portfolio(conn_factory, book, pid, _T0)
+
+        status = setup_conn.execute(
+            "SELECT status FROM portfolios WHERE portfolio_id=%s", (pid,)
+        ).fetchone()
+        assert status == ("ACTIVE",)  # no limits declared -- never breaches
+
+        row = setup_conn.execute(
+            "SELECT equity, peak_equity, drawdown_pct FROM portfolio_equity_snapshots"
+            " WHERE portfolio_id=%s AND ts=%s",
+            (pid, _T0),
+        ).fetchone()
+        # cash 100000 + 10 * 100.00 mark = 101000
+        assert row == (Decimal("101000.0000"), Decimal("101000.0000"), Decimal("0.0000"))
+    finally:
+        setup_conn.execute("DELETE FROM positions WHERE portfolio_id=%s", (pid,))
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+def test_evaluate_breaker_for_portfolio_skips_and_logs_on_a_missing_mark(
+    setup_conn, conn_factory
+) -> None:
+    """A held position with no `bars_intraday` row at all must not crash
+    the evaluation, pause the portfolio, or write a snapshot with a
+    fabricated equity -- it is logged and skipped, retried on the next
+    cycle once a mark becomes available."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_crypto_instrument(setup_conn)
+    setup_conn.execute(
+        "INSERT INTO positions (portfolio_id, instrument_id, quantity, avg_cost, realised_pnl)"
+        " VALUES (%s, %s, %s, %s, 0)",
+        (pid, iid, Decimal("10"), Decimal("90")),
+    )
+    book = OpenOrderBook()
+    try:
+        with structlog.testing.capture_logs() as cap:
+            evaluate_breaker_for_portfolio(conn_factory, book, pid, _T0)
+
+        status = setup_conn.execute(
+            "SELECT status FROM portfolios WHERE portfolio_id=%s", (pid,)
+        ).fetchone()
+        assert status == ("ACTIVE",)
+
+        snapshots = setup_conn.execute(
+            "SELECT 1 FROM portfolio_equity_snapshots WHERE portfolio_id=%s", (pid,)
+        ).fetchall()
+        assert snapshots == []  # no equity value was ever computable
+
+        warnings = [e for e in cap if e.get("event") == "paper_engine.breaker_missing_mark"]
+        assert len(warnings) == 1
+    finally:
+        setup_conn.execute("DELETE FROM positions WHERE portfolio_id=%s", (pid,))
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+def test_evaluate_breaker_for_all_active_portfolios_isolates_failures_between_portfolios(
+    setup_conn, conn_factory
+) -> None:
+    """One portfolio's `MissingMark` must never block evaluating (and
+    tripping) a healthy neighbour in the same sweep."""
+    broken_pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_crypto_instrument(setup_conn)
+    setup_conn.execute(
+        "INSERT INTO positions (portfolio_id, instrument_id, quantity, avg_cost, realised_pnl)"
+        " VALUES (%s, %s, %s, %s, 0)",
+        (broken_pid, iid, Decimal("10"), Decimal("90")),
+    )  # no bars_intraday row -- this portfolio can never be priced
+
+    breaching_pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    setup_conn.execute(
+        "UPDATE portfolios SET max_daily_loss = %s, cash_balance = %s WHERE portfolio_id = %s",
+        (Decimal("100"), Decimal("50000"), breaching_pid),
+    )
+    book = OpenOrderBook()
+    try:
+        with structlog.testing.capture_logs() as cap:
+            evaluate_breaker_for_all_active_portfolios(conn_factory, book, _T0)
+
+        broken_status = setup_conn.execute(
+            "SELECT status FROM portfolios WHERE portfolio_id=%s", (broken_pid,)
+        ).fetchone()
+        assert broken_status == ("ACTIVE",)  # left alone, not crashed
+
+        breaching_status = setup_conn.execute(
+            "SELECT status FROM portfolios WHERE portfolio_id=%s", (breaching_pid,)
+        ).fetchone()
+        assert breaching_status == ("PAUSED",)  # still tripped despite its neighbour's failure
+
+        warnings = [e for e in cap if e.get("event") == "paper_engine.breaker_missing_mark"]
+        assert len(warnings) == 1
+    finally:
+        setup_conn.execute("DELETE FROM positions WHERE portfolio_id=%s", (broken_pid,))
+        _cleanup(setup_conn, portfolio_ids=[broken_pid, breaching_pid], instrument_ids=[iid])
+
+
+def test_run_engine_periodic_breaker_check_trips_a_breaching_portfolio(
+    setup_conn, conn_factory
+) -> None:
+    """No fill or tick for the resting order's own instrument ever
+    arrives -- only the 5-second (here, 0.05s) periodic check can trip
+    this portfolio. Mirrors `test_run_engine_sweeps_a_day_order_via_the_
+    periodic_check`'s structure: a short check interval, a real
+    `asyncio.sleep`, genuinely waiting for the window, then an unrelated
+    tick purely to terminate the loop via `max_ticks=1`."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    setup_conn.execute(
+        "UPDATE portfolios SET max_daily_loss = %s, cash_balance = %s WHERE portfolio_id = %s",
+        (Decimal("100"), Decimal("50000"), pid),
+    )
+    iid = _make_crypto_instrument(setup_conn)
+    order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    try:
+        async_redis: AsyncRedis = AsyncRedis.from_url(
+            get_settings().redis_url, decode_responses=True
+        )
+        try:
+            loop_task = run_engine(
+                async_redis,
+                conn_factory,
+                slippage_bps=Decimal("0"),
+                sleep=asyncio.sleep,
+                max_ticks=1,
+                pattern=pattern,
+                sweep_check_seconds=9999.0,
+                breaker_check_seconds=0.05,
+            )
+
+            async def _publish_after_subscribed() -> None:
+                await asyncio.sleep(0.3)  # give the breaker a few cycles to run
+                r = redis.Redis.from_url(get_settings().redis_url, decode_responses=True)
+                try:
+                    r.publish(channel, _tick_json(iid, datetime.now(UTC), "10.00"))
+                finally:
+                    r.close()
+
+            asyncio.run(_run_both(loop_task, _publish_after_subscribed()))
+        finally:
+            asyncio.run(async_redis.aclose())
+
+        status = setup_conn.execute(
+            "SELECT status FROM portfolios WHERE portfolio_id=%s", (pid,)
+        ).fetchone()
+        assert status == ("PAUSED",)
+
+        order_status = setup_conn.execute(
+            "SELECT status FROM orders WHERE order_id=%s", (order.order_id,)
+        ).fetchone()
+        assert order_status == ("CANCELLED",)
+
+        # The order was already dropped from the book by the periodic
+        # check, well before the terminating tick arrived.
+        fills = setup_conn.execute(
+            "SELECT 1 FROM fills WHERE order_id=%s", (order.order_id,)
+        ).fetchall()
+        assert fills == []
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+def test_run_engine_evaluates_the_breaker_after_a_fill_and_prevents_a_later_fill_elsewhere(
+    setup_conn, conn_factory
+) -> None:
+    """`evaluate_breaker_for_portfolio` runs immediately after every fill
+    (the other of the two required triggers). A crypto DELIVERY fill
+    always pays a real brokerage charge (migration 0007 seeds 0.1% for
+    BINANCE, and nothing else), which alone is enough to breach a
+    deliberately tiny `max_daily_loss` -- proving the post-fill trigger
+    works without needing to fabricate a price move. `order_two`, resting
+    on a *different* instrument for the same portfolio, must not fill on
+    a later, separate tick once the portfolio is paused."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    setup_conn.execute(
+        "UPDATE portfolios SET max_daily_loss = %s WHERE portfolio_id = %s",
+        (Decimal("0.01"), pid),
+    )
+    iid_one = _make_crypto_instrument(setup_conn)
+    iid_two = _make_crypto_instrument(setup_conn)
+    _insert_bar(setup_conn, iid_one, Decimal("100.00"))
+    order_one = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid_one,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    order_two = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid_two,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    run_id = next(_seq)
+    pattern = f"test-ticks-breaker:{run_id}:*"
+    channel_one = f"test-ticks-breaker:{run_id}:{iid_one}"
+    channel_two = f"test-ticks-breaker:{run_id}:{iid_two}"
+    try:
+        _run_engine_with_publish(
+            conn_factory=conn_factory,
+            max_ticks=2,
+            publish=[
+                (channel_one, _tick_json(iid_one, datetime.now(UTC), "100.00")),
+                (channel_two, _tick_json(iid_two, datetime.now(UTC), "10.00")),
+            ],
+            pattern=pattern,
+        )
+
+        one_fills = setup_conn.execute(
+            "SELECT 1 FROM fills WHERE order_id=%s", (order_one.order_id,)
+        ).fetchall()
+        assert len(one_fills) == 1  # the triggering fill itself still happened
+
+        status = setup_conn.execute(
+            "SELECT status FROM portfolios WHERE portfolio_id=%s", (pid,)
+        ).fetchone()
+        assert status == ("PAUSED",)
+
+        two_status = setup_conn.execute(
+            "SELECT status FROM orders WHERE order_id=%s", (order_two.order_id,)
+        ).fetchone()
+        assert two_status == ("CANCELLED",)
+
+        two_fills = setup_conn.execute(
+            "SELECT 1 FROM fills WHERE order_id=%s", (order_two.order_id,)
+        ).fetchall()
+        assert two_fills == []
+
+        event = setup_conn.execute(
+            "SELECT reason FROM circuit_breaker_events WHERE portfolio_id=%s", (pid,)
+        ).fetchone()
+        assert event is not None and event[0].startswith("max_daily_loss")
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid_one, iid_two])

@@ -16,6 +16,7 @@ import pytest
 from psycopg import Connection
 
 from trading.paper.charges import (
+    AmbiguousChargeSchedule,
     MissingChargeSchedule,
     compute_charges,
     load_schedules,
@@ -132,6 +133,57 @@ def test_dp_charge_is_flat_and_sell_side_only() -> None:
     assert buy.dp_charges == Decimal("0")
 
 
+def test_scrip_day_charge_is_zeroed_when_already_applied_today() -> None:
+    """IMP-4: FLAT_PER_SCRIP_PER_DAY (DP charges) was implemented
+    identically to FLAT_PER_ORDER -- charged on every fill, not once per
+    scrip per day. Two same-day delivery sells of one scrip must be
+    charged DP only on the first; the caller (trading.paper.engine) tells
+    compute_charges this via `scrip_day_charge_already_applied`, since
+    compute_charges itself stays pure and must not query the database."""
+    s = [_sched(ChargeType.DP_CHARGES, ChargeBasis.FLAT_PER_SCRIP_PER_DAY, "SELL", "20")]
+    first = compute_charges(s, Side.SELL, Decimal("5"), Decimal("100"))
+    second = compute_charges(
+        s, Side.SELL, Decimal("5"), Decimal("100"), scrip_day_charge_already_applied=True
+    )
+    assert first.dp_charges == Decimal("20.00")
+    assert second.dp_charges == Decimal("0")
+
+
+def test_scrip_day_charge_flag_does_not_affect_flat_per_order_charges() -> None:
+    """The dedup flag is scoped to FLAT_PER_SCRIP_PER_DAY specifically --
+    a FLAT_PER_ORDER charge (e.g. brokerage) must still apply on every
+    fill regardless of the flag."""
+    s = [_sched(ChargeType.BROKERAGE, ChargeBasis.FLAT_PER_ORDER, "BOTH", "20")]
+    b = compute_charges(
+        s, Side.BUY, Decimal("5"), Decimal("100"), scrip_day_charge_already_applied=True
+    )
+    assert b.brokerage == Decimal("20.00")
+
+
+def test_gst_falls_when_scrip_day_charge_already_applied() -> None:
+    """The GST-DP interaction the brief calls out explicitly: GST's base
+    includes DP_CHARGES for delivery, so when DP is zeroed on the second
+    same-day sell, GST must fall correspondingly rather than being
+    computed against the first sell's (no-longer-applicable) DP amount."""
+    s = [
+        _sched(ChargeType.BROKERAGE, ChargeBasis.FLAT_PER_ORDER, "BOTH", "20"),
+        _sched(ChargeType.DP_CHARGES, ChargeBasis.FLAT_PER_SCRIP_PER_DAY, "SELL", "20"),
+        _sched(
+            ChargeType.GST,
+            ChargeBasis.PERCENT_OF_CHARGES,
+            "BOTH",
+            "0.18",
+            gst_base=(ChargeType.BROKERAGE, ChargeType.DP_CHARGES),
+        ),
+    ]
+    first = compute_charges(s, Side.SELL, Decimal("5"), Decimal("100"))
+    second = compute_charges(
+        s, Side.SELL, Decimal("5"), Decimal("100"), scrip_day_charge_already_applied=True
+    )
+    assert first.gst == Decimal("7.20")  # 18% of (20 brokerage + 20 dp)
+    assert second.gst == Decimal("3.60")  # 18% of (20 brokerage + 0 dp)
+
+
 def test_empty_schedule_list_raises_rather_than_returning_zero() -> None:
     """A missing schedule must fail loudly. Treating it as zero yields a
     P&L that looks fine and is systematically optimistic."""
@@ -215,6 +267,26 @@ def test_load_schedules_splits_comma_separated_gst_base_types(db_conn: Connectio
         ChargeType.DP_CHARGES,
         ChargeType.IPFT,
     )
+
+
+@pytest.mark.db
+def test_load_schedules_raises_ambiguous_on_overlapping_rows_for_one_charge_type(
+    db_conn: Connection,
+) -> None:
+    """IMP-3: the trigger is the charge_schedules table's own reason for
+    existing -- a future rate revision that forgets to close off the
+    previous row's effective_to. Two in-force rows for the same charge
+    type on the same date must never be silently resolved by whichever
+    order Postgres happens to return them in; the loader must refuse."""
+    db_conn.execute(
+        "INSERT INTO charge_schedules (broker, exchange, asset_class, product,"
+        " charge_type, basis, applies_to_side, rate, cap, rounding,"
+        " gst_base_types, effective_from, effective_to, source_note)"
+        " VALUES ('UPSTOX','NSE','EQUITY','DELIVERY','BROKERAGE','FLAT_PER_ORDER',"
+        " 'BOTH', 25, NULL, 'TWO_DECIMALS', NULL, '2026-01-01', NULL, 'dup test')"
+    )
+    with pytest.raises(AmbiguousChargeSchedule):
+        load_schedules(db_conn, "UPSTOX", "NSE", "EQUITY", Product.DELIVERY, date(2026, 6, 1))
 
 
 @pytest.mark.db

@@ -133,6 +133,19 @@ def test_money_columns_are_numeric_not_float(db_conn: Connection) -> None:
         assert dtype == "numeric", f"{name} is {dtype}, must be numeric"
 
 
+def test_fills_tds_column_exists_and_is_numeric(db_conn: Connection) -> None:
+    """Migration 0009 (IMP-2): fills.tds stores the TDS charge component
+    the same way every other statutory charge is stored, so a future TDS
+    charge-schedule row is never dropped on the floor the way it was
+    before ChargeBreakdown had a field for it at all."""
+    row = db_conn.execute(
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_name='fills' AND column_name='tds'"
+    ).fetchone()
+    assert row is not None, "fills.tds was not created"
+    assert row[0] == "numeric"
+
+
 def test_positions_no_negative_quantity_constraint_exists(db_conn: Connection) -> None:
     """Migration 0008: positions.quantity gets the same DB-level floor
     ck_no_negative_cash gives portfolios.cash_balance. Without it, a sell

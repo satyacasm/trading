@@ -39,6 +39,7 @@ _CHARGE_FIELDS = (
     "ipft",
     "gst",
     "dp_charges",
+    "tds",
 )
 
 _seq = count(1)

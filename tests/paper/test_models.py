@@ -23,8 +23,30 @@ def test_charge_breakdown_totals_its_components() -> None:
         ipft=Decimal("0.01"),
         gst=Decimal("4.35"),
         dp_charges=Decimal("0.00"),
+        tds=Decimal("0.00"),
     )
     assert b.total == Decimal("179.16")
+
+
+def test_charge_breakdown_includes_tds_in_total() -> None:
+    """IMP-2: TDS (crypto 1% TDS, plan Sec4.3) is a real ChargeType but had
+    no field on ChargeBreakdown at all -- compute_charges accumulated a TDS
+    row into its internal `amounts` dict and then dropped it on the floor
+    when building the return value. Seeding a TDS charge-schedule row would
+    have zeroed it silently, forever."""
+    b = ChargeBreakdown(
+        brokerage=Decimal("0.00"),
+        stt=Decimal("0.00"),
+        exchange_txn=Decimal("0.00"),
+        sebi_fee=Decimal("0.00"),
+        stamp_duty=Decimal("0.00"),
+        ipft=Decimal("0.00"),
+        gst=Decimal("0.00"),
+        dp_charges=Decimal("0.00"),
+        tds=Decimal("50.00"),
+    )
+    assert b.tds == Decimal("50.00")
+    assert b.total == Decimal("50.00")
 
 
 def test_money_serialises_as_json_number_not_string() -> None:
@@ -39,6 +61,7 @@ def test_money_serialises_as_json_number_not_string() -> None:
         ipft=Decimal("0"),
         gst=Decimal("0"),
         dp_charges=Decimal("0"),
+        tds=Decimal("0"),
     )
     payload = json.loads(b.model_dump_json())
     assert isinstance(payload["brokerage"], (int, float))

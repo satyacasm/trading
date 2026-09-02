@@ -35,6 +35,21 @@ class MissingChargeSchedule(Exception):
     """
 
 
+class AmbiguousChargeSchedule(Exception):
+    """`load_schedules` found more than one in-force row for the same
+    `charge_type` on the same date -- a data defect (most likely a rate
+    revision that forgot to close off the previous row's `effective_to`),
+    not something to resolve by picking whichever row Postgres happened to
+    return first or last. A sibling of `MissingChargeSchedule` rather than
+    reusing it: "missing" and "ambiguous" are different failure modes with
+    different remedies (add a row vs. fix a date range), and `trading.
+    paper.engine`'s rejection message names which one happened.
+
+    Raised rather than silently picking one, per the same no-silent-
+    fallbacks rule `MissingChargeSchedule` enforces.
+    """
+
+
 def load_schedules(
     conn: Connection,
     broker: str,
@@ -43,7 +58,16 @@ def load_schedules(
     product: Product,
     on: date,
 ) -> list[ChargeSchedule]:
-    """Every charge rule in force for this combination on `on`."""
+    """Every charge rule in force for this combination on `on`.
+
+    `ORDER BY effective_from DESC` makes the result deterministic rather
+    than depending on whatever order Postgres happens to return matching
+    rows in. Determinism alone isn't enough, though: two in-force rows for
+    the *same* `charge_type` on the same date is a data defect (a rate
+    revision that forgot to close off the previous row's `effective_to`),
+    not something to resolve quietly by picking one -- see
+    `AmbiguousChargeSchedule`.
+    """
     rows = conn.execute(
         "SELECT broker, exchange, asset_class, product, charge_type, basis,"
         " applies_to_side, rate, cap, rounding, gst_base_types,"
@@ -51,10 +75,11 @@ def load_schedules(
         " FROM charge_schedules"
         " WHERE broker=%s AND exchange=%s AND asset_class=%s AND product=%s"
         "   AND effective_from <= %s"
-        "   AND (effective_to IS NULL OR effective_to > %s)",
+        "   AND (effective_to IS NULL OR effective_to > %s)"
+        " ORDER BY effective_from DESC",
         (broker, exchange, asset_class, product.value, on, on),
     ).fetchall()
-    return [
+    schedules = [
         ChargeSchedule(
             broker=r[0],
             exchange=r[1],
@@ -73,6 +98,21 @@ def load_schedules(
         )
         for r in rows
     ]
+    _reject_duplicate_charge_types(schedules, on)
+    return schedules
+
+
+def _reject_duplicate_charge_types(schedules: Sequence[ChargeSchedule], on: date) -> None:
+    seen: set[ChargeType] = set()
+    for s in schedules:
+        if s.charge_type in seen:
+            raise AmbiguousChargeSchedule(
+                f"multiple in-force {s.charge_type.value} charge schedules for "
+                f"broker={s.broker!r} exchange={s.exchange!r} asset_class={s.asset_class!r} "
+                f"product={s.product.value!r} on {on.isoformat()}; one of them is missing "
+                "its effective_to"
+            )
+        seen.add(s.charge_type)
 
 
 def _round(value: Decimal, rounding: Rounding) -> Decimal:
@@ -90,6 +130,8 @@ def compute_charges(
     side: Side,
     quantity: Decimal,
     price: Decimal,
+    *,
+    scrip_day_charge_already_applied: bool = False,
 ) -> ChargeBreakdown:
     """Itemised charges for one fill. Pure.
 
@@ -97,6 +139,20 @@ def compute_charges(
     schedule row declares -- never as a multiplier on the total, because
     it excludes STT and stamp duty and the included set differs between
     brokers.
+
+    `scrip_day_charge_already_applied` (IMP-4): a `FLAT_PER_SCRIP_PER_DAY`
+    row (DP charges) is a once-per-scrip-per-day cost, not a per-fill one
+    -- two same-day delivery sells of one scrip must only incur it once.
+    This function stays pure and never queries the database to find out
+    whether that already happened today (Ruling 28: it is the golden-test
+    surface and Phase 3's backtest engine calls it a million times without
+    Postgres); the *caller* (`trading.paper.engine`, inside the same
+    transaction `apply_fill` runs in) determines the flag and passes it in.
+    When `True`, every `FLAT_PER_SCRIP_PER_DAY` charge contributes zero --
+    which, since GST's base can include `DP_CHARGES` for delivery, also
+    correctly lowers GST on the second sell without any special-casing
+    here (GST is still computed generically from `amounts`, whatever the
+    other charges settled to).
     """
     if not schedules:
         raise MissingChargeSchedule(
@@ -112,6 +168,9 @@ def compute_charges(
             gst_schedule = s
             continue
         if not _applies(s, side):
+            continue
+        if s.basis is ChargeBasis.FLAT_PER_SCRIP_PER_DAY and scrip_day_charge_already_applied:
+            amounts[s.charge_type] = Decimal("0")
             continue
 
         if s.basis is ChargeBasis.PERCENT_OF_TURNOVER:
@@ -141,4 +200,5 @@ def compute_charges(
         ipft=amounts[ChargeType.IPFT],
         gst=amounts[ChargeType.GST],
         dp_charges=amounts[ChargeType.DP_CHARGES],
+        tds=amounts[ChargeType.TDS],
     )

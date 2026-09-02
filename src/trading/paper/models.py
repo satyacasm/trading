@@ -40,6 +40,7 @@ _MONEY_FIELDS = (
     "ipft",
     "gst",
     "dp_charges",
+    "tds",
 )
 
 
@@ -49,6 +50,12 @@ class ChargeBreakdown(BaseModel):
     Stored per component rather than as a total because §8's cost-drag
     report needs the breakdown and it cannot be reconstructed from a lump
     sum afterwards.
+
+    `tds` (crypto 1% TDS, plan §4.3) is plumbed through like every other
+    charge type even though no `charge_schedules` row seeds it yet
+    (switching it on is a product decision, not this fix's to make) --
+    IMP-2's whole point is that the field exists so a future TDS row is
+    never silently dropped on the floor the way it was before.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -61,6 +68,7 @@ class ChargeBreakdown(BaseModel):
     ipft: Decimal
     gst: Decimal
     dp_charges: Decimal
+    tds: Decimal
 
     @property
     def total(self) -> Decimal:
@@ -73,6 +81,7 @@ class ChargeBreakdown(BaseModel):
             + self.ipft
             + self.gst
             + self.dp_charges
+            + self.tds
         )
 
     @field_serializer(*_MONEY_FIELDS)

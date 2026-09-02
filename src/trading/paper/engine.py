@@ -27,16 +27,29 @@ a live event a refresh recovers. A double fill is impossible because a
 fully-filled order is removed from the in-memory book the moment its own
 commit succeeds, before the next tick can ever see it again.
 
-**An unaffordable fill is rejected, never retried.** `apply_fill` can
-raise `psycopg.errors.CheckViolation` (`ck_no_negative_cash` or
+**A permanently unfillable order is rejected, never retried.** Two
+failures inside `_process_fill` are treated as permanent, not transient,
+and both get the same response: `apply_fill` can raise
+`psycopg.errors.CheckViolation` (`ck_no_negative_cash` or
 `ck_no_negative_position`) because the API's submit-time cash check is
 necessarily an estimate -- a market order's real fill price, and every
-order's charges, are unknowable until the tick that fills it. When that
-happens here, the failed transaction is rolled back, the order is marked
-`REJECTED` with a `rejection_reason` in its own fresh commit, and it is
-dropped from the in-memory book. Leaving it `OPEN` would retry on every
-subsequent tick and live-lock the engine against a permanently
-unaffordable order.
+order's charges, are unknowable until the tick that fills it; and
+`load_schedules`/`compute_charges` can raise `MissingChargeSchedule` if a
+long-resting `GTC` order outlives its `charge_schedules` row's
+`effective_to`. Either way, the failed transaction is rolled back, the
+order is marked `REJECTED` with a `rejection_reason` in its own fresh
+commit, and it is dropped from the in-memory book. Leaving it `OPEN`
+would retry -- and fail, and log -- on every subsequent tick, live-locking
+the engine against an order that can never fill.
+
+**Per-order isolation on any other failure.** `_handle_tick_message`
+wraps each order's `_process_fill` call individually, not the whole tick.
+An exception that isn't one of the two permanent cases above (a transient
+DB error, say) is logged and the loop moves on to the next order on the
+same instrument -- the failing order is left exactly as it was (`OPEN`,
+still in the book, retried on the next tick), and, critically, a healthy
+neighbour resting on the same instrument still fills on the *same* tick
+instead of being starved by the first order's trouble.
 """
 
 from __future__ import annotations
@@ -58,7 +71,7 @@ from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
 
 from trading.config import get_settings
-from trading.paper.charges import compute_charges, load_schedules
+from trading.paper.charges import MissingChargeSchedule, compute_charges, load_schedules
 from trading.paper.enums import OrderStatus, OrderType, Product, Side, TimeInForce
 from trading.paper.fills import decide_fill
 from trading.paper.ledger import apply_fill
@@ -313,11 +326,13 @@ def _parse_tick(raw: str) -> Tick | None:
         return None
 
 
-def _rejection_reason(exc: CheckViolation) -> str:
-    constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
-    if constraint:
-        return f"fill rejected: constraint {constraint} violated at fill time"
-    return f"fill rejected: {exc}"
+def _rejection_reason(exc: CheckViolation | MissingChargeSchedule) -> str:
+    if isinstance(exc, CheckViolation):
+        constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
+        if constraint:
+            return f"fill rejected: constraint {constraint} violated at fill time"
+        return f"fill rejected: {exc}"
+    return f"fill rejected: no charge schedule available at fill time: {exc}"
 
 
 async def _process_fill(
@@ -343,7 +358,17 @@ async def _process_fill(
             charges = compute_charges(schedules, order.side, decision.quantity, decision.price)
             fill_id = apply_fill(conn, order, decision, charges)
             conn.commit()
-        except CheckViolation as exc:
+        except (CheckViolation, MissingChargeSchedule) as exc:
+            # Both are permanent, not transient: an unaffordable fill will
+            # still be unaffordable on retry (barring a cash deposit this
+            # engine has no way to observe), and a missing charge schedule
+            # can only be fixed by changing data this process doesn't
+            # control -- a long-resting GTC order can genuinely outlive its
+            # charge_schedules row's effective_to. Either way, leaving the
+            # order OPEN would retry -- and fail, and log -- on every
+            # subsequent tick forever. Reject it instead, exactly like the
+            # CheckViolation path already did before MissingChargeSchedule
+            # joined it here.
             conn.rollback()
             reason = _rejection_reason(exc)
             conn.execute(
@@ -396,7 +421,19 @@ async def _handle_tick_message(
         decision = decide_fill(order, tick.price, tick.ts, slippage_bps)
         if decision is None:
             continue
-        await _process_fill(conn_factory, redis, book, order, decision)
+        try:
+            await _process_fill(conn_factory, redis, book, order, decision)
+        except Exception as exc:  # noqa: BLE001 - one order's failure must never block its
+            # neighbours resting on the same instrument for the same tick.
+            # CheckViolation and MissingChargeSchedule are already handled,
+            # and terminally, inside _process_fill (the order is rejected
+            # and removed from the book there) -- anything that reaches
+            # here is unexpected and presumed transient, so the order is
+            # left exactly as it was: still OPEN, still in the book, free
+            # to retry on the next tick.
+            log.warning(
+                "paper_engine.fill_processing_failed", order_id=order.order_id, reason=str(exc)
+            )
 
 
 def _fetch_and_promote_order(conn: Connection, order_id: int) -> Order | None:
@@ -571,6 +608,7 @@ def main() -> None:
             run_engine(
                 redis,
                 lambda: psycopg.connect(settings.database_url, autocommit=False),
+                slippage_bps=settings.paper_slippage_bps,
             )
         )
     except KeyboardInterrupt:

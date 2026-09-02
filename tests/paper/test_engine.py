@@ -870,6 +870,152 @@ def test_run_engine_does_not_retry_a_rejected_order_on_a_later_tick(
         _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
 
 
+# --- Per-order isolation on a per-tick failure ------------------------------
+
+
+def test_run_engine_rejects_a_missing_charge_schedule_order_and_fills_its_neighbour(
+    setup_conn, conn_factory
+) -> None:
+    """Migration 0007 seeds a BINANCE/CRYPTO/DELIVERY charge schedule but
+    no INTRADAY one -- an INTRADAY crypto order has no schedule to compute
+    charges from at all, a real (not hypothetical) MissingChargeSchedule.
+    That order must be rejected, not retried forever -- and, critically, a
+    healthy DELIVERY order resting on the *same* instrument must still
+    fill on the *same* tick: a test that only checked the failing order's
+    own outcome would pass even if one order's failure still aborted
+    every other order on that tick."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_crypto_instrument(setup_conn)
+    bad_order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.INTRADAY,
+        status=OrderStatus.OPEN,
+    )
+    good_order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    try:
+        with structlog.testing.capture_logs() as cap:
+            _run_engine_with_publish(
+                conn_factory=conn_factory,
+                max_ticks=1,
+                publish=[(channel, _tick_json(iid, datetime.now(UTC), "10.00"))],
+                pattern=pattern,
+            )
+
+        bad_row = setup_conn.execute(
+            "SELECT status, rejection_reason FROM orders WHERE order_id=%s",
+            (bad_order.order_id,),
+        ).fetchone()
+        assert bad_row is not None
+        assert bad_row[0] == "REJECTED"
+        assert bad_row[1]  # a rejection_reason naming the problem
+
+        bad_fills = setup_conn.execute(
+            "SELECT 1 FROM fills WHERE order_id=%s", (bad_order.order_id,)
+        ).fetchall()
+        assert bad_fills == []
+
+        # The proof of isolation: the healthy neighbour still filled on
+        # the very same tick, despite bad_order's failure.
+        good_fills = setup_conn.execute(
+            "SELECT 1 FROM fills WHERE order_id=%s", (good_order.order_id,)
+        ).fetchall()
+        assert len(good_fills) == 1
+
+        warnings = [e for e in cap if e.get("event") == "paper_engine.fill_rejected"]
+        assert len(warnings) == 1
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+def test_run_engine_isolates_a_transient_processing_failure_from_its_neighbour(
+    setup_conn, conn_factory, monkeypatch
+) -> None:
+    """A failure that is neither CheckViolation nor MissingChargeSchedule
+    (a stand-in for a transient DB blip) must not be treated as
+    permanent: the failing order stays OPEN, retryable on a future tick,
+    and -- the assertion that actually proves isolation -- a healthy
+    neighbour on the same instrument still fills on the same tick."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_crypto_instrument(setup_conn)
+    flaky_order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    healthy_order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+
+    import trading.paper.engine as engine_module
+
+    real_apply_fill = engine_module.apply_fill
+
+    def _flaky_apply_fill(conn, order, decision, charges):
+        if order.order_id == flaky_order.order_id:
+            raise RuntimeError("simulated transient DB failure")
+        return real_apply_fill(conn, order, decision, charges)
+
+    monkeypatch.setattr(engine_module, "apply_fill", _flaky_apply_fill)
+
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    try:
+        with structlog.testing.capture_logs() as cap:
+            _run_engine_with_publish(
+                conn_factory=conn_factory,
+                max_ticks=1,
+                publish=[(channel, _tick_json(iid, datetime.now(UTC), "10.00"))],
+                pattern=pattern,
+            )
+
+        flaky_row = setup_conn.execute(
+            "SELECT status FROM orders WHERE order_id=%s", (flaky_order.order_id,)
+        ).fetchone()
+        assert flaky_row == ("OPEN",)  # left alone -- transient, not permanent
+        flaky_fills = setup_conn.execute(
+            "SELECT 1 FROM fills WHERE order_id=%s", (flaky_order.order_id,)
+        ).fetchall()
+        assert flaky_fills == []
+
+        # The proof of isolation: the healthy neighbour still filled on
+        # the very same tick, despite flaky_order's failure.
+        healthy_fills = setup_conn.execute(
+            "SELECT 1 FROM fills WHERE order_id=%s", (healthy_order.order_id,)
+        ).fetchall()
+        assert len(healthy_fills) == 1
+
+        warnings = [e for e in cap if e.get("event") == "paper_engine.fill_processing_failed"]
+        assert len(warnings) == 1
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
 # --- run_engine: session-close sweep wired into the loop --------------------
 
 

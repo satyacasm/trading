@@ -448,7 +448,14 @@ anything not on the final allowlist.
 2. **Smoke run** — five simulated days in a throwaway sandbox. Must not crash
    and must parse orders correctly. *Waiting on the sandbox.*
 3. **Registration** — versioned and stored, ready to backtest or forward-run.
-   *Not yet built.*
+   **Implemented** (`trading.agent_contract.registry`).
+
+   **A registered version is immutable.** Re-uploading `demo 1.0.0` with
+   different source is refused, not applied. Every backtest report and forward
+   run refers to a `(name, version)`, and if that could be overwritten those
+   results would silently describe code that no longer exists. Re-uploading
+   *identical* source is idempotent — that is a retry, not a change. Publish a
+   change as a new version.
 
 Every rejection returns a report **written to be pasted straight back into the
 agent that generated the code** — every finding at once, never one per round

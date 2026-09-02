@@ -59,7 +59,7 @@ ec6fa0c  Merge 'paper-trading-core': paper trading core (Phase 1)
 Both feature branches (`paper-trading-core`, `frontend-paper-trading`) still
 exist as local refs. Fully merged; safe to delete with `git branch -d`.
 
-Test counts: **836 backend** (8 golden deselected), **36 frontend**. ruff,
+Test counts: **847 backend** (8 golden deselected), **36 frontend**. ruff,
 mypy, eslint, tsc all clean.
 
 ---
@@ -108,10 +108,19 @@ containment is the sandbox's job. It is a fast local filter for honest mistakes
 in generated code. Both the module and the contract say so, and the "ACCEPTED"
 report says so too, so nobody reads a pass as a proof of safety.
 
-Next in Phase 2: the sandbox (gVisor in Docker Desktop's Linux VM), which
-unblocks §9 stage 2 (smoke run) and D4 (the worked examples, which must be
-executed before publication). Stage 3 (registration/versioned storage) is
-independent and could come first.
+**Registration is built** (`trading.agent_contract.registry`, migration
+`0010`) — §9 stage 3. Its load-bearing rule is that **a registered version is
+immutable**: re-registering `(name, version)` with different source raises
+`VersionConflict` rather than updating, because results already attributed to
+that version must keep describing the code that produced them. Identical
+source re-registers idempotently (a retry, not a change). Nothing that fails
+static validation is stored, and the rejection carries the agent-facing report
+so a caller can hand it straight back.
+
+Next in Phase 2: **the sandbox** (gVisor in Docker Desktop's Linux VM). It is
+now the single gate on the rest — §9 stage 2 (smoke run) and D4 (the worked
+examples, which must be *executed* before publication) both wait on it. The
+upload path is otherwise complete: validate → register.
 
 **Acceptance bar** (plan §10): the contract is not done until *three different
 frontier agents*, each given only that file, each produce a working strategy
@@ -140,8 +149,9 @@ well-understood engineering; the contract is the bet.
 Infra is `docker compose up -d` (timescaledb, redis on 6379, redis_test on
 6380 — a separate *instance*, because Redis pub/sub ignores the db number).
 
-**The database must be at migration `0009`.** `0009` adds `fills.tds`; an older
-schema fails every fill insert.
+**The database must be at migration `0010`.** `0009` adds `fills.tds` (an older
+schema fails every fill insert); `0010` adds the strategy registry. Both
+`trading` and `trading_test` are at `0010`.
 
 ```bash
 uv run alembic upgrade head

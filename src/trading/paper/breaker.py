@@ -96,6 +96,7 @@ from zoneinfo import ZoneInfo
 
 from psycopg import Connection
 
+from trading.paper.alerts import enqueue_alert
 from trading.paper.enums import OrderStatus
 from trading.paper.models import Position
 
@@ -306,4 +307,20 @@ def trip(
         "INSERT INTO circuit_breaker_events (portfolio_id, ts, reason, equity, threshold)"
         " VALUES (%s, now(), %s, %s, %s)",
         (portfolio_id, reason, equity, threshold),
+    )
+    # Task 10 deliberately left this call out -- Task 11 owns wiring
+    # alerting in. enqueue_alert only ever INSERTs (no commit, no
+    # network), so it participates in this same uncommitted transaction
+    # exactly like the two writes above; the caller's own commit is what
+    # makes the pause, the cancels, the event, and this alert one atomic
+    # unit.
+    enqueue_alert(
+        conn,
+        "BREACH",
+        {
+            "portfolio_id": portfolio_id,
+            "reason": reason,
+            "equity": equity,
+            "threshold": threshold,
+        },
     )

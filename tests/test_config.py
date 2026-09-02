@@ -65,3 +65,27 @@ def test_paper_slippage_bps_is_tunable_via_env(monkeypatch, tmp_path):
     s = Settings(_env_file=None)
 
     assert s.paper_slippage_bps == Decimal("12.5")
+
+
+def test_telegram_settings_default_to_none(monkeypatch, tmp_path):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+
+    s = Settings(_env_file=None)
+
+    assert s.telegram_bot_token is None  # unconfigured bot is a valid state, not an error
+    assert s.telegram_chat_id is None
+
+
+def test_telegram_settings_are_tunable_via_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "987654")
+
+    s = Settings(_env_file=None)
+
+    assert s.telegram_bot_token == "123456:test-token"
+    assert s.telegram_chat_id == "987654"

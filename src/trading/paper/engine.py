@@ -104,6 +104,7 @@ from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
 
 from trading.config import get_settings
+from trading.paper.alerts import enqueue_alert
 from trading.paper.breaker import (
     REASON_MAX_DAILY_LOSS,
     MissingMark,
@@ -587,6 +588,22 @@ async def _process_fill(
             )
             charges = compute_charges(schedules, order.side, decision.quantity, decision.price)
             fill_id = apply_fill(conn, order, decision, charges)
+            # Task 11's wiring: enqueued inside the same transaction
+            # apply_fill just wrote to, so the fill and the alert that
+            # reports it commit -- or roll back -- as one unit.
+            enqueue_alert(
+                conn,
+                "FILL",
+                {
+                    "fill_id": fill_id,
+                    "order_id": order.order_id,
+                    "portfolio_id": order.portfolio_id,
+                    "instrument_id": order.instrument_id,
+                    "side": order.side.value,
+                    "quantity": decision.quantity,
+                    "price": decision.price,
+                },
+            )
             conn.commit()
         except OrderNoLongerFillable as exc:
             # Not an error, and not one of the permanent-rejection cases
@@ -620,6 +637,17 @@ async def _process_fill(
                 "UPDATE orders SET status = %s, rejection_reason = %s, updated_at = now()"
                 " WHERE order_id = %s",
                 (OrderStatus.REJECTED.value, reason, order.order_id),
+            )
+            # Same wiring as the FILL alert above, in this rejection's own
+            # fresh (post-rollback) transaction.
+            enqueue_alert(
+                conn,
+                "REJECTED",
+                {
+                    "order_id": order.order_id,
+                    "portfolio_id": order.portfolio_id,
+                    "reason": reason,
+                },
             )
             conn.commit()
             book.remove(order.order_id)

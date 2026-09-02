@@ -33,6 +33,17 @@ class Settings(BaseSettings):
     # at startup, whatever supplies it.
     paper_slippage_bps: Decimal = Decimal("5")
 
+    # Telegram Bot API credentials for `trading.paper.alerts`' outbox worker
+    # (Task 11). Both optional: an unconfigured bot is a deliberate
+    # configuration state for this personal, single-user system, not an
+    # error -- `run_alert_worker` idles rather than crashing when either is
+    # unset (`build_telegram_sender` returns None, which is the signal it
+    # checks). Not validated against each other at startup (a bot token with
+    # no chat id, or vice versa, is still "unconfigured" as far as sending
+    # is concerned) because nothing downstream needs one without the other.
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+
     @property
     def raw_archive_root(self) -> Path:
         return self.data_root / "raw"

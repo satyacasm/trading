@@ -172,6 +172,16 @@ def _cleanup(conn: Connection, *, portfolio_ids: list[int], instrument_ids: list
     if instrument_ids:
         conn.execute("DELETE FROM bars_intraday WHERE instrument_id = ANY(%s)", (instrument_ids,))
         conn.execute("DELETE FROM instruments WHERE instrument_id = ANY(%s)", (instrument_ids,))
+    # alert_deliveries carries no portfolio_id/instrument_id column (see
+    # migration 0007), so it can't be filtered by the ids above -- wiped
+    # unconditionally instead. Safe because every test using `_cleanup`
+    # runs against the same test database serially and this table only
+    # ever holds rows this suite itself wrote (via Task 11's engine/breaker
+    # wiring); leaving a committed row behind would otherwise leak into
+    # tests/paper/test_alerts.py's own unfiltered `SELECT ... FROM
+    # alert_deliveries` queries, since setup_conn commits for real and
+    # db_conn's rollback-at-teardown can't undo another test's commit.
+    conn.execute("DELETE FROM alert_deliveries")
     # `_mark_market_open_today` writes to a private 'TEST-NSE'/'CM' pair
     # (never the real 'NSE'/'CM' other tests -- e.g. test_api.py's
     # test_order_with_no_trading_calendar_entry_is_rejected_400 -- rely on
@@ -559,6 +569,49 @@ def test_run_engine_publishes_the_fill(setup_conn, conn_factory, redis_client) -
         assert payload["instrument_id"] == iid
     finally:
         fills_sub.close()
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+def test_run_engine_enqueues_a_fill_alert_in_the_same_transaction_as_the_fill(
+    setup_conn, conn_factory
+) -> None:
+    """Task 11's wiring: `_process_fill` must call `enqueue_alert` inside
+    the same transaction it commits the fill in, never after via a
+    separate call the engine could die between. Proven by checking a
+    `FILL` alert_deliveries row exists once the fill is committed."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_crypto_instrument(setup_conn)
+    order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("2"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    try:
+        _run_engine_with_publish(
+            conn_factory=conn_factory,
+            max_ticks=1,
+            publish=[(channel, _tick_json(iid, datetime.now(UTC), "100.00"))],
+            pattern=pattern,
+        )
+        delivery = setup_conn.execute(
+            "SELECT kind, status, payload FROM alert_deliveries"
+        ).fetchone()
+        assert delivery is not None
+        kind, status, payload = delivery
+        assert kind == "FILL"
+        assert status == "PENDING"
+        decoded = json.loads(payload)
+        assert decoded["order_id"] == order.order_id
+        assert decoded["portfolio_id"] == pid
+        assert decoded["quantity"] == "2.00000000"
+        assert decoded["price"] == "100.00"
+    finally:
         _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
 
 
@@ -1025,6 +1078,47 @@ def test_run_engine_rejects_an_unaffordable_fill_instead_of_retrying(
 
         warnings = [e for e in cap if e.get("event") == "paper_engine.fill_rejected"]
         assert len(warnings) == 1
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+def test_run_engine_enqueues_a_rejected_alert_on_an_unaffordable_fill(
+    setup_conn, conn_factory
+) -> None:
+    """Task 11's wiring: a permanent rejection (CheckViolation here) must
+    enqueue a `REJECTED` alert in the same transaction that writes the
+    order's REJECTED status, exactly like the FILL case above."""
+    pid = make_portfolio(setup_conn, cash=Decimal("1"))  # far too little cash
+    iid = _make_crypto_instrument(setup_conn)
+    order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("10"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    try:
+        _run_engine_with_publish(
+            conn_factory=conn_factory,
+            max_ticks=1,
+            publish=[(channel, _tick_json(iid, datetime.now(UTC), "1000.00"))],
+            pattern=pattern,
+        )
+        delivery = setup_conn.execute(
+            "SELECT kind, status, payload FROM alert_deliveries"
+        ).fetchone()
+        assert delivery is not None
+        kind, status, payload = delivery
+        assert kind == "REJECTED"
+        assert status == "PENDING"
+        decoded = json.loads(payload)
+        assert decoded["order_id"] == order.order_id
+        assert decoded["portfolio_id"] == pid
+        assert decoded["reason"]
     finally:
         _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
 

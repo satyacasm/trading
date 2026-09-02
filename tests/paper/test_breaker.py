@@ -10,6 +10,7 @@ both kinds of test.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -338,3 +339,26 @@ def test_trip_pauses_the_portfolio_cancels_resting_orders_and_writes_an_event(db
         (pid,),
     ).fetchone()
     assert event == (pid, "max_daily_loss: exceeded", Decimal("9000.0000"), Decimal("1000.0000"))
+
+
+@pytest.mark.db
+def test_trip_enqueues_a_breach_alert_in_the_same_transaction(db_conn) -> None:
+    """Task 10 deliberately left `trip` without alerting -- Task 11 owns
+    wiring it in, and this is the assertion that proves it: a trip must
+    enqueue a `BREACH` alert_deliveries row, written through the same
+    connection/transaction as the pause/cancel/event writes above (`trip`
+    itself never commits, matching `record_snapshot`'s convention)."""
+    pid = make_portfolio(db_conn, cash=Decimal("100000"))
+
+    trip(db_conn, pid, "max_daily_loss: exceeded", Decimal("9000"), Decimal("1000"))
+
+    delivery = db_conn.execute("SELECT kind, status, payload FROM alert_deliveries").fetchone()
+    assert delivery is not None
+    kind, status, payload = delivery
+    assert kind == "BREACH"
+    assert status == "PENDING"
+    decoded = json.loads(payload)
+    assert decoded["portfolio_id"] == pid
+    assert decoded["reason"] == "max_daily_loss: exceeded"
+    assert decoded["equity"] == "9000"
+    assert decoded["threshold"] == "1000"

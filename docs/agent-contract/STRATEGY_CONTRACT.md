@@ -444,21 +444,49 @@ anything not on the final allowlist.
 ## 9. Upload, validation, and the feedback loop
 
 1. **Static validation** — manifest schema check, import allowlist, AST scan.
+   **Implemented** (`trading.agent_contract.validation`).
 2. **Smoke run** — five simulated days in a throwaway sandbox. Must not crash
-   and must parse orders correctly.
+   and must parse orders correctly. *Waiting on the sandbox.*
 3. **Registration** — versioned and stored, ready to backtest or forward-run.
+   *Not yet built.*
 
-Every rejection returns a structured report **written to be pasted back into
-the agent that generated the code**:
+Every rejection returns a report **written to be pasted straight back into the
+agent that generated the code** — every finding at once, never one per round
+trip:
 
 ```
-REJECTED: static validation
-  line 42: imports `requests`, which is not permitted.
-  See STRATEGY_CONTRACT.md §8 for the allowlist.
-  Data reaches a strategy only through `ctx`; there is no network.
+REJECTED: static validation found 3 problems.
+
+  [IMPORT_NOT_ALLOWED] line 2: imports 'requests', which is not on the allowlist.
+      A strategy reaches data only through `ctx`; there is no network and no filesystem.
+      See STRATEGY_CONTRACT.md §8.
+  [WALL_CLOCK] line 7: calls datetime.now(), which reads the real clock. Use ctx.now
+      -- a strategy that reads wall-clock time cannot be replayed, so its backtest
+      would prove nothing.
+      See STRATEGY_CONTRACT.md §2.
+  [MISSING_CONFIGURE] file: the Strategy class does not implement `configure()`.
+      See STRATEGY_CONTRACT.md §3.
+
+Fix these and resubmit. All findings are listed above, not only the first.
 ```
+
+Finding codes are stable, so an agent can branch on them: `SYNTAX_ERROR`,
+`IMPORT_NOT_ALLOWED`, `FORBIDDEN_CALL`, `FORBIDDEN_ATTRIBUTE`, `WALL_CLOCK`,
+`NO_STRATEGY_CLASS`, `MISSING_CONFIGURE`, `MANIFEST_INVALID`.
 
 Fix, resubmit, repeat. Closing that loop is the point.
+
+### Static validation is not the sandbox
+
+Worth stating plainly, because a checker that greps for `eval` and `socket`
+invites being mistaken for a security control. It is not one. An AST scan is
+bypassable by anyone actually trying — a name assembled at run time, a payload
+decoded from a string. **Containment is the sandbox's job** (§8), and none of
+it depends on this stage.
+
+What this stage does is catch the mistakes generated code actually makes, fast
+and locally, and explain them well enough to fix. A passing report means no
+honest mistakes were found — not that the code has been proven safe.
 
 ---
 

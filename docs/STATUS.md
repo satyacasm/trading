@@ -59,7 +59,7 @@ ec6fa0c  Merge 'paper-trading-core': paper trading core (Phase 1)
 Both feature branches (`paper-trading-core`, `frontend-paper-trading`) still
 exist as local refs. Fully merged; safe to delete with `git branch -d`.
 
-Test counts: **810 backend** (8 golden deselected), **36 frontend**. ruff,
+Test counts: **836 backend** (8 golden deselected), **36 frontend**. ruff,
 mypy, eslint, tsc all clean.
 
 ---
@@ -96,8 +96,22 @@ enumerations are generated from `trading.paper.enums` and pinned by
 is a value the order API accepts. Verified by mutation: appending a bogus
 status to the schema fails the suite.
 
-Next in Phase 2: the validation pipeline (manifest check, import allowlist, AST
-scan) and the sandbox, then the worked examples once something can run them.
+**Static validation is built** (`trading.agent_contract.validation`) — stage 1
+of the §9 pipeline, plus stage 4's paste-back report. Manifest check against
+the schema, import allowlist, AST scan for forbidden calls and escape-shaped
+attribute access, wall-clock reads (a determinism rule, not a security one),
+and structural checks. Stable finding codes so an agent can branch on them.
+
+**Read the module docstring before extending it.** Static validation is *not*
+the security boundary — an AST scan is bypassable by anyone trying, and
+containment is the sandbox's job. It is a fast local filter for honest mistakes
+in generated code. Both the module and the contract say so, and the "ACCEPTED"
+report says so too, so nobody reads a pass as a proof of safety.
+
+Next in Phase 2: the sandbox (gVisor in Docker Desktop's Linux VM), which
+unblocks §9 stage 2 (smoke run) and D4 (the worked examples, which must be
+executed before publication). Stage 3 (registration/versioned storage) is
+independent and could come first.
 
 **Acceptance bar** (plan §10): the contract is not done until *three different
 frontier agents*, each given only that file, each produce a working strategy

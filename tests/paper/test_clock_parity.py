@@ -19,12 +19,25 @@ trigger, per the brief) -- to check two properties:
    bar's extreme through `decide_fill` must land on the same price the
    tick path landed on. A bar engine that instead fills at its own
    extreme would produce a *better* price than was knowable at the moment
-   of the crossing -- exactly the leak this test exists to catch. Each
-   synthetic path below runs a tick well past the limit within the
-   crossing bar (bar's own extreme != the crossing tick's price) so a
-   naive "fill at the bar extreme" implementation would in fact produce a
-   better price here; see task-9-report.md for the RED/GREEN proof this
-   is not vacuous.
+   of the crossing -- exactly the leak this test exists to catch.
+
+   Property 2 needs one more thing before it is worth asserting: a path
+   on which a correct and an incorrect implementation would actually
+   disagree. Because `decide_fill` fills a crossed limit order at the
+   *limit* price whatever price triggered it, the correct tick path and
+   the correct bar path land on the identical number (100.00 buying,
+   110.00 selling) -- property 2 holds here with equality, not merely
+   inequality, so the assertion alone does not demonstrate it could ever
+   fail. Each synthetic path below therefore runs a tick well past the
+   limit inside the crossing bar, so the bar's own extreme differs from
+   the price of the tick that crossed (low 99.50 vs 100.00 on the buy
+   side; high 110.50 vs 110.00 on the sell). A naive bar engine filling
+   at the bar's extreme would hand the buyer 99.50 and the seller 110.50
+   -- better than was knowable at the moment of the crossing, and caught
+   by property 2. That was confirmed by temporarily substituting such an
+   implementation, watching property 2 fail against it, and restoring;
+   without the construction, the assertion would be satisfied by any
+   implementation at all.
 
 No I/O, no clock, no DB -- pure functions of in-memory data only.
 """

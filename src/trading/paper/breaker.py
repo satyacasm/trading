@@ -74,6 +74,17 @@ Money/percentage columns (`equity`, `peak_equity`: `NUMERIC(18,4)`;
 write, mirroring `trading.paper.ledger`'s discipline, rather than trusting
 Postgres's own storage rounding to agree with whatever a future
 pure-Python reader (e.g. a metrics job replaying this table) computes.
+`quantize_money`/`quantize_pct` are exported so the *source* value --
+`compute_equity`'s raw output, which can carry up to twelve fractional
+digits (`positions.quantity` is `NUMERIC(18,8)`, `bars_intraday.close` is
+`NUMERIC(18,4)`) -- is quantized exactly once, in `trading.paper.engine.
+evaluate_breaker_for_portfolio`, before it is threaded through
+`record_snapshot`, `evaluate_breach`, and `trip`. `record_snapshot` also
+quantizes defensively on its own inputs (any direct caller, not only the
+engine, must get a correctly-scaled row), but the single upstream
+quantization is what guarantees `trip`'s `circuit_breaker_events.equity`
+and `record_snapshot`'s `portfolio_equity_snapshots.equity` for the same
+evaluation are the same number, not two independently-rounded ones.
 """
 
 from __future__ import annotations
@@ -108,11 +119,26 @@ _CANCELLABLE_ORDER_STATUSES = (
 )
 
 
-def _quantize_money(value: Decimal) -> Decimal:
+def quantize_money(value: Decimal) -> Decimal:
+    """To 4dp (`NUMERIC(18,4)`'s scale), `ROUND_HALF_UP`. Exported (not
+    just used internally by `record_snapshot`) so `trading.paper.engine`
+    can quantize `compute_equity`'s raw output once, at the source,
+    before threading it through `record_snapshot`, `evaluate_breach`, and
+    `trip` -- see the module docstring's quantization paragraph. Fix
+    round 1: previously only `record_snapshot` quantized, so `trip` could
+    persist a `circuit_breaker_events.equity` with more than 4 fractional
+    digits (a position's `quantity` is `NUMERIC(18,8)`, so
+    `quantity * mark` can carry up to 12), silently rounded by Postgres's
+    own storage rounding on insert instead of by this function -- exactly
+    the class of divergence this module documents guarding against.
+    """
     return value.quantize(_MONEY_DP, rounding=ROUND_HALF_UP)
 
 
-def _quantize_pct(value: Decimal) -> Decimal:
+def quantize_pct(value: Decimal) -> Decimal:
+    """To 4dp (`NUMERIC(9,4)`'s scale), `ROUND_HALF_UP`. Exported for the
+    same reason as `quantize_money` -- a `max_drawdown_pct` threshold
+    handed to `trip` needs the percentage scale, not the money one."""
     return value.quantize(_PCT_DP, rounding=ROUND_HALF_UP)
 
 
@@ -226,11 +252,11 @@ def record_snapshot(conn: Connection, portfolio_id: int, ts: datetime, equity: D
     a single evaluation can commit `record_snapshot` and a subsequent
     `trip` as one unit.
     """
-    equity = _quantize_money(equity)
+    equity = quantize_money(equity)
     prior_peak = load_peak_equity(conn, portfolio_id)
-    new_peak = _quantize_money(equity if prior_peak is None else max(prior_peak, equity))
+    new_peak = quantize_money(equity if prior_peak is None else max(prior_peak, equity))
     drawdown_pct = (
-        _quantize_pct((new_peak - equity) / new_peak * Decimal(100))
+        quantize_pct((new_peak - equity) / new_peak * Decimal(100))
         if new_peak > 0
         else Decimal("0.0000")
     )
@@ -251,6 +277,17 @@ def trip(
     Does not commit (same convention as `record_snapshot`) and does not
     touch the engine's in-memory `OpenOrderBook` -- see the module
     docstring's "Cross-boundary requirement" section for who does.
+
+    Unlike `record_snapshot`, this does *not* quantize `equity`/
+    `threshold` itself -- the caller (`trading.paper.engine.
+    evaluate_breaker_for_portfolio`) is expected to have already
+    quantized `equity` once at the source (`quantize_money`) and
+    `threshold` with whichever of `quantize_money`/`quantize_pct`
+    matches the breached limit's column scale, precisely so this
+    function's `circuit_breaker_events` row and `record_snapshot`'s
+    `portfolio_equity_snapshots` row -- both written from the same
+    evaluation -- persist the same `equity` value rather than two
+    independently-rounded ones.
     """
     conn.execute(
         "UPDATE portfolios SET status = %s WHERE portfolio_id = %s",

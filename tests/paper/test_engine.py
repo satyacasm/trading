@@ -1420,6 +1420,88 @@ def test_evaluate_breaker_for_portfolio_marks_positions_from_bars_intraday(
         _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
 
 
+def test_evaluate_breaker_for_portfolio_quantizes_equity_before_it_reaches_trip(
+    setup_conn, conn_factory, monkeypatch
+) -> None:
+    """Fix round 1 regression. A position of quantity 0.00000001 at mark
+    79090.0100 makes `compute_equity`'s raw output carry 10 fractional
+    digits (...89000.0007909001), not the 4dp scale `portfolio_equity_
+    snapshots.equity`/`circuit_breaker_events.equity` actually store.
+
+    Before this fix, `evaluate_breaker_for_portfolio` threaded that raw
+    Decimal straight into `trip`, relying on Postgres's own storage
+    rounding on INSERT to bring it down to 4dp -- undocumented, and not
+    what the module's own docstring claims ("quantized in Python before
+    every write"). Asserting only on the *persisted* value would not
+    catch this: Postgres's numeric-column rounding turns out to agree
+    with Python's `ROUND_HALF_UP` for this input (verified empirically),
+    so the two happen to land on the same stored number regardless of
+    whether the fix is applied. The only assertion that actually
+    distinguishes the two is on the Python-level value handed to `trip`
+    itself, captured here by wrapping it -- exactly the discipline
+    quantity/price already receive in `trading.paper.ledger.apply_fill`.
+    """
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    setup_conn.execute(
+        "UPDATE portfolios SET max_daily_loss = %s, cash_balance = %s WHERE portfolio_id = %s",
+        (Decimal("100"), Decimal("89000"), pid),
+    )
+    iid = _make_crypto_instrument(setup_conn)
+    setup_conn.execute(
+        "INSERT INTO positions (portfolio_id, instrument_id, quantity, avg_cost, realised_pnl)"
+        " VALUES (%s, %s, %s, %s, 0)",
+        (pid, iid, Decimal("0.00000001"), Decimal("79000")),
+    )
+    _insert_bar(setup_conn, iid, Decimal("79090.0100"))
+    book = OpenOrderBook()
+
+    import trading.paper.engine as engine_module
+
+    real_trip = engine_module.trip
+    captured: dict[str, Decimal] = {}
+
+    def _capturing_trip(
+        conn: Connection, portfolio_id: int, reason: str, equity: Decimal, threshold: Decimal
+    ) -> None:
+        captured["equity"] = equity
+        captured["threshold"] = threshold
+        real_trip(conn, portfolio_id, reason, equity, threshold)
+
+    monkeypatch.setattr(engine_module, "trip", _capturing_trip)
+
+    try:
+        evaluate_breaker_for_portfolio(conn_factory, book, pid, _T0)
+
+        status = setup_conn.execute(
+            "SELECT status FROM portfolios WHERE portfolio_id=%s", (pid,)
+        ).fetchone()
+        assert status == ("PAUSED",)
+
+        # 89000 (cash) + 0.00000001 * 79090.0100 = 89000.0007909001 raw,
+        # quantized ROUND_HALF_UP to 4dp -> 89000.0008. The two Decimals
+        # are genuinely unequal as *values* (not merely differently
+        # scaled), so this is a real regression check, not a formatting
+        # one.
+        expected_equity = Decimal("89000.0008")
+        assert captured["equity"] == expected_equity
+        assert captured["threshold"] == Decimal("100.0000")
+
+        snapshot_equity = setup_conn.execute(
+            "SELECT equity FROM portfolio_equity_snapshots WHERE portfolio_id=%s AND ts=%s",
+            (pid, _T0),
+        ).fetchone()[0]
+        event_equity = setup_conn.execute(
+            "SELECT equity FROM circuit_breaker_events WHERE portfolio_id=%s", (pid,)
+        ).fetchone()[0]
+        # Both persisted rows, written from the same evaluation, agree
+        # exactly -- not merely "close".
+        assert snapshot_equity == expected_equity
+        assert event_equity == expected_equity
+    finally:
+        setup_conn.execute("DELETE FROM positions WHERE portfolio_id=%s", (pid,))
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
 def test_evaluate_breaker_for_portfolio_skips_and_logs_on_a_missing_mark(
     setup_conn, conn_factory
 ) -> None:

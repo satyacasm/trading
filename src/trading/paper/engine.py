@@ -110,6 +110,8 @@ from trading.paper.breaker import (
     compute_equity,
     evaluate_breach,
     load_day_open_equity,
+    quantize_money,
+    quantize_pct,
     record_snapshot,
     trip,
 )
@@ -320,7 +322,15 @@ def evaluate_breaker_for_portfolio(
 
         positions = _load_positions(conn, portfolio_id)
         marks = _load_marks(conn, positions)
-        equity = compute_equity(cash, positions, marks)
+        # Quantized once, here, at the source -- compute_equity's raw
+        # output sums quantity (NUMERIC(18,8)) * mark (NUMERIC(18,4)) and
+        # can carry up to twelve fractional digits. Quantizing before this
+        # value is threaded through record_snapshot, evaluate_breach, and
+        # trip is what guarantees every one of them sees the identical
+        # number, rather than each -- or, before this fix, only
+        # record_snapshot -- rounding it independently. See breaker.py's
+        # module docstring and quantize_money's own docstring.
+        equity = quantize_money(compute_equity(cash, positions, marks))
 
         day_open_equity = load_day_open_equity(conn, portfolio_id, now)
         peak_equity = record_snapshot(conn, portfolio_id, now, equity)
@@ -330,11 +340,20 @@ def evaluate_breaker_for_portfolio(
         if reason is not None:
             # evaluate_breach prefixes its reason with whichever limit
             # breached, precisely so this decision doesn't have to
-            # re-derive which one it was.
-            threshold = (
-                max_daily_loss if reason.startswith(REASON_MAX_DAILY_LOSS) else max_drawdown_pct
-            )
-            assert threshold is not None, f"breach reason {reason!r} named a limit that is None"
+            # re-derive which one it was. The two limits live on
+            # different columns/scales (max_daily_loss: NUMERIC(18,4)
+            # money; max_drawdown_pct: NUMERIC(9,4) percentage), so the
+            # quantizer must match which one actually breached.
+            if reason.startswith(REASON_MAX_DAILY_LOSS):
+                assert max_daily_loss is not None, (
+                    f"breach reason {reason!r} named a limit that is None"
+                )
+                threshold = quantize_money(max_daily_loss)
+            else:
+                assert max_drawdown_pct is not None, (
+                    f"breach reason {reason!r} named a limit that is None"
+                )
+                threshold = quantize_pct(max_drawdown_pct)
             trip(conn, portfolio_id, reason, equity, threshold)
         conn.commit()
     except MissingMark as exc:

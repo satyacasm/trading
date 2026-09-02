@@ -49,7 +49,7 @@ makes the two computations byte-for-byte reproducible rather than merely
 **Precondition on `decision.price`, made explicit rather than assumed:**
 `replay_portfolio` only ever sees a fill's price after it has round-tripped
 through `fills.price`, a `NUMERIC(18,4)` column -- so its recomputation is
-structurally rounded to 4dp even when it doesn't call `_quantize`
+structurally rounded to 4dp even when it doesn't call `quantize_money`
 directly. `apply_fill`, by contrast, computes notional and `avg_cost` from
 `decision.price` *before* that round trip. If `decision.price` ever
 carried more than four decimal places, the two would diverge -- the
@@ -58,11 +58,19 @@ of the quantity axis. Today it's unreachable only because
 `trading.paper.fills.decide_fill` quantizes market prices to 2dp and
 passes limit prices through from a `NUMERIC(18,4)` column already -- a
 fact this module must not rely on silently. `apply_fill` therefore
-quantizes `decision.price` itself, defensively, as its first step, so the
-value it uses for notional, `avg_cost`, and the `fills.price` insert is
-provably the same value `replay_portfolio` will later read back,
-regardless of what a future `FillDecision` producer does or doesn't
-round.
+quantizes `decision.price` itself as its first step -- but only
+*defensively*, as a real precondition check on its own arithmetic
+(notional, `avg_cost`, the `fills.price` insert): `decision.model_copy`
+rebinds a local name, and `FillDecision` is frozen, so this cannot and
+does not change what the *caller* sees. `decision.price` as the caller
+holds it, and everything the caller derives from it (charges, an alert
+payload, a Redis publish) *before* ever calling `apply_fill`, is
+untouched by this quantization (IMP-5 -- see the caller,
+`trading.paper.engine._process_fill`, which quantizes once, at the
+source, before deriving anything else, so every downstream consumer -- not
+just this function -- shares one value). `quantize_money` is exported
+(not just used internally) precisely so that caller can do so, mirroring
+`trading.paper.breaker.quantize_money`'s identical fix for the same shape.
 """
 
 from __future__ import annotations
@@ -77,7 +85,15 @@ from trading.paper.models import ChargeBreakdown, FillDecision, Order, Position
 _MONEY_DP = Decimal("0.0001")
 
 
-def _quantize(value: Decimal) -> Decimal:
+def quantize_money(value: Decimal) -> Decimal:
+    """To 4dp (`NUMERIC(18,4)`'s scale), `ROUND_HALF_UP`. Exported (not
+    just used internally by `apply_fill`/`replay_portfolio`) so
+    `trading.paper.engine._process_fill` can quantize `decision.price`
+    once, at the source, before deriving charges, an alert payload, or a
+    Redis publish from it -- see the module docstring's "Precondition on
+    decision.price" section (IMP-5). Mirrors `trading.paper.breaker.
+    quantize_money`'s identical fix for the identical shape.
+    """
     return value.quantize(_MONEY_DP, rounding=ROUND_HALF_UP)
 
 
@@ -110,7 +126,7 @@ def apply_fill(
     # stored -- see the module docstring's "Precondition on decision.price"
     # section. Every use of decision.price below (notional, avg_cost, the
     # fills insert) reads this already-quantized value.
-    decision = decision.model_copy(update={"price": _quantize(decision.price)})
+    decision = decision.model_copy(update={"price": quantize_money(decision.price)})
 
     notional = decision.quantity * decision.price
     total_charges = charges.total
@@ -120,8 +136,8 @@ def apply_fill(
     fill_row = conn.execute(
         "INSERT INTO fills (order_id, quantity, price, filled_at, tick_ts,"
         " brokerage, stt, exchange_txn, sebi_fee, stamp_duty, ipft, gst,"
-        " dp_charges, total_charges)"
-        " VALUES (%s,%s,%s,now(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+        " dp_charges, tds, total_charges)"
+        " VALUES (%s,%s,%s,now(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
         " RETURNING fill_id",
         (
             order.order_id,
@@ -136,6 +152,7 @@ def apply_fill(
             charges.ipft,
             charges.gst,
             charges.dp_charges,
+            charges.tds,
             total_charges,
         ),
     ).fetchone()
@@ -211,7 +228,7 @@ def _apply_position(conn: Connection, order: Order, decision: FillDecision) -> N
                     order.portfolio_id,
                     order.instrument_id,
                     decision.quantity,
-                    _quantize(decision.price),
+                    quantize_money(decision.price),
                 ),
             )
             return
@@ -220,7 +237,7 @@ def _apply_position(conn: Connection, order: Order, decision: FillDecision) -> N
         # Weighted average over the *gross* traded price. Charges are a cash
         # cost, not part of the position's cost basis -- folding them in here
         # would double-count them against realised P&L on the way out.
-        new_avg = _quantize(((qty * avg) + (decision.quantity * decision.price)) / new_qty)
+        new_avg = quantize_money(((qty * avg) + (decision.quantity * decision.price)) / new_qty)
         conn.execute(
             "UPDATE positions SET quantity=%s, avg_cost=%s"
             " WHERE portfolio_id=%s AND instrument_id=%s",
@@ -231,7 +248,7 @@ def _apply_position(conn: Connection, order: Order, decision: FillDecision) -> N
     assert row is not None, "sell with no position; the API must reject this"
     qty, avg, realised = row
     new_qty = qty - decision.quantity
-    gain = _quantize((decision.price - avg) * decision.quantity)
+    gain = quantize_money((decision.price - avg) * decision.quantity)
     conn.execute(
         "UPDATE positions SET quantity=%s, realised_pnl=%s"
         " WHERE portfolio_id=%s AND instrument_id=%s",
@@ -257,7 +274,7 @@ def replay_portfolio(conn: Connection, portfolio_id: int) -> tuple[Decimal, dict
     # initial_capital is already NUMERIC(18,4); quantize anyway so the
     # running total starts from the same representation apply_fill's
     # first UPDATE would have started from.
-    cash = _quantize(Decimal(initial[0]))
+    cash = quantize_money(Decimal(initial[0]))
 
     rows = conn.execute(
         "SELECT o.instrument_id, o.side, f.quantity, f.price, f.total_charges"
@@ -276,14 +293,14 @@ def replay_portfolio(conn: Connection, portfolio_id: int) -> tuple[Decimal, dict
             # full precision and rounding only the final sum would
             # reproduce a different number whenever intermediate
             # roundings compound differently than one final rounding.
-            cash = _quantize(cash - (notional + total_charges))
+            cash = quantize_money(cash - (notional + total_charges))
             held = positions.get(instrument_id)
             if held is None:
                 positions[instrument_id] = Position(
                     portfolio_id=portfolio_id,
                     instrument_id=instrument_id,
                     quantity=quantity,
-                    avg_cost=_quantize(price),
+                    avg_cost=quantize_money(price),
                     realised_pnl=Decimal("0"),
                 )
             else:
@@ -291,19 +308,19 @@ def replay_portfolio(conn: Connection, portfolio_id: int) -> tuple[Decimal, dict
                 positions[instrument_id] = held.model_copy(
                     update={
                         "quantity": new_qty,
-                        "avg_cost": _quantize(
+                        "avg_cost": quantize_money(
                             ((held.quantity * held.avg_cost) + (quantity * price)) / new_qty
                         ),
                     }
                 )
         else:
-            cash = _quantize(cash + (notional - total_charges))
+            cash = quantize_money(cash + (notional - total_charges))
             held = positions[instrument_id]
             positions[instrument_id] = held.model_copy(
                 update={
                     "quantity": held.quantity - quantity,
                     "realised_pnl": held.realised_pnl
-                    + _quantize((price - held.avg_cost) * quantity),
+                    + quantize_money((price - held.avg_cost) * quantity),
                 }
             )
 

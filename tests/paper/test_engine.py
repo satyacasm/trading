@@ -51,6 +51,7 @@ from trading.contracts.enums import DataSource
 from trading.paper.engine import (
     OpenOrderBook,
     _handle_tick_message,
+    _process_fill,
     evaluate_breaker_for_all_active_portfolios,
     evaluate_breaker_for_portfolio,
     load_open_orders,
@@ -59,7 +60,7 @@ from trading.paper.engine import (
     validate_slippage_bps,
 )
 from trading.paper.enums import OrderStatus, OrderType, Product, Side, TimeInForce
-from trading.paper.models import Order
+from trading.paper.models import FillDecision, Order
 from trading.streaming.models import Tick
 
 pytestmark = pytest.mark.db
@@ -610,8 +611,230 @@ def test_run_engine_enqueues_a_fill_alert_in_the_same_transaction_as_the_fill(
         assert decoded["order_id"] == order.order_id
         assert decoded["portfolio_id"] == pid
         assert decoded["quantity"] == "2.00000000"
-        assert decoded["price"] == "100.00"
+        # 4dp, not the tick's raw 2dp -- IMP-5: the alert payload must
+        # carry the same quantized price apply_fill stores, not a value
+        # derived from decision.price before _process_fill quantized it.
+        assert decoded["price"] == "100.0000"
     finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+# --- IMP-4: DP charges applied once per scrip per day, not once per fill ----
+
+
+def _make_nse_delivery_instrument(conn: Connection) -> int:
+    """A real `NSE` (not `TEST-NSE`) EQUITY instrument -- unlike every
+    other engine test's isolated exchange, this one must match migration
+    0007's seeded UPSTOX/NSE charge schedules (DP charges included) so
+    `_process_fill` computes a real, non-zero DP charge."""
+    row = conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, status, canonical_key)"
+        " VALUES ('EQUITY', 'NSE', 'CM', %s, 'ACTIVE', %s) RETURNING instrument_id",
+        (f"DPTEST{next(_seq)}", f"TEST/ENGINE/DP/{next(_seq)}"),
+    ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def test_process_fill_charges_dp_once_per_scrip_per_day_across_two_sells(
+    setup_conn, conn_factory
+) -> None:
+    """IMP-4: FLAT_PER_SCRIP_PER_DAY was implemented identically to
+    FLAT_PER_ORDER, so DP was charged per fill, not per scrip per day.
+    Two same-day delivery sells of one scrip must incur DP (Rs 20) only on
+    the first."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_nse_delivery_instrument(setup_conn)
+    setup_conn.execute(
+        "INSERT INTO positions (portfolio_id, instrument_id, quantity, avg_cost, realised_pnl)"
+        " VALUES (%s, %s, 20, 100, 0)",
+        (pid, iid),
+    )
+    order_a = make_order(
+        setup_conn,
+        pid,
+        side=Side.SELL,
+        quantity=Decimal("5"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    order_b = make_order(
+        setup_conn,
+        pid,
+        side=Side.SELL,
+        quantity=Decimal("5"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    meta = ("EQUITY", "NSE", "CM")
+    book = OpenOrderBook()
+    book.add(order_a, meta=meta)
+    book.add(order_b, meta=meta)
+    now = datetime.now(UTC)
+    decision_a = FillDecision(quantity=Decimal("5"), price=Decimal("100"), tick_ts=now)
+    decision_b = FillDecision(quantity=Decimal("5"), price=Decimal("100"), tick_ts=now)
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+
+    async def _run() -> None:
+        # Both fills, and the pool teardown, in the same event loop --
+        # a connection opened under one asyncio.run() cannot be closed
+        # from a different one (see _handle_tick_message's identical
+        # pattern above).
+        await _process_fill(conn_factory, async_redis, book, order_a, decision_a)
+        await _process_fill(conn_factory, async_redis, book, order_b, decision_b)
+        await async_redis.connection_pool.disconnect()
+
+    try:
+        asyncio.run(_run())
+
+        dp_charges = setup_conn.execute(
+            "SELECT f.dp_charges FROM fills f JOIN orders o ON o.order_id = f.order_id"
+            " WHERE o.portfolio_id = %s ORDER BY f.fill_id",
+            (pid,),
+        ).fetchall()
+        assert [row[0] for row in dp_charges] == [Decimal("20.00"), Decimal("0.00")]
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+def test_process_fill_charges_dp_again_for_a_different_scrip_the_same_day(
+    setup_conn, conn_factory
+) -> None:
+    """The dedup is per-scrip, not portfolio-wide: a same-day sell of a
+    *different* instrument must still incur its own DP charge."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid_a = _make_nse_delivery_instrument(setup_conn)
+    iid_b = _make_nse_delivery_instrument(setup_conn)
+    setup_conn.execute(
+        "INSERT INTO positions (portfolio_id, instrument_id, quantity, avg_cost, realised_pnl)"
+        " VALUES (%s, %s, 20, 100, 0), (%s, %s, 20, 100, 0)",
+        (pid, iid_a, pid, iid_b),
+    )
+    order_a = make_order(
+        setup_conn,
+        pid,
+        side=Side.SELL,
+        quantity=Decimal("5"),
+        instrument_id=iid_a,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    order_b = make_order(
+        setup_conn,
+        pid,
+        side=Side.SELL,
+        quantity=Decimal("5"),
+        instrument_id=iid_b,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    book = OpenOrderBook()
+    book.add(order_a, meta=("EQUITY", "NSE", "CM"))
+    book.add(order_b, meta=("EQUITY", "NSE", "CM"))
+    now = datetime.now(UTC)
+    decision_a = FillDecision(quantity=Decimal("5"), price=Decimal("100"), tick_ts=now)
+    decision_b = FillDecision(quantity=Decimal("5"), price=Decimal("100"), tick_ts=now)
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+
+    async def _run() -> None:
+        await _process_fill(conn_factory, async_redis, book, order_a, decision_a)
+        await _process_fill(conn_factory, async_redis, book, order_b, decision_b)
+        await async_redis.connection_pool.disconnect()
+
+    try:
+        asyncio.run(_run())
+
+        dp_charges = setup_conn.execute(
+            "SELECT f.dp_charges FROM fills f JOIN orders o ON o.order_id = f.order_id"
+            " WHERE o.portfolio_id = %s ORDER BY f.fill_id",
+            (pid,),
+        ).fetchall()
+        assert [row[0] for row in dp_charges] == [Decimal("20.00"), Decimal("20.00")]
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid_a, iid_b])
+
+
+# --- IMP-5: apply_fill's price quantization must reach every consumer ------
+
+
+def test_process_fill_uses_the_same_quantized_price_everywhere(
+    setup_conn, conn_factory, redis_client, monkeypatch
+) -> None:
+    """IMP-5: `apply_fill` quantized `decision.price` by rebinding a local
+    *name* -- `FillDecision` is frozen, so the caller's object (and
+    everything the caller derives from it before calling `apply_fill`) was
+    untouched. `compute_charges`, the FILL alert payload, and the
+    `fills:{portfolio_id}` publish all used the raw, unquantized price.
+    The fix quantizes once, at the source, in `_process_fill`, before any
+    of those four consumers ever sees `decision.price`."""
+    pid = make_portfolio(setup_conn, cash=Decimal("1000000"))
+    iid = _make_crypto_instrument(setup_conn)
+    order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        order_type=OrderType.MARKET,
+        product=Product.DELIVERY,
+        status=OrderStatus.OPEN,
+    )
+    book = OpenOrderBook()
+    book.add(order, meta=("CRYPTO", "BINANCE", "SPOT"))
+    decision = FillDecision(
+        quantity=Decimal("1"), price=Decimal("100.123456"), tick_ts=datetime.now(UTC)
+    )
+
+    import trading.paper.engine as engine_module
+
+    real_compute_charges = engine_module.compute_charges
+    seen_prices: list[Decimal] = []
+
+    def _spy_compute_charges(schedules, side, quantity, price, **kwargs):
+        seen_prices.append(price)
+        return real_compute_charges(schedules, side, quantity, price, **kwargs)
+
+    monkeypatch.setattr(engine_module, "compute_charges", _spy_compute_charges)
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+
+    async def _run() -> None:
+        await _process_fill(conn_factory, async_redis, book, order, decision)
+        await async_redis.connection_pool.disconnect()
+
+    fills_sub = redis_client.pubsub()
+    fills_sub.subscribe(f"fills:{pid}")
+    fills_sub.get_message(timeout=1)
+    try:
+        asyncio.run(_run())
+
+        expected = Decimal("100.1235")
+        assert seen_prices == [expected], "compute_charges saw an unquantized price"
+
+        stored_price = setup_conn.execute(
+            "SELECT price FROM fills WHERE order_id=%s", (order.order_id,)
+        ).fetchone()[0]
+        assert stored_price == expected
+
+        message = fills_sub.get_message(timeout=2)
+        assert message is not None
+        published = json.loads(message["data"])
+        assert published["price"] == str(expected)
+
+        alert_payload = setup_conn.execute(
+            "SELECT payload FROM alert_deliveries WHERE kind='FILL'"
+        ).fetchone()[0]
+        assert json.loads(alert_payload)["price"] == str(expected)
+    finally:
+        fills_sub.close()
         _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
 
 

@@ -91,7 +91,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -116,10 +116,16 @@ from trading.paper.breaker import (
     record_snapshot,
     trip,
 )
-from trading.paper.charges import MissingChargeSchedule, compute_charges, load_schedules
+from trading.paper.charges import (
+    AmbiguousChargeSchedule,
+    MissingChargeSchedule,
+    compute_charges,
+    load_schedules,
+)
 from trading.paper.enums import OrderStatus, OrderType, Product, Side, TimeInForce
 from trading.paper.fills import decide_fill
 from trading.paper.ledger import OrderNoLongerFillable, apply_fill
+from trading.paper.ledger import quantize_money as quantize_fill_price
 from trading.paper.models import FillDecision, Order, Position
 from trading.streaming.models import Tick
 
@@ -549,6 +555,39 @@ def sweep_expired_day_orders(conn: Connection, book: OpenOrderBook, now: datetim
     return swept
 
 
+def _ist_day_bounds_utc(ts: datetime) -> tuple[datetime, datetime]:
+    """The `[start, end)` UTC bounds of `ts`'s Asia/Kolkata calendar day --
+    DP charges are an Indian broker convention (Rs 20/scrip/day), so "day"
+    means the IST day, matching `_is_session_closed`'s identical
+    convention for session boundaries, not a UTC midnight-to-midnight
+    window that would split an IST trading day in two."""
+    ist_date = ts.astimezone(_IST).date()
+    start = datetime.combine(ist_date, time.min, tzinfo=_IST).astimezone(UTC)
+    end = datetime.combine(ist_date + timedelta(days=1), time.min, tzinfo=_IST).astimezone(UTC)
+    return start, end
+
+
+def _dp_already_applied_today(
+    conn: Connection, portfolio_id: int, instrument_id: int, product: Product, tick_ts: datetime
+) -> bool:
+    """Whether a DELIVERY sell fill for this portfolio+instrument already
+    incurred a non-zero DP charge earlier today (IST) -- see
+    compute_charges's `scrip_day_charge_already_applied` kwarg. Queried by
+    the caller inside the same transaction `apply_fill` is about to run
+    in, so two same-tick fills for the same scrip can never both see "not
+    yet charged today"."""
+    day_start, day_end = _ist_day_bounds_utc(tick_ts)
+    row = conn.execute(
+        "SELECT 1 FROM fills f JOIN orders o ON o.order_id = f.order_id"
+        " WHERE o.portfolio_id = %s AND o.instrument_id = %s AND o.product = %s"
+        "   AND o.side = %s AND f.dp_charges > 0"
+        "   AND f.filled_at >= %s AND f.filled_at < %s"
+        " LIMIT 1",
+        (portfolio_id, instrument_id, product.value, Side.SELL.value, day_start, day_end),
+    ).fetchone()
+    return row is not None
+
+
 def _parse_tick(raw: str) -> Tick | None:
     try:
         return Tick.model_validate_json(raw)
@@ -557,12 +596,16 @@ def _parse_tick(raw: str) -> Tick | None:
         return None
 
 
-def _rejection_reason(exc: CheckViolation | MissingChargeSchedule) -> str:
+def _rejection_reason(
+    exc: CheckViolation | MissingChargeSchedule | AmbiguousChargeSchedule,
+) -> str:
     if isinstance(exc, CheckViolation):
         constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
         if constraint:
             return f"fill rejected: constraint {constraint} violated at fill time"
         return f"fill rejected: {exc}"
+    if isinstance(exc, AmbiguousChargeSchedule):
+        return f"fill rejected: ambiguous charge schedule at fill time: {exc}"
     return f"fill rejected: no charge schedule available at fill time: {exc}"
 
 
@@ -573,6 +616,15 @@ async def _process_fill(
     order: Order,
     decision: FillDecision,
 ) -> None:
+    # Quantize once, here, at the source -- IMP-5. apply_fill's own
+    # quantize only rebinds its local name (FillDecision is frozen), so it
+    # cannot reach back into this caller's object. Every downstream
+    # consumer of decision.price below (compute_charges, the FILL alert
+    # payload, apply_fill itself, and the fills:{portfolio_id} publish
+    # after it) must share one value, not four independently-precise ones.
+    # See ledger.py's module docstring and quantize_money's own docstring.
+    decision = decision.model_copy(update={"price": quantize_fill_price(decision.price)})
+
     asset_class, exchange, segment = book.instrument_meta[order.instrument_id]
     broker = _BROKER_BY_ASSET_CLASS.get(asset_class)
 
@@ -586,7 +638,21 @@ async def _process_fill(
                 if broker is not None
                 else []
             )
-            charges = compute_charges(schedules, order.side, decision.quantity, decision.price)
+            # IMP-4: a FLAT_PER_SCRIP_PER_DAY charge (DP charges) is a
+            # once-per-scrip-per-day cost, not a per-fill one. Queried
+            # inside this same transaction (the one apply_fill is about to
+            # run in), so two same-tick fills for the same scrip can't both
+            # see "not yet charged today" -- see _dp_already_applied_today.
+            already_applied = order.side is Side.SELL and _dp_already_applied_today(
+                conn, order.portfolio_id, order.instrument_id, order.product, decision.tick_ts
+            )
+            charges = compute_charges(
+                schedules,
+                order.side,
+                decision.quantity,
+                decision.price,
+                scrip_day_charge_already_applied=already_applied,
+            )
             fill_id = apply_fill(conn, order, decision, charges)
             # Task 11's wiring: enqueued inside the same transaction
             # apply_fill just wrote to, so the fill and the alert that
@@ -620,17 +686,18 @@ async def _process_fill(
             book.remove(order.order_id)
             log.info("paper_engine.fill_lost_race", order_id=order.order_id, reason=str(exc))
             return
-        except (CheckViolation, MissingChargeSchedule) as exc:
-            # Both are permanent, not transient: an unaffordable fill will
-            # still be unaffordable on retry (barring a cash deposit this
-            # engine has no way to observe), and a missing charge schedule
+        except (CheckViolation, MissingChargeSchedule, AmbiguousChargeSchedule) as exc:
+            # All three are permanent, not transient: an unaffordable fill
+            # will still be unaffordable on retry (barring a cash deposit
+            # this engine has no way to observe); a missing charge schedule
             # can only be fixed by changing data this process doesn't
             # control -- a long-resting GTC order can genuinely outlive its
-            # charge_schedules row's effective_to. Either way, leaving the
-            # order OPEN would retry -- and fail, and log -- on every
-            # subsequent tick forever. Reject it instead, exactly like the
-            # CheckViolation path already did before MissingChargeSchedule
-            # joined it here.
+            # charge_schedules row's effective_to; and an ambiguous schedule
+            # (two in-force rows for one charge type) needs a human to fix
+            # the data, not a retry. Either way, leaving the order OPEN
+            # would retry -- and fail, and log -- on every subsequent tick
+            # forever. Reject it instead, exactly like the CheckViolation
+            # path already did before MissingChargeSchedule joined it here.
             conn.rollback()
             reason = _rejection_reason(exc)
             conn.execute(

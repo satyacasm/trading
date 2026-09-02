@@ -59,7 +59,7 @@ ec6fa0c  Merge 'paper-trading-core': paper trading core (Phase 1)
 Both feature branches (`paper-trading-core`, `frontend-paper-trading`) still
 exist as local refs. Fully merged; safe to delete with `git branch -d`.
 
-Test counts: **847 backend** (8 golden deselected), **36 frontend**. ruff,
+Test counts: **862 backend** (8 golden deselected, 15 of them sandbox tests that spawn real containers), **36 frontend**. ruff,
 mypy, eslint, tsc all clean.
 
 ---
@@ -117,10 +117,36 @@ source re-registers idempotently (a retry, not a change). Nothing that fails
 static validation is stored, and the rejection carries the agent-facing report
 so a caller can hand it straight back.
 
-Next in Phase 2: **the sandbox** (gVisor in Docker Desktop's Linux VM). It is
-now the single gate on the rest — §9 stage 2 (smoke run) and D4 (the worked
-examples, which must be *executed* before publication) both wait on it. The
-upload path is otherwise complete: validate → register.
+**The sandbox is built** (`trading.agent_contract.sandbox`, image in
+`sandbox/`). Build it with `docker build -t trading-strategy-sandbox:0.1
+sandbox/` — the tests need it.
+
+**Correction to an earlier assumption in this file: Docker Desktop cannot run
+gVisor.** It ships `runc` only, and there is no supported way to install
+`runsc` into its VM. So the sandbox enforces network-none, read-only rootfs,
+all capabilities dropped, `no-new-privileges`, memory/CPU/PID ceilings, a
+host-enforced wall-clock timeout, and a non-root uid — real confinement, but
+**the host kernel is shared**. `SandboxLimits(runtime="runsc")` selects gVisor
+on a host that has one, and every `SandboxResult` records `runtime` and
+`kernel_isolated` so a stored run can never be misread as better isolated than
+it was. Proportionate for single-user V1 (the code is your own agent's);
+**gVisor is required before Phase 4**, when strangers' code runs here. That
+likely means a Linux VPS after all — not for scale, for isolation.
+
+Strategy source is piped over **stdin**, not bind-mounted: no host path is
+exposed, and it sidesteps Docker Desktop's fixed share list, which excludes the
+system temp directory (the first implementation failed on exactly that).
+
+15 tests attempt the forbidden thing and assert containment — socket, DNS,
+writing outside `/tmp`, memory exhaustion, an infinite loop, running as root.
+Verified non-vacuous by weakening the sandbox (network on, rootfs writable) and
+watching them fail.
+
+Next in Phase 2: **§9 stage 2, the smoke run** — five simulated days through a
+real `Context`. The sandbox now runs `configure()` and returns the manifest;
+what remains is feeding a strategy actual bars over the RPC boundary. That also
+unblocks D4 (the worked examples, which must be *executed* before publication).
+Upload path so far: validate → register → run `configure()` in the sandbox.
 
 **Acceptance bar** (plan §10): the contract is not done until *three different
 frontier agents*, each given only that file, each produce a working strategy

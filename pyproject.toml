@@ -38,6 +38,7 @@ markers = [
     "live: hits the real network; excluded from the default run",
     "db: requires a running TimescaleDB",
     "golden: grades the cost model against real broker figures; needs a contract note",
+    "sandbox: runs real containers to prove strategy isolation; needs Docker and the trading-strategy-sandbox image",
 ]
 
 [tool.ruff]

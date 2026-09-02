@@ -427,17 +427,42 @@ An edge thinner than that is not an edge.
 Strategy code runs isolated: **no network, read-only filesystem**, hard CPU,
 memory, and wall-clock limits, non-root.
 
-**Partly settled.** The sandbox will run under gVisor inside **Docker
-Desktop's Linux VM** on the development machine (gVisor is Linux-only and
-cannot run on macOS directly); a VPS becomes relevant only for scale, not for
-correctness. The specific limits, the allowed-import list, and the timeout are
-still open (D3) because the sandbox is not built. The intended shape:
-`numpy`, `pandas`, `ta-lib`, and a standard-library subset permitted;
-`open`, `socket`, `exec`, `subprocess`, and dunder escapes rejected by static
-analysis before the code ever runs.
+**Settled and enforced.** Strategy code runs in a container with:
+
+| Limit | Default |
+|---|---|
+| Memory | 256 MB, no swap |
+| CPU | 1.0 core |
+| Processes | 64 (a fork bomb stays the container's problem) |
+| Wall clock | 30 s, enforced by the host |
+| Filesystem | read-only, with one 16 MB `tmpfs` at `/tmp` (`noexec`, `nosuid`) |
+| Network | **none** — no interface exists, not merely a blocked port |
+| Capabilities | all dropped, plus `no-new-privileges` |
+| User | non-root, uid 10001 |
+
+Your source is piped in over stdin; no host path is mounted, and there is no
+file on disk for a strategy to rewrite between validation and execution. `/tmp`
+is the only writable surface and it dies with the container.
+
+The allowlist is in §8's companion — `numpy` and `pandas` are installed and
+importable; the full permitted set is enforced by static validation before a
+strategy ever reaches the sandbox.
+
+**About the runtime.** The plan specifies gVisor (`runsc`), which interposes a
+user-space kernel so an escape must first get through *it*. Where a host
+provides `runsc` the sandbox uses it. Where it does not — Docker Desktop on
+macOS ships `runc` only, with no supported way to add gVisor — the confinement
+above still holds, but **the host kernel is shared**, so a kernel-level exploit
+that gVisor would absorb is not contained.
+
+Every run records which runtime confined it, rather than leaving it to be
+assumed. That distinction is load-bearing before Phase 4, when code from
+strangers runs here; for single-user V1, where the code is your own agent's,
+hardened `runc` is proportionate.
 
 Do not write code that reads files, opens sockets, spawns processes, or imports
-anything not on the final allowlist.
+anything not on the allowlist — it will fail, and the failure will be reported
+against your strategy.
 
 ---
 
@@ -547,7 +572,7 @@ like, so each is worth settling deliberately.
 |---|---|---|
 | **D1** | Universe: explicit list, query, or both? | **Settled — both.** An explicit `InstrumentRef` list for a handful of named instruments; a `Query` when the universe is dynamic. Resolution is point-in-time either way, which is where the survivorship guarantee lives. The query form exists because hardcoding today's index constituents into a 2022 backtest silently selects for survival. |
 | **D2** | How dated lot size reaches `ctx`. | **Settled.** `ctx.data.lot_size(instrument_id)`, resolved at `ctx.now`, `None` where there is no lot concept. A method on `ctx.data`, not a field on the instrument, so a 2026 lot size cannot be cached into a 2022 backtest. |
-| **D3** | Sandbox limits and the import allowlist. | **Partly settled.** gVisor runs inside Docker Desktop's Linux VM on the dev machine; a VPS is a scale question, not a correctness one. Specific limits, timeout, and allowlist remain open until the sandbox exists. |
+| **D3** | Sandbox limits and the import allowlist. | **Settled** — see §8 for the enforced table. Discovered while building it: Docker Desktop ships `runc` only and cannot host gVisor, so the runtime is configurable and every result records which one confined it. gVisor becomes a requirement before Phase 4, not before V1. |
 | **D4** | Worked examples. | **Open, deliberately.** Blocked on the runtime — each must be *executed* before publication, because an example is a promise the code runs. |
 | **D5** | Does `on_bar` fire for an instrument that did not trade? | **Settled — absent from the dict.** Carrying the previous close forward invents a trade that did not happen and lets a strategy act on liquidity that was not there. `ctx.data.last()` covers the "last known price" need. |
 | **D6** | Can one strategy hold more than one portfolio? | **Settled — no.** One strategy, one portfolio, one currency. This matches the platform: the currency gate is enforced at order submission and there is no FX mark model. **Consequence, stated plainly:** a single strategy cannot trade NSE equities and crypto together in V1. Revisit when multi-currency portfolios exist. |

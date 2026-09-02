@@ -419,8 +419,7 @@ def create_order(
         )
 
     instrument_row = conn.execute(
-        "SELECT asset_class, exchange, segment, currency FROM instruments"
-        " WHERE instrument_id = %s",
+        "SELECT asset_class, exchange, segment, currency FROM instruments WHERE instrument_id = %s",
         (body.instrument_id,),
     ).fetchone()
     if instrument_row is None:

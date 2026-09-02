@@ -55,9 +55,25 @@ The classes a strategy does instantiate — `StrategyManifest`, `Param`,
 `InstrumentRef`, `Query`, `DataRequest`, and the `Strategy` base — are all
 real working code today, with real validation in them.
 
-Therefore the runtime needs no substitute module, no `sys.modules`
-injection, and no de-stubbed copy. `trading.runtime.context.LiveContext`
-**subclasses** `platform_sdk.Context` and overrides the raising methods. A
+Therefore the runtime needs no substitute module and no de-stubbed copy.
+`trading.runtime.context.LiveContext` **subclasses** the stub's `Context`
+and overrides the raising methods.
+
+*Corrected while writing the implementation plan:* an earlier draft of
+this decision also claimed no `sys.modules` work was needed. That was
+wrong. The module lives at `src/trading/agent_contract/platform_sdk.py`
+and is importable by the bare name `platform_sdk` only inside the
+container, where `PYTHONPATH=/opt` puts it there. A strategy writes
+`from platform_sdk import Strategy` while the runtime would write
+`from trading.agent_contract import platform_sdk` — two import paths to
+one file, which Python resolves into **two distinct module objects**,
+with two distinct `Strategy` classes and a subclass relationship that
+silently is not one. So the runner aliases the canonical module under the
+bare name (`sys.modules["platform_sdk"] = ...`) before executing any
+strategy source. One module, both names. What the decision was actually
+buying — a single SDK, no de-stubbed copy, drift made impossible rather
+than merely tested for — is unaffected; only the incidental claim that no
+aliasing was required has been dropped. A
 strategy imports the same `platform_sdk` it type-checked against offline,
 and the offline stub cannot drift from the live runtime on shape, because
 the live runtime is a subclass of it. Any method added to the stub and not

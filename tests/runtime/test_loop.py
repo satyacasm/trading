@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 
+from trading.paper.breaker import REASON_MAX_DAILY_LOSS
 from trading.paper.enums import ChargeBasis, ChargeType, OrderStatus, Product, Rounding
 from trading.paper.models import ChargeSchedule
 from trading.runtime.loop import run_loop
@@ -207,7 +208,9 @@ def test_the_breaker_trips_on_a_declared_daily_loss() -> None:
         max_daily_loss=Decimal("1000"),
     )
     assert outcome.breaker_reason is not None
-    assert "MAX_DAILY_LOSS" in outcome.breaker_reason
+    # Against the constant, not a literal: a hardcoded string would keep
+    # passing-or-failing on its own terms if the reason were ever renamed.
+    assert outcome.breaker_reason.startswith(REASON_MAX_DAILY_LOSS)
 
 
 def test_two_identical_runs_produce_identical_order_snapshots() -> None:

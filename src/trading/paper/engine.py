@@ -461,15 +461,20 @@ class OpenOrderBook:
         self.order_index[order.order_id] = order.instrument_id
 
 
-def load_open_orders(conn: Connection) -> OpenOrderBook:
-    """Startup load: promote every `PENDING` order to `OPEN` (a `PENDING`
-    order is one the API accepted but this process hadn't picked up yet,
-    whether because it crashed, restarted, or was simply slower to start
-    than the API), then load every `OPEN`/`PARTIALLY_FILLED` order into a
-    fresh `OpenOrderBook`, keyed by `instrument_id`.
+def _promote_pending_and_load_active_orders(conn: Connection) -> list[Order]:
+    """Promote every still-`PENDING` order to `OPEN` (a `PENDING` order is
+    one the API accepted but no process has picked up yet -- whether
+    because the engine crashed, restarted, or is simply slower to start
+    than the API, or, for `reconcile_missing_orders`, because the
+    `orders:control` `new` message telling this process about it never
+    arrived), then return every `OPEN`/`PARTIALLY_FILLED` order as of
+    right now.
 
-    Commits its own writes: this is a one-shot startup read/write, not a
-    step inside a fill's transaction boundary.
+    Shared by `load_open_orders` (startup: every one of these goes into a
+    fresh, empty book) and `reconcile_missing_orders` (steady state: only
+    the ones missing from an already-populated book get adopted -- see its
+    own docstring). Commits its own writes: this is one-shot housekeeping,
+    not a step inside a fill's transaction boundary.
     """
     conn.execute(
         "UPDATE orders SET status = %s, updated_at = now() WHERE status = %s",
@@ -479,10 +484,16 @@ def load_open_orders(conn: Connection) -> OpenOrderBook:
         f"SELECT {_ORDER_COLUMNS} FROM orders WHERE status IN (%s, %s)",
         (OrderStatus.OPEN.value, OrderStatus.PARTIALLY_FILLED.value),
     ).fetchall()
+    return [_order_from_row(row) for row in rows]
 
+
+def load_open_orders(conn: Connection) -> OpenOrderBook:
+    """Startup load: every `PENDING`/`OPEN`/`PARTIALLY_FILLED` order (see
+    `_promote_pending_and_load_active_orders`) into a fresh `OpenOrderBook`,
+    keyed by `instrument_id`.
+    """
     book = OpenOrderBook()
-    for row in rows:
-        order = _order_from_row(row)
+    for order in _promote_pending_and_load_active_orders(conn):
         if order.instrument_id not in book.instrument_meta:
             book.instrument_meta[order.instrument_id] = _load_instrument_meta(
                 conn, order.instrument_id
@@ -490,6 +501,40 @@ def load_open_orders(conn: Connection) -> OpenOrderBook:
         book.add(order)
     conn.commit()
     return book
+
+
+def reconcile_missing_orders(conn: Connection, book: OpenOrderBook) -> list[int]:
+    """IMP-1's backstop. `create_order` publishes `orders:control`'s `new`
+    message *before* its own transaction commits (`trading.streaming.db.
+    get_db_connection` commits at dependency teardown, which -- measured
+    against the installed FastAPI version, see `test_background_task_runs_
+    before_yield_dependency_teardown` in `tests/paper/test_api.py` -- runs
+    *after* a `BackgroundTasks` task, not before it, so moving the publish
+    there would not fix this). Redis can therefore deliver `new` before
+    Postgres shows the order to a fresh connection, in which case
+    `_fetch_and_promote_order` finds nothing and the order is dropped
+    forever, silently. A dropped pub/sub message has the identical
+    symptom. Either way, no source-level fix closes this gap by itself.
+
+    This periodic sweep is the backstop that does: it re-derives the same
+    `PENDING`/`OPEN`/`PARTIALLY_FILLED` set `load_open_orders` computes at
+    startup (promoting `PENDING` -> `OPEN` the same way) and adopts into
+    `book` whatever isn't already tracked there. Every adoption is logged
+    at `info` by the caller -- an order arriving via this path means a
+    message was lost, and that must be visible, not silent.
+    """
+    adopted: list[int] = []
+    for order in _promote_pending_and_load_active_orders(conn):
+        if order.order_id in book.order_index:
+            continue
+        meta = book.instrument_meta.get(order.instrument_id)
+        if meta is None:
+            meta = _load_instrument_meta(conn, order.instrument_id)
+            book.instrument_meta[order.instrument_id] = meta
+        book.add(order, meta)
+        adopted.append(order.order_id)
+    conn.commit()
+    return adopted
 
 
 def _session_close_utc(session_date: date, session_close: time) -> datetime:
@@ -865,6 +910,7 @@ async def run_engine(
     slippage_bps: Decimal = Decimal("5"),
     sweep_check_seconds: float = 30.0,
     breaker_check_seconds: float = 5.0,
+    reconcile_check_seconds: float = 5.0,
     sleep: Sleeper = _default_sleep,
     max_ticks: int | None = None,
     pattern: str = _TICK_PATTERN,
@@ -877,6 +923,12 @@ async def run_engine(
     `max_ticks` tick messages have been consumed (fill or no fill) when
     it's an int -- a test seam, the same shape as `crypto_ingestor.
     run_ingestion_loop`'s `max_ticks`.
+
+    `reconcile_check_seconds` (default 5.0, matching `breaker_check_
+    seconds`'s cadence -- IMP-1) governs `reconcile_missing_orders`'s
+    periodic sweep, the backstop for a lost or too-early `orders:control`
+    `new` message. See that function's docstring for why no source-level
+    fix closes this gap alone.
     """
     validate_slippage_bps(slippage_bps)
 
@@ -939,6 +991,19 @@ async def run_engine(
             except Exception as exc:  # noqa: BLE001 - a breaker-check failure must never kill the loop
                 log.warning("paper_engine.breaker_sweep_failed", reason=str(exc))
 
+    async def _periodic_reconcile() -> None:
+        while not done.is_set():
+            await sleep(reconcile_check_seconds)
+            reconcile_conn = conn_factory()
+            try:
+                adopted = reconcile_missing_orders(reconcile_conn, book)
+                if adopted:
+                    log.info("paper_engine.reconcile_adopted", order_ids=adopted)
+            except Exception as exc:  # noqa: BLE001 - a reconcile failure must never kill the loop
+                log.warning("paper_engine.reconcile_failed", reason=str(exc))
+            finally:
+                reconcile_conn.close()
+
     tick_pubsub = redis.pubsub()
     await tick_pubsub.psubscribe(pattern)
     control_pubsub = redis.pubsub()
@@ -948,9 +1013,10 @@ async def run_engine(
     control_task = asyncio.create_task(_consume_control(control_pubsub))
     sweep_task = asyncio.create_task(_periodic_sweep())
     breaker_task = asyncio.create_task(_periodic_breaker_check())
+    reconcile_task = asyncio.create_task(_periodic_reconcile())
     try:
         if max_ticks is None:
-            await asyncio.gather(tick_task, control_task, sweep_task, breaker_task)
+            await asyncio.gather(tick_task, control_task, sweep_task, breaker_task, reconcile_task)
         else:
             await done.wait()
     finally:
@@ -958,6 +1024,7 @@ async def run_engine(
         control_task.cancel()
         sweep_task.cancel()
         breaker_task.cancel()
+        reconcile_task.cancel()
         try:
             await tick_pubsub.punsubscribe()
             await tick_pubsub.aclose()  # type: ignore[no-untyped-call]

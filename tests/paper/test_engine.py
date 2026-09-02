@@ -55,6 +55,7 @@ from trading.paper.engine import (
     evaluate_breaker_for_all_active_portfolios,
     evaluate_breaker_for_portfolio,
     load_open_orders,
+    reconcile_missing_orders,
     run_engine,
     sweep_expired_day_orders,
     validate_slippage_bps,
@@ -229,10 +230,19 @@ def _run_engine_with_publish(
     control_channel: str = "test-orders:control",
     slippage_bps: Decimal = Decimal("0"),
     sweep_check_seconds: float = 9999.0,
+    reconcile_check_seconds: float = 9999.0,
 ) -> None:
     """Run `run_engine` against an isolated tick pattern, publishing
     `publish` (channel, payload) pairs shortly after subscription lands,
-    then wait for both to finish."""
+    then wait for both to finish.
+
+    `reconcile_check_seconds` defaults far out of range for the same
+    reason `sweep_check_seconds` does: `sleep=_no_sleep` makes every
+    periodic task fire almost continuously, and the reconcile sweep -- IMP-1's
+    backstop -- actively mutates `book` (re-adopting anything OPEN in the
+    DB but missing from it), which most of this helper's callers don't
+    want interfering with a scenario they built by hand.
+    """
     async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
     try:
         loop_task = run_engine(
@@ -244,6 +254,7 @@ def _run_engine_with_publish(
             pattern=pattern,
             control_channel=control_channel,
             sweep_check_seconds=sweep_check_seconds,
+            reconcile_check_seconds=reconcile_check_seconds,
         )
 
         async def _publish_after_subscribed() -> None:
@@ -388,6 +399,103 @@ def test_load_open_orders_ignores_terminal_orders(setup_conn) -> None:
     )
     try:
         book = load_open_orders(setup_conn)
+        assert iid not in book.open_orders
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+# --- reconcile_missing_orders (IMP-1 backstop) -------------------------------
+
+
+def test_reconcile_missing_orders_adopts_an_untracked_open_order(setup_conn) -> None:
+    """The core case: an order genuinely OPEN in the database but missing
+    from `book` -- standing in for a lost or too-early orders:control `new`
+    message (see the module docstring and reconcile_missing_orders's own
+    docstring)."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_crypto_instrument(setup_conn)
+    order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        status=OrderStatus.OPEN,
+    )
+    try:
+        book = OpenOrderBook()  # deliberately empty
+        adopted = reconcile_missing_orders(setup_conn, book)
+        assert adopted == [order.order_id]
+        assert order.order_id in book.order_index
+        assert book.open_orders[iid][0].order_id == order.order_id
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+def test_reconcile_missing_orders_promotes_pending_to_open(setup_conn) -> None:
+    """Mirrors load_open_orders's own promotion, reusing the same shared
+    helper rather than duplicating the promotion query."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_crypto_instrument(setup_conn)
+    order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        status=OrderStatus.PENDING,
+    )
+    try:
+        book = OpenOrderBook()
+        adopted = reconcile_missing_orders(setup_conn, book)
+        assert adopted == [order.order_id]
+        db_status = setup_conn.execute(
+            "SELECT status FROM orders WHERE order_id=%s", (order.order_id,)
+        ).fetchone()
+        assert db_status == ("OPEN",)
+        assert book.open_orders[iid][0].status is OrderStatus.OPEN
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+def test_reconcile_missing_orders_skips_an_order_already_in_the_book(setup_conn) -> None:
+    """The steady-state case: nothing was lost, so reconcile must not
+    double-add an order the engine already knows about."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_crypto_instrument(setup_conn)
+    order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        status=OrderStatus.OPEN,
+    )
+    try:
+        book = OpenOrderBook()
+        book.add(order, meta=("CRYPTO", "BINANCE", "SPOT"))
+        adopted = reconcile_missing_orders(setup_conn, book)
+        assert adopted == []
+        assert len(book.open_orders[iid]) == 1
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+def test_reconcile_missing_orders_ignores_terminal_orders(setup_conn) -> None:
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_crypto_instrument(setup_conn)
+    make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        instrument_id=iid,
+        status=OrderStatus.CANCELLED,
+    )
+    try:
+        book = OpenOrderBook()
+        adopted = reconcile_missing_orders(setup_conn, book)
+        assert adopted == []
         assert iid not in book.open_orders
     finally:
         _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
@@ -947,6 +1055,13 @@ def test_run_engine_does_not_double_fill_on_a_second_identical_tick(
 
 
 def test_run_engine_cancel_control_message_prevents_a_fill(setup_conn, conn_factory) -> None:
+    """Publishes `cancel` *and* writes `CANCELLED` to the database, mirroring
+    what `trading.paper.api.cancel_order` actually does (IMP-1's reconcile
+    backstop made the DB write load-bearing here: without it, this order
+    is genuinely, indefinitely OPEN in the database with no cancellation
+    ever recorded, and reconcile_missing_orders would -- correctly --
+    re-adopt and fill it, since nothing distinguishes that from a lost
+    `new` message)."""
     pid = make_portfolio(setup_conn, cash=Decimal("100000"))
     iid = _make_crypto_instrument(setup_conn)
     order = make_order(
@@ -972,10 +1087,14 @@ def test_run_engine_cancel_control_message_prevents_a_fill(setup_conn, conn_fact
             pattern=pattern,
             control_channel=control_channel,
             sweep_check_seconds=9999.0,
+            reconcile_check_seconds=9999.0,
         )
 
         async def _publish_after_subscribed() -> None:
             await asyncio.sleep(0.2)
+            setup_conn.execute(
+                "UPDATE orders SET status='CANCELLED' WHERE order_id=%s", (order.order_id,)
+            )
             r = redis.Redis.from_url(get_settings().redis_url, decode_responses=True)
             try:
                 r.publish(
@@ -1027,6 +1146,7 @@ def test_run_engine_new_control_message_adds_and_fills_an_order(setup_conn, conn
             pattern=pattern,
             control_channel=control_channel,
             sweep_check_seconds=9999.0,
+            reconcile_check_seconds=9999.0,
         )
 
         async def _publish_after_subscribed() -> None:
@@ -1211,6 +1331,7 @@ def test_run_engine_loses_a_race_against_a_db_committed_cancel_and_fills_its_nei
             max_ticks=1,
             pattern=pattern,
             sweep_check_seconds=9999.0,
+            reconcile_check_seconds=9999.0,
         )
 
         async def _cancel_then_publish() -> None:
@@ -1600,6 +1721,79 @@ def test_run_engine_sweeps_a_day_order_via_the_periodic_check(setup_conn, conn_f
         _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
 
 
+# --- run_engine: reconciliation sweep wired into the loop (IMP-1) -----------
+
+
+def test_run_engine_reconciles_an_order_missing_from_the_book(setup_conn, conn_factory) -> None:
+    """No orders:control message is ever published for this order --
+    standing in for one that was dropped, or observed before the API's own
+    commit (see the module docstring's IMP-1 paragraph and
+    reconcile_missing_orders's docstring). Only the periodic reconcile
+    sweep can adopt it into the book; only then can the tick that follows
+    fill it. Mirrors test_run_engine_sweeps_a_day_order_via_the_periodic_
+    check's real-asyncio.sleep, short-interval shape, and test_run_engine_
+    new_control_message_adds_and_fills_an_order's "create the order only
+    after run_engine's startup load has already run" technique (so
+    load_open_orders provably can't be what found it)."""
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_crypto_instrument(setup_conn)
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    order_id_box: list[int] = []
+    try:
+        with structlog.testing.capture_logs() as cap:
+            async_redis: AsyncRedis = AsyncRedis.from_url(
+                get_settings().redis_url, decode_responses=True
+            )
+            try:
+                loop_task = run_engine(
+                    async_redis,
+                    conn_factory,
+                    slippage_bps=Decimal("0"),
+                    sleep=asyncio.sleep,
+                    max_ticks=1,
+                    pattern=pattern,
+                    sweep_check_seconds=9999.0,
+                    breaker_check_seconds=9999.0,
+                    reconcile_check_seconds=0.05,
+                )
+
+                async def _create_then_publish() -> None:
+                    await asyncio.sleep(0.15)  # let startup's load_open_orders finish first
+                    order = make_order(
+                        setup_conn,
+                        pid,
+                        side=Side.BUY,
+                        quantity=Decimal("1"),
+                        instrument_id=iid,
+                        order_type=OrderType.MARKET,
+                        product=Product.DELIVERY,
+                        status=OrderStatus.OPEN,
+                    )
+                    order_id_box.append(order.order_id)
+                    # No orders:control publish here, deliberately -- only
+                    # the periodic reconcile sweep can find this order.
+                    await asyncio.sleep(0.3)  # give the sweep a couple of cycles
+                    r = redis.Redis.from_url(get_settings().redis_url, decode_responses=True)
+                    try:
+                        r.publish(channel, _tick_json(iid, datetime.now(UTC), "10.00"))
+                    finally:
+                        r.close()
+
+                asyncio.run(_run_both(loop_task, _create_then_publish()))
+            finally:
+                asyncio.run(async_redis.aclose())
+
+        order_id = order_id_box[0]
+        adoptions = [e for e in cap if e.get("event") == "paper_engine.reconcile_adopted"]
+        assert len(adoptions) >= 1
+        assert any(order_id in e["order_ids"] for e in adoptions)
+
+        fills = setup_conn.execute("SELECT 1 FROM fills WHERE order_id=%s", (order_id,)).fetchall()
+        assert len(fills) == 1
+    finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
 # --- Task 10: circuit breaker wiring -----------------------------------------
 
 
@@ -1934,6 +2128,7 @@ def test_run_engine_periodic_breaker_check_trips_a_breaching_portfolio(
                 max_ticks=1,
                 pattern=pattern,
                 sweep_check_seconds=9999.0,
+                reconcile_check_seconds=9999.0,
                 breaker_check_seconds=0.05,
             )
 

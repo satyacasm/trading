@@ -22,7 +22,7 @@ from decimal import Decimal
 
 import pytest
 import redis
-from fastapi import FastAPI
+from fastapi import BackgroundTasks, Depends, FastAPI
 from fastapi.testclient import TestClient
 
 from tests.paper.helpers import make_order, make_portfolio
@@ -868,3 +868,60 @@ def test_get_positions_is_empty_for_a_portfolio_with_no_trades(
     response = client.get(f"/portfolios/{portfolio_id}/positions")
     assert response.status_code == 200
     assert response.json() == []
+
+
+# --- IMP-1: FastAPI background-task vs. yield-dependency teardown ordering --
+
+
+def test_background_task_runs_before_yield_dependency_teardown() -> None:
+    """IMP-1's empirical unknown, settled by measurement rather than
+    assumption. Ruling 27 requires moving create_order's `new`
+    orders:control publish into a FastAPI `BackgroundTasks` task -- but
+    only if the installed FastAPI version runs background tasks *after* a
+    `yield`-dependency's post-yield code (get_db_connection's
+    `conn.commit()` happens there). If background tasks instead run
+    *before* teardown, moving the publish there changes nothing: it would
+    still race ahead of the commit exactly as today, with extra ceremony
+    and no fix.
+
+    This reproduces that exact shape -- a yield-dependency plus a
+    background task -- independent of any real DB or Redis, so it settles
+    the question for whichever FastAPI version is actually installed.
+
+    Result (see final-review-fix-report.md): background tasks run BEFORE
+    teardown on the installed FastAPI (0.141.1) -- traced to
+    `fastapi.routing.request_response`'s `app()`: `await response(scope,
+    receive, send)` (which sends the response and, per Starlette, runs its
+    background tasks) happens *inside* the `async with AsyncExitStack() as
+    request_stack:` block that yield-dependencies are torn down on exiting.
+    So the 'move the publish into BackgroundTasks' source fix from the
+    brief would not fix IMP-1 -- this branch ships the reconciliation-sweep
+    backstop alone (`trading.paper.engine.reconcile_missing_orders`) and
+    leaves the publish exactly where it was. If this test ever starts
+    asserting the opposite order, that is the trigger to revisit the
+    source fix.
+    """
+    events: list[str] = []
+
+    def _yield_dependency() -> Iterator[None]:
+        yield
+        events.append("teardown")
+
+    probe_app = FastAPI()
+
+    @probe_app.get("/probe")
+    def probe(
+        background_tasks: BackgroundTasks,
+        _: None = Depends(_yield_dependency),
+    ) -> dict[str, bool]:
+        background_tasks.add_task(lambda: events.append("background"))
+        return {"ok": True}
+
+    with TestClient(probe_app) as probe_client:
+        response = probe_client.get("/probe")
+    assert response.status_code == 200
+
+    assert events == ["background", "teardown"], (
+        "FastAPI's background-task-vs-teardown ordering changed: "
+        f"observed {events!r}. Revisit IMP-1's source fix (ruling 27)."
+    )

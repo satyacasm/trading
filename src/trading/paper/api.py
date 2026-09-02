@@ -101,7 +101,7 @@ _PORTFOLIO_COLUMNS = (
 _ORDER_COLUMNS = (
     "order_id, portfolio_id, instrument_id, side, order_type, quantity,"
     " filled_quantity, limit_price, product, time_in_force, status,"
-    " rationale, submitted_at"
+    " rationale, submitted_at, rejection_reason"
 )
 
 
@@ -181,6 +181,7 @@ def _order_from_row(row: Sequence[Any]) -> Order:
         order_status,
         rationale,
         submitted_at,
+        rejection_reason,
     ) = row
     return Order(
         order_id=order_id,
@@ -196,6 +197,7 @@ def _order_from_row(row: Sequence[Any]) -> Order:
         status=OrderStatus(order_status),
         rationale=rationale,
         submitted_at=submitted_at,
+        rejection_reason=rejection_reason,
     )
 
 
@@ -509,6 +511,38 @@ def cancel_order(
     cancelled_order = _order_from_row(updated)
     _publish_order_control("cancel", cancelled_order.order_id)
     return cancelled_order
+
+
+@router.get("/orders", response_model=list[Order])
+def list_orders(
+    portfolio_id: int,
+    limit: int = Query(default=50, ge=1, le=500),
+    conn: Connection = Depends(get_db_connection),  # noqa: B008
+) -> list[Order]:
+    """This portfolio's orders, newest first -- the blotter's one query.
+
+    A plain `def`, like every route in this module: psycopg is
+    synchronous and an `async def` route running a blocking DB call on
+    the event loop deadlocked the gateway permanently under concurrency
+    (see this module's docstring).
+
+    An unknown `portfolio_id` is a 404 rather than an empty list,
+    mirroring `get_positions`: a typo in the id must be visible, not look
+    like a portfolio that simply has not traded yet.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM portfolios WHERE portfolio_id = %s", (portfolio_id,)
+    ).fetchone()
+    if exists is None:
+        raise HTTPException(
+            status_code=404, detail=f"no portfolio with portfolio_id={portfolio_id}"
+        )
+    rows = conn.execute(
+        f"SELECT {_ORDER_COLUMNS} FROM orders WHERE portfolio_id = %s"
+        " ORDER BY order_id DESC LIMIT %s",
+        (portfolio_id, limit),
+    ).fetchall()
+    return [_order_from_row(row) for row in rows]
 
 
 @router.get("/portfolios/{portfolio_id}/positions", response_model=list[Position])

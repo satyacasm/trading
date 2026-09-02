@@ -133,6 +133,12 @@ class Order(BaseModel):
     status: OrderStatus
     rationale: str
     submitted_at: datetime
+    # The column `orders` has always carried, now surfaced on the model so
+    # a rejected order can say *why* on screen. Optional rather than an
+    # empty string: a live order has no reason, and "no reason" must stay
+    # distinguishable from "a reason we failed to read". Defaulted so
+    # every existing constructor call site keeps working unchanged.
+    rejection_reason: str | None = None
 
     @property
     def remaining(self) -> Decimal:

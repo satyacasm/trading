@@ -218,3 +218,93 @@ def test_select_window_finds_the_latest_sessions_every_instrument_shares(db_conn
     bars = fetch_bars(db_conn, ids, window)
     assert set(bars) == set(ids)
     assert all(isinstance(bar.close, Decimal) for series in bars.values() for bar in series)
+
+
+@pytest.mark.db
+@pytest.mark.sandbox
+def test_smoke_test_runs_a_real_strategy_end_to_end(db_conn) -> None:  # noqa: ANN001
+    """`smoke_test()` is the public entry point of the whole feature and,
+    until now, had no coverage of its own composition: `build_verdict` is
+    exercised only against hand-built dicts, and `select_window`/
+    `fetch_bars` only in isolation. Nothing proved that configure ->
+    resolve_universe -> select_window -> fetch_bars -> _charge_key ->
+    load_schedules -> two sandboxed smoke runs -> build_verdict actually
+    fits together against a real container and a real database.
+
+    Three container runs happen inside this one `smoke_test()` call (one
+    configure, two smoke), so this is slow by nature.
+    """
+    import textwrap
+    from datetime import UTC, datetime
+
+    from trading.agent_contract.smoke import smoke_test
+
+    symbol = "SMOKEE2E"
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM',%s,'INR','ACTIVE',%s) "
+        "RETURNING instrument_id",
+        (symbol, f"NSE:CM:{symbol}"),
+    ).fetchone()
+    instrument_id = row[0]
+
+    # Three distinct sessions, five 1-minute bars each -- enough for
+    # select_window to find a real window and for a market order
+    # submitted on the first bar to fill against a later one.
+    for day in (25, 26, 27):
+        for minute in range(5):
+            db_conn.execute(
+                "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+                "close, volume, source) VALUES (%s,%s,60,100,101,99,100,10,1)",
+                (instrument_id, datetime(2026, 8, day, 9, 15 + minute, tzinfo=UTC)),
+            )
+
+    # UPSTOX/NSE/EQUITY/DELIVERY is one of the three combinations the
+    # seeded charge_schedules table actually carries (see the task brief);
+    # NSE equity is picked so _charge_key resolves without inventing data.
+    source = (
+        textwrap.dedent(
+            """
+            from decimal import Decimal
+            from platform_sdk import DataRequest, InstrumentRef, Strategy, StrategyManifest
+
+
+            class MyStrategy(Strategy):
+                def configure(self):
+                    return StrategyManifest(
+                        name="smoke-e2e",
+                        version="1.0.0",
+                        universe=[
+                            InstrumentRef(exchange="NSE", segment="CM", symbol="SMOKEE2E"),
+                        ],
+                        data=DataRequest(bars="1m", history_bars=10),
+                        capital=Decimal("1000000"),
+                        base_currency="INR",
+                    )
+
+                def initialize(self, ctx):
+                    self._ordered = False
+
+                def on_bar(self, ctx, bars):
+                    if not self._ordered:
+                        self._ordered = True
+                        ctx.order(
+                            list(bars)[0],
+                            side="BUY",
+                            quantity=Decimal("1"),
+                            rationale="end-to-end smoke coverage",
+                        )
+            """
+        ).strip()
+        + "\n"
+    )
+
+    verdict = smoke_test(db_conn, source)
+
+    assert verdict.passed is True, verdict.as_agent_feedback()
+    assert verdict.window["sessions"] == 3
+    assert verdict.window["instruments"] == {str(instrument_id): {"bars": 15}}
+    assert verdict.outcome is not None
+    assert verdict.outcome["fills"] == 1
+    assert len(verdict.outcome["orders"]) == 1
+    assert verdict.outcome["orders"][0]["status"] == "FILLED"

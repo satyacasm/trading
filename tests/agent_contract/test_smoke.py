@@ -255,6 +255,155 @@ def test_select_window_finds_the_latest_sessions_every_instrument_shares(db_conn
 
 
 @pytest.mark.db
+def test_fetch_bars_daily_branch_reconstructs_a_continuous_series_across_a_split(
+    db_conn,  # noqa: ANN001
+) -> None:
+    """A 1:2 split printed on day 3. Unadjusted closes would show a ~50%
+    drop between day 2 and day 3 -- the exact defect measured against real
+    NSE splits in the spec (COLAB: -51.0%, VLL: -49.0%, NAVKARURB: -47.6%).
+    With as_of set to the window's end (D3a-2: fixed for the whole run,
+    after the split), the adjusted series must be continuous instead.
+    """
+    from datetime import date
+
+    from trading.agent_contract.smoke import fetch_bars
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','DAILYSPLIT','INR',"
+        "'ACTIVE','NSE:CM:DAILYSPLIT') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+
+    # Day 3 is the ex-date. Its own bar is already printed post-split, per
+    # adjusted_bars's factor_for: an action scales a bar only when the
+    # ex_date is STRICTLY AFTER that bar's day.
+    closes = {
+        date(2024, 1, 8): 200,  # 2 days before ex-date
+        date(2024, 1, 9): 210,  # 1 day before ex-date
+        date(2024, 1, 10): 105,  # ex-date -- already post-split as printed
+        date(2024, 1, 11): 106,  # 1 day after
+        date(2024, 1, 12): 104,  # 2 days after
+    }
+    for day, close in closes.items():
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,%s,%s,%s,%s,10,1)",
+            (instrument_id, day, close, close, close, close),
+        )
+    db_conn.execute(
+        "INSERT INTO corporate_actions (instrument_id, action_type, ex_date, "
+        "ratio_from, ratio_to, source) VALUES (%s,'SPLIT','2024-01-10',1,2,'test')",
+        (instrument_id,),
+    )
+
+    window = {
+        "start": "2024-01-08T00:00:00+00:00",
+        "end": "2024-01-12T23:59:59.999999+00:00",
+        "sessions": 5,
+        "instruments": {},
+    }
+    bars = fetch_bars(db_conn, [instrument_id], window, interval_sec=86400)
+
+    series = [b.close for b in bars[instrument_id]]
+    assert series == [
+        Decimal("100.0000"),  # 200 * 0.5
+        Decimal("105.0000"),  # 210 * 0.5
+        Decimal("105.0000"),  # ex-date, unscaled
+        Decimal("106.0000"),  # unscaled
+        Decimal("104.0000"),  # unscaled
+    ]
+    # The regression itself: no jump anywhere near 50%.
+    for a, b in zip(series, series[1:], strict=False):
+        assert abs(b / a - 1) < Decimal("0.1"), (a, b)
+
+
+@pytest.mark.db
+def test_fetch_bars_daily_branch_uses_the_windows_end_as_as_of_not_some_other_date(
+    db_conn,  # noqa: ANN001
+) -> None:
+    """Pins D3a-2's specific choice, not just that adjustment happens at
+    all. `adjustment_factors`' query filters `ex_date <= as_of` -- an
+    action whose ex_date is after `as_of` is not merely left unscaled, it
+    is invisible entirely (confirmed by direct inspection of
+    `_ACTION_QUERY`). So a window that ENDS before the split's ex-date
+    must come back completely raw. If `_fetch_daily_bars` passed the
+    wrong date here -- `date.today()`, the window's START, anything but
+    `window["end"]` -- this is the test that would catch it: today's real
+    calendar date is long after 2024, so a `date.today()` bug would make
+    this test see the split as already known and silently pass adjusted
+    values instead of raw ones.
+    """
+    from datetime import date
+
+    from trading.agent_contract.smoke import fetch_bars
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','DAILYPRESPLIT','INR',"
+        "'ACTIVE','NSE:CM:DAILYPRESPLIT') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for day, close in {date(2024, 1, 8): 200, date(2024, 1, 9): 210}.items():
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,%s,%s,%s,%s,10,1)",
+            (instrument_id, day, close, close, close, close),
+        )
+    db_conn.execute(
+        "INSERT INTO corporate_actions (instrument_id, action_type, ex_date, "
+        "ratio_from, ratio_to, source) VALUES (%s,'SPLIT','2024-01-10',1,2,'test')",
+        (instrument_id,),
+    )
+
+    # Window ends 2024-01-09 -- the DAY BEFORE the split's ex_date.
+    window = {
+        "start": "2024-01-08T00:00:00+00:00",
+        "end": "2024-01-09T23:59:59.999999+00:00",
+        "sessions": 2,
+        "instruments": {},
+    }
+    bars = fetch_bars(db_conn, [instrument_id], window, interval_sec=86400)
+
+    series = [b.close for b in bars[instrument_id]]
+    assert series == [Decimal("200.0000"), Decimal("210.0000")]  # raw, NOT halved
+
+
+@pytest.mark.db
+def test_fetch_bars_1m_path_is_unaffected_by_the_daily_branch(db_conn) -> None:  # noqa: ANN001
+    """The default interval_sec=60 must produce identical output to before
+    this plan -- the vacuity guard for every 1-minute strategy already on
+    this platform."""
+    from datetime import UTC, datetime
+
+    from trading.agent_contract.smoke import fetch_bars
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','MINUTEONLY','INR',"
+        "'ACTIVE','NSE:CM:MINUTEONLY') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for minute in range(3):
+        db_conn.execute(
+            "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, "
+            "low, close, volume, source) VALUES (%s,%s,60,100,101,99,100,10,1)",
+            (instrument_id, datetime(2024, 1, 8, 9, 15 + minute, tzinfo=UTC)),
+        )
+    window = {
+        "start": "2024-01-08T00:00:00+00:00",
+        "end": "2024-01-08T23:59:59.999999+00:00",
+        "sessions": 1,
+        "instruments": {},
+    }
+
+    bars = fetch_bars(db_conn, [instrument_id], window)  # interval_sec defaults to 60
+
+    assert len(bars[instrument_id]) == 3
+    assert all(b.interval_sec == 60 for b in bars[instrument_id])
+
+
+@pytest.mark.db
 @pytest.mark.sandbox
 def test_smoke_test_runs_a_real_strategy_end_to_end(db_conn) -> None:  # noqa: ANN001
     """`smoke_test()` is the public entry point of the whole feature and,

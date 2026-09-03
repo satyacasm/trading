@@ -46,6 +46,7 @@ from trading.agent_contract.sandbox import (
 )
 from trading.agent_contract.validation import Finding, ValidationReport
 from trading.config import get_settings
+from trading.corpactions.adjust import adjusted_bars
 from trading.paper.charges import load_schedules
 from trading.paper.enums import Product
 from trading.runtime.payload import MODE_SMOKE, SmokePayload
@@ -380,11 +381,50 @@ def select_window(
     }
 
 
-def fetch_bars(
+def _fetch_daily_bars(
     conn: Connection, instrument_ids: Sequence[int], window: dict[str, Any]
+) -> dict[int, tuple[BarRecord, ...]]:
+    """The `bars="1d"` path: one `adjusted_bars` call per instrument.
+
+    `as_of` is the window's end date for every instrument and every bar in
+    the run (D3a-2) -- one fixed factor set, so the series is continuous
+    and returns are correct throughout the run, at the accepted cost that
+    an early bar's absolute price level may not match what the exchange
+    printed that day if a split lands later in the window.
+    """
+    start = datetime.fromisoformat(window["start"]).date()
+    end = datetime.fromisoformat(window["end"]).date()
+    series: dict[int, list[BarRecord]] = {}
+    for instrument_id in instrument_ids:
+        frame = adjusted_bars(conn, instrument_id, start, end, as_of=end)
+        for row in frame.iter_rows(named=True):
+            series.setdefault(instrument_id, []).append(
+                BarRecord(
+                    instrument_id=instrument_id,
+                    ts=row["ts"],
+                    interval_sec=86400,
+                    open=row["open"],
+                    high=row["high"],
+                    low=row["low"],
+                    close=row["close"],
+                    volume=None if row["volume"] is None else Decimal(row["volume"]),
+                )
+            )
+    window["instruments"] = {str(k): {"bars": len(v)} for k, v in series.items()}
+    return {k: tuple(v) for k, v in series.items()}
+
+
+def fetch_bars(
+    conn: Connection,
+    instrument_ids: Sequence[int],
+    window: dict[str, Any],
+    *,
+    interval_sec: int = 60,
 ) -> dict[int, tuple[BarRecord, ...]]:
     if window["start"] is None:
         return {}
+    if interval_sec == 86400:
+        return _fetch_daily_bars(conn, instrument_ids, window)
     rows = conn.execute(
         _BARS_SQL,
         (
@@ -397,7 +437,7 @@ def fetch_bars(
     for (
         instrument_id,
         ts,
-        interval_sec,
+        interval_sec_row,
         open_,
         high,
         low,
@@ -411,7 +451,7 @@ def fetch_bars(
             BarRecord(
                 instrument_id=instrument_id,
                 ts=ts,
-                interval_sec=interval_sec,
+                interval_sec=interval_sec_row,
                 open=open_,
                 high=high,
                 low=low,

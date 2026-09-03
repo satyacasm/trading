@@ -661,6 +661,8 @@ def test_resolve_bar_interval_rejects_anything_else() -> None:
         {"data": {"bars": None}},
         {"data": {}},
         {},
+        {"data": {"bars": ["1m"]}},  # unhashable type (list)
+        {"data": "1m"},  # data is not a dict
     ):
         with pytest.raises(_InvalidBarInterval):
             resolve_bar_interval(manifest)

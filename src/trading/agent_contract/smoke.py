@@ -439,10 +439,11 @@ class _InvalidBarInterval(Exception):
 
 
 def resolve_bar_interval(manifest: dict[str, Any]) -> int:
-    raw = (manifest.get("data") or {}).get("bars")
+    data = manifest.get("data")
+    raw = data.get("bars") if isinstance(data, dict) else None
     try:
         return _BAR_INTERVALS_SEC[raw]  # type: ignore[index]
-    except KeyError:
+    except (KeyError, TypeError):
         raise _InvalidBarInterval(
             f"the manifest declares data.bars={raw!r}, which is not one of the five "
             f"values the contract permits: {sorted(_BAR_INTERVALS_SEC)}. "

@@ -56,6 +56,7 @@ __all__ = [
     "build_verdict",
     "fetch_bars",
     "record_smoke_run",
+    "resolve_bar_interval",
     "resolve_universe",
     "select_window",
     "smoke_test",
@@ -414,6 +415,39 @@ def fetch_bars(
 
 class _UnresolvedUniverse(Exception):
     """A declared instrument has no row at `as_of`."""
+
+
+_BAR_INTERVALS_SEC: dict[str, int] = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "1h": 3600,
+    "1d": 86400,
+}
+
+
+class _InvalidBarInterval(Exception):
+    """The manifest's data.bars is not one of the five values §3 permits.
+
+    Raised rather than defaulted: nothing schema-checks this value before
+    smoke_test uses it -- api.py's pre-smoke-test validate_strategy() call
+    has no manifest yet, and validate_manifest only runs inside
+    register_strategy, after a passing smoke test. A silent default to
+    60 here would be the exact silent-wrong-data failure this plan exists
+    to remove, one function over.
+    """
+
+
+def resolve_bar_interval(manifest: dict[str, Any]) -> int:
+    raw = (manifest.get("data") or {}).get("bars")
+    try:
+        return _BAR_INTERVALS_SEC[raw]  # type: ignore[index]
+    except KeyError:
+        raise _InvalidBarInterval(
+            f"the manifest declares data.bars={raw!r}, which is not one of the five "
+            f"values the contract permits: {sorted(_BAR_INTERVALS_SEC)}. "
+            "See STRATEGY_CONTRACT.md §3."
+        ) from None
 
 
 def resolve_universe(conn: Connection, manifest: dict[str, Any], as_of: date) -> list[int]:

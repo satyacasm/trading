@@ -637,3 +637,30 @@ def test_a_crashed_run_reports_no_money_at_all() -> None:
     )
     assert verdict.pnl is None
     assert "P&L" not in verdict.as_agent_feedback()
+
+
+def test_resolve_bar_interval_maps_every_schema_value_to_seconds() -> None:
+    from trading.agent_contract.smoke import resolve_bar_interval
+
+    expected = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "1d": 86400}
+    for bars, seconds in expected.items():
+        manifest = {"data": {"bars": bars}}
+        assert resolve_bar_interval(manifest) == seconds
+
+
+def test_resolve_bar_interval_rejects_anything_else() -> None:
+    """No silent default. A typo'd interval reaching this function
+    unvalidated -- nothing schema-checks it before smoke_test calls this,
+    see the spec's testing-section correction -- must be a loud failure,
+    not a quiet 60.
+    """
+    from trading.agent_contract.smoke import _InvalidBarInterval, resolve_bar_interval
+
+    for manifest in (
+        {"data": {"bars": "2m"}},
+        {"data": {"bars": None}},
+        {"data": {}},
+        {},
+    ):
+        with pytest.raises(_InvalidBarInterval):
+            resolve_bar_interval(manifest)

@@ -45,6 +45,7 @@ from trading.agent_contract.sandbox import (
     run_strategy_in_sandbox,
 )
 from trading.agent_contract.validation import Finding, ValidationReport
+from trading.config import get_settings
 from trading.paper.charges import load_schedules
 from trading.paper.enums import Product
 from trading.runtime.payload import MODE_SMOKE, SmokePayload
@@ -463,11 +464,28 @@ def _charge_key(conn: Connection, instrument_ids: Sequence[int]) -> tuple[str, s
     return broker, exchange, asset_class
 
 
+def _resolve_limits(limits: SandboxLimits | None) -> SandboxLimits:
+    """The ceilings for this run, with the runtime filled in from settings.
+
+    `SandboxLimits.runtime=None` means "the daemon's default", and a
+    daemon with gVisor installed still defaults to `runc` -- so aiming
+    DOCKER_CONTEXT at a gVisor-capable VM buys nothing unless the runtime
+    is also asked for by name. Resolving it here rather than at each call
+    site means the `configure` pass cannot end up weaker than the smoke
+    passes, which is the failure mode worth designing out: `configure`
+    runs the strategy's code first.
+    """
+    if limits is not None:
+        return limits
+    return SandboxLimits(runtime=get_settings().strategy_sandbox_runtime)
+
+
 def smoke_test(
     conn: Connection, source: str, *, limits: SandboxLimits | None = None
 ) -> SmokeVerdict:
     """The whole of stage 2: configure, fetch, run twice, judge."""
-    configured = run_strategy_in_sandbox(source)
+    limits = _resolve_limits(limits)
+    configured = run_strategy_in_sandbox(source, limits)
     if not configured.ok or configured.manifest is None:
         return SmokeVerdict(
             passed=False,

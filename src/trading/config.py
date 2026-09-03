@@ -33,6 +33,15 @@ class Settings(BaseSettings):
     # at startup, whatever supplies it.
     paper_slippage_bps: Decimal = Decimal("5")
 
+    # Passed to `docker run --runtime` for every strategy sandbox container
+    # (trading.agent_contract.sandbox). None means "whatever the daemon
+    # defaults to", which is `runc` even on a host where gVisor is
+    # installed -- pointing DOCKER_CONTEXT at a gVisor-capable daemon is
+    # therefore NOT enough on its own. Set this to "runsc" to actually get
+    # kernel isolation. Left unset by default because a machine without
+    # gVisor would fail every sandbox run rather than degrade.
+    strategy_sandbox_runtime: str | None = None
+
     # Telegram Bot API credentials for `trading.paper.alerts`' outbox worker
     # (Task 11). Both optional: an unconfigured bot is a deliberate
     # configuration state for this personal, single-user system, not an

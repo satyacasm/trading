@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from trading.agent_contract.smoke import SmokeVerdict, build_verdict  # noqa: F401
+from trading.config import get_settings
 
 
 def _outcome(**overrides) -> dict:  # noqa: ANN003
@@ -471,3 +472,44 @@ def test_smoke_test_reports_an_unresolvable_instrument_as_a_finding(db_conn) -> 
     assert verdict.passed is False
     assert [f.code for f in verdict.report.findings] == ["MANIFEST_UNRESOLVABLE"]
     assert "NSE:CM:NOSUCHSYM" in verdict.as_agent_feedback()
+
+
+def test_both_container_passes_run_under_the_configured_runtime(monkeypatch) -> None:  # noqa: ANN001
+    """`SandboxLimits.runtime=None` means "whatever the daemon defaults to",
+    and the gVisor-capable VM still defaults to runc -- so pointing
+    DOCKER_CONTEXT at it is not enough to get kernel isolation. The runtime
+    has to be asked for. All three container runs must ask, including
+    `configure`, which was not passed limits at all: a configure pass
+    confined only by namespaces while the smoke passes are confined by
+    gVisor is strictly the weaker of the two, and it runs the strategy's
+    code first.
+    """
+    from trading.agent_contract import smoke as smoke_module
+
+    seen: list[object] = []
+
+    def fake_configure(source, limits=None):  # noqa: ANN001, ANN202
+        seen.append(limits)
+        raise _StopEarly
+
+    class _StopEarly(Exception):
+        pass
+
+    monkeypatch.setenv("STRATEGY_SANDBOX_RUNTIME", "runsc")
+    get_settings.cache_clear()
+    monkeypatch.setattr(smoke_module, "run_strategy_in_sandbox", fake_configure)
+
+    with pytest.raises(_StopEarly):
+        smoke_module.smoke_test(None, "irrelevant")  # type: ignore[arg-type]
+
+    get_settings.cache_clear()
+    assert [getattr(limit, "runtime", None) for limit in seen] == ["runsc"]
+
+
+def test_the_runtime_is_unset_by_default_so_the_daemon_decides() -> None:
+    # The vacuity guard: hard-coding "runsc" would satisfy the test above
+    # and would break every machine that does not have gVisor installed.
+    from trading.agent_contract.smoke import _resolve_limits
+
+    get_settings.cache_clear()
+    assert _resolve_limits(None).runtime is None

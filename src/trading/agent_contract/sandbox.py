@@ -101,8 +101,16 @@ class SandboxLimits:
     timeout_seconds: float = 30.0
     tmpfs_size: str = "16m"
     # Passed to `docker run --runtime`. "runsc" selects gVisor where the
-    # host provides it; None uses the daemon's default (runc).
+    # host provides it; None uses the daemon's default (runc) -- note that
+    # a daemon WITH runsc installed still defaults to runc, so this must be
+    # named to take effect.
     runtime: str | None = None
+    # Passed to `docker --context`, naming which daemon runs the container.
+    # Not a ceiling like the fields above, but it belongs with `runtime`:
+    # gVisor lives on a particular daemon, and choosing one without the
+    # other yields a run that is confined differently than it claims.
+    # None uses whatever the ambient DOCKER_CONTEXT/DOCKER_HOST selects.
+    docker_context: str | None = None
 
 
 @dataclass(frozen=True)
@@ -140,9 +148,23 @@ class SandboxResult:
         )
 
 
+def _docker_base(limits: SandboxLimits) -> list[str]:
+    """`docker`, plus the global flags that must precede any subcommand.
+
+    Shared by the run and the kill deliberately. A kill that omitted the
+    context would go to the default daemon, find no such container, fail
+    silently under check=False, and leave the runaway strategy consuming
+    CPU on the other daemon -- the one failure the timeout path exists to
+    prevent.
+    """
+    if limits.docker_context:
+        return ["docker", "--context", limits.docker_context]
+    return ["docker"]
+
+
 def _docker_args(limits: SandboxLimits, name: str) -> list[str]:
     args = [
-        "docker",
+        *_docker_base(limits),
         "run",
         "--rm",
         # Keep stdin open: the strategy source is written to it.
@@ -219,7 +241,7 @@ def _run_payload(raw: bytes, limits: SandboxLimits) -> SandboxResult:
         # it -- otherwise a strategy that ignores limits keeps consuming
         # its CPU share indefinitely.
         subprocess.run(  # noqa: S603 - fixed argv, no shell
-            ["docker", "kill", name],
+            [*_docker_base(limits), "kill", name],
             capture_output=True,
             check=False,
             timeout=15,

@@ -465,19 +465,30 @@ def _charge_key(conn: Connection, instrument_ids: Sequence[int]) -> tuple[str, s
 
 
 def _resolve_limits(limits: SandboxLimits | None) -> SandboxLimits:
-    """The ceilings for this run, with the runtime filled in from settings.
+    """The ceilings for this run, with the daemon and runtime from settings.
 
+    Both halves come from one place because either alone is a trap.
     `SandboxLimits.runtime=None` means "the daemon's default", and a
-    daemon with gVisor installed still defaults to `runc` -- so aiming
-    DOCKER_CONTEXT at a gVisor-capable VM buys nothing unless the runtime
-    is also asked for by name. Resolving it here rather than at each call
-    site means the `configure` pass cannot end up weaker than the smoke
-    passes, which is the failure mode worth designing out: `configure`
-    runs the strategy's code first.
+    daemon with gVisor installed still defaults to `runc`, so naming the
+    daemon without naming the runtime silently gets namespaces. Naming the
+    runtime without the daemon is worse: it asks for `runsc` from a daemon
+    that may not have it.
+
+    Resolving both here rather than at each call site also means the
+    `configure` pass cannot end up weaker than the smoke passes -- the
+    failure mode worth designing out, since `configure` is the first thing
+    that runs the strategy's code.
+
+    An explicit `limits` wins untouched: settings supply a default, they
+    do not override a caller who asked for something specific.
     """
     if limits is not None:
         return limits
-    return SandboxLimits(runtime=get_settings().strategy_sandbox_runtime)
+    settings = get_settings()
+    return SandboxLimits(
+        runtime=settings.strategy_sandbox_runtime,
+        docker_context=settings.strategy_sandbox_docker_context,
+    )
 
 
 def smoke_test(

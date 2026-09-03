@@ -513,3 +513,31 @@ def test_the_runtime_is_unset_by_default_so_the_daemon_decides() -> None:
 
     get_settings.cache_clear()
     assert _resolve_limits(None).runtime is None
+
+
+def test_the_configured_docker_context_reaches_every_container(monkeypatch) -> None:  # noqa: ANN001
+    """One setting, both halves. gVisor lives on a particular daemon, so a
+    runtime chosen without a daemon (or the reverse) produces a run that is
+    confined differently than the settings claim."""
+    from trading.agent_contract.smoke import _resolve_limits
+
+    monkeypatch.setenv("STRATEGY_SANDBOX_DOCKER_CONTEXT", "colima-sandbox")
+    monkeypatch.setenv("STRATEGY_SANDBOX_RUNTIME", "runsc")
+    get_settings.cache_clear()
+    try:
+        limits = _resolve_limits(None)
+    finally:
+        get_settings.cache_clear()
+
+    assert limits.docker_context == "colima-sandbox"
+    assert limits.runtime == "runsc"
+
+
+def test_an_explicit_limits_argument_still_wins() -> None:
+    # The vacuity guard: settings fill in a default, they do not override a
+    # caller that asked for something specific.
+    from trading.agent_contract.sandbox import SandboxLimits
+    from trading.agent_contract.smoke import _resolve_limits
+
+    asked = SandboxLimits(runtime=None, docker_context=None, memory="512m")
+    assert _resolve_limits(asked) is asked

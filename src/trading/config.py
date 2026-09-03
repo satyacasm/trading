@@ -42,6 +42,14 @@ class Settings(BaseSettings):
     # gVisor would fail every sandbox run rather than degrade.
     strategy_sandbox_runtime: str | None = None
 
+    # Passed to `docker --context`, naming which daemon runs the sandbox.
+    # Named explicitly rather than inherited from the ambient
+    # DOCKER_CONTEXT so that one configuration controls the whole sandbox:
+    # gVisor lives on a particular daemon, and a process that sets the
+    # runtime but inherits a different daemon would run strategies on one
+    # that has no runsc at all. None leaves the environment to decide.
+    strategy_sandbox_docker_context: str | None = None
+
     # Telegram Bot API credentials for `trading.paper.alerts`' outbox worker
     # (Task 11). Both optional: an unconfigured bot is a deliberate
     # configuration state for this personal, single-user system, not an

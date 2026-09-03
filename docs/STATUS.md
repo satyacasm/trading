@@ -198,9 +198,12 @@ because the window moves even though the version does not.
 Upload path, complete: validate → smoke → register, reachable over HTTP at
 `POST /strategies` and from the UI at `/strategies`. The request blocks for the
 whole run -- three containers, a few seconds -- which is right for one operator
-and wrong for a queue. Start the gateway with `DOCKER_CONTEXT=colima-sandbox`
-to get gVisor; without it every run records `kernel_isolated=false`, correctly
-but more weakly than you may assume.
+and wrong for a queue. Set both `STRATEGY_SANDBOX_DOCKER_CONTEXT=colima-sandbox`
+and `STRATEGY_SANDBOX_RUNTIME=runsc` (in `.env.local`) to get gVisor. **Both**
+are required and neither is inferred: that daemon lists `runsc` among its
+runtimes and still *defaults* to `runc`, so naming the daemon alone silently
+records `kernel_isolated=false` while looking correctly configured. Unset on a
+machine without gVisor -- there is no fallback, by design.
 
 Next in Phase 2: **D4, the worked examples.** They were withheld because an
 example in a contract is a promise the code runs, and nothing could run it.

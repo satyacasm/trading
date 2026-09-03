@@ -456,3 +456,65 @@ class Buyer(Strategy):
     # 99980, which omits the notional and is arithmetically wrong; see
     # the task report.)
     assert Decimal(result.outcome["final_cash"]) == Decimal("98980")
+
+
+# --- which daemon the containers go to ----------------------------------------
+
+
+@pytest.mark.parametrize("subcommand_index", [0])
+def test_the_docker_context_is_named_on_the_run(subcommand_index: int) -> None:
+    """gVisor lives in a second Colima VM, so reaching it means naming the
+    daemon. Passing `--context` explicitly rather than relying on the
+    ambient DOCKER_CONTEXT means one setting controls the whole sandbox --
+    a gateway started without the env var cannot end up running strategies
+    on a daemon that has no runsc while a setting says it does."""
+    from trading.agent_contract.sandbox import _docker_args
+
+    args = _docker_args(SandboxLimits(docker_context="colima-sandbox"), "probe")
+
+    assert args[0] == "docker"
+    # `--context` is a global flag: it MUST precede the subcommand, or
+    # docker parses it as an argument to `run` and errors.
+    assert args[1:3] == ["--context", "colima-sandbox"]
+    assert args[3] == "run"
+    assert args.index("--context") < args.index("run", subcommand_index)
+
+
+def test_no_context_flag_is_emitted_when_none_is_configured() -> None:
+    # The vacuity guard: always emitting `--context` would break every
+    # machine that has only the default daemon.
+    from trading.agent_contract.sandbox import _docker_args
+
+    args = _docker_args(SandboxLimits(), "probe")
+
+    assert "--context" not in args
+    assert args[:2] == ["docker", "run"]
+
+
+def test_the_kill_after_a_timeout_targets_the_same_daemon(monkeypatch) -> None:  # noqa: ANN001
+    """A `docker kill` without the context goes to the DEFAULT daemon,
+    where the container does not exist -- so it fails silently (check=False)
+    and the runaway strategy keeps burning CPU on the other daemon forever.
+    The timeout path is exactly where a leak matters most."""
+    import subprocess
+
+    from trading.agent_contract import sandbox as sandbox_module
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        calls.append(list(args))
+        if args[-1] == sandbox_module.DEFAULT_IMAGE:
+            raise subprocess.TimeoutExpired(cmd=args, timeout=1.0)
+        return subprocess.CompletedProcess(args, 0, b"", b"")
+
+    monkeypatch.setattr(sandbox_module.subprocess, "run", fake_run)
+
+    result = sandbox_module._run_payload(
+        b"", SandboxLimits(docker_context="colima-sandbox", timeout_seconds=1.0)
+    )
+
+    assert result.timed_out is True
+    kill = next(c for c in calls if "kill" in c)
+    assert kill[:3] == ["docker", "--context", "colima-sandbox"]
+    assert kill[3] == "kill"

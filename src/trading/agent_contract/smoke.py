@@ -127,6 +127,17 @@ class SmokeVerdict:
         return "\n".join(lines)
 
 
+def _last_line(outcome: dict[str, Any]) -> str:
+    """The final line of a traceback -- the exception, without the frames.
+
+    Sliced with `[-1]` rather than `[-1:]`: the latter is a list, and an
+    f-string renders a list as `['ValueError: boom']`, which reads to an
+    agent as a fault in the platform rather than one in its strategy.
+    """
+    lines = (outcome.get("error") or "").strip().splitlines()
+    return lines[-1].strip() if lines else "no error text was captured"
+
+
 def _order_key(order: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(order.get(field) for field in sorted(order))
 
@@ -154,15 +165,39 @@ def build_verdict(
                 message=(
                     f"{where} raised at simulated time {when}, after "
                     f"{first.get('bar_calls', 0):,} on_bar calls.\n"
-                    f"      {(first.get('error') or '').strip().splitlines()[-1:] or ['']}"[:600]
+                    f"      {_last_line(first)}"[:600]
                 ),
                 contract_section="§2",
             )
         )
-    else:
+    elif not second.get("ok"):
+        # Only the second pass died. That is not merely a crash -- it is
+        # proof the two passes disagreed, which is the deeper fault: a
+        # strategy that fails intermittently cannot be backtested at all,
+        # and the crash is the evidence rather than the finding. Reported
+        # here instead of leaving it to the order comparison below, which
+        # sees [] == [] whenever neither pass got far enough to order.
+        crashed_at = second.get("crashed_at") or {}
+        findings.append(
+            Finding(
+                code="NONDETERMINISTIC",
+                message=(
+                    "two runs of identical input disagreed: pass 1 completed "
+                    f"{first.get('bar_calls', 0):,} on_bar calls, pass 2 raised in "
+                    f"{crashed_at.get('handler', 'the strategy')} at simulated time "
+                    f"{crashed_at.get('ts') or 'an unknown point'}.\n"
+                    f"      {_last_line(second)}\n"
+                    "      A backtest of this strategy would not be reproducible. Common "
+                    "causes: random without a seed, iterating a set, or depending on dict "
+                    "insertion order that varies."
+                )[:800],
+                contract_section="§2",
+            )
+        )
+    if first.get("ok"):
         first_orders = [_order_key(o) for o in first.get("orders", [])]
         second_orders = [_order_key(o) for o in second.get("orders", [])]
-        if first_orders != second_orders:
+        if second.get("ok") and first_orders != second_orders:
             index = next(
                 (
                     i
@@ -333,6 +368,10 @@ def fetch_bars(
     return {k: tuple(v) for k, v in series.items()}
 
 
+class _UnresolvedUniverse(Exception):
+    """A declared instrument has no row at `as_of`."""
+
+
 def resolve_universe(conn: Connection, manifest: dict[str, Any], as_of: date) -> list[int]:
     """Instrument ids for a manifest's universe, point-in-time.
 
@@ -343,7 +382,7 @@ def resolve_universe(conn: Connection, manifest: dict[str, Any], as_of: date) ->
     """
     universe = manifest.get("universe")
     if isinstance(universe, list):
-        ids = []
+        ids, missing = [], []
         for ref in universe:
             row = conn.execute(
                 "SELECT instrument_id FROM instruments WHERE exchange=%s AND segment=%s "
@@ -351,8 +390,19 @@ def resolve_universe(conn: Connection, manifest: dict[str, Any], as_of: date) ->
                 "AND (delisted_on IS NULL OR delisted_on > %s)",
                 (ref["exchange"], ref["segment"], ref["symbol"], as_of, as_of),
             ).fetchone()
-            if row is not None:
+            if row is None:
+                missing.append(f"{ref['exchange']}:{ref['segment']}:{ref['symbol']}")
+            else:
                 ids.append(row[0])
+        if missing:
+            listed = "\n  ".join(missing)
+            raise _UnresolvedUniverse(
+                f"your universe declares {len(universe)} instrument(s); {len(missing)} "
+                f"do(es) not resolve at {as_of.isoformat()}:\n  {listed}\n"
+                "Check the exchange/segment/symbol triple, or the listing date if this "
+                "instrument is newly listed. Dropping it and running on the rest would "
+                "report a pass for a universe you did not ask for."
+            )
         return ids
     if not isinstance(universe, dict):
         universe = {}
@@ -439,7 +489,26 @@ def smoke_test(
         )
 
     manifest = configured.manifest
-    instrument_ids = resolve_universe(conn, manifest, datetime.now(UTC).date())
+    try:
+        instrument_ids = resolve_universe(conn, manifest, datetime.now(UTC).date())
+    except _UnresolvedUniverse as unresolved:
+        return SmokeVerdict(
+            passed=False,
+            warnings_only=False,
+            report=ValidationReport(
+                findings=(
+                    Finding(
+                        code="MANIFEST_UNRESOLVABLE",
+                        message=str(unresolved),
+                        contract_section="§3",
+                    ),
+                )
+            ),
+            window={"start": None, "end": None, "sessions": 0, "instruments": {}},
+            outcome=None,
+            runtime=configured.runtime,
+            kernel_isolated=configured.kernel_isolated,
+        )
     window = (
         select_window(conn, instrument_ids)
         if instrument_ids

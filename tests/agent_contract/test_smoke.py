@@ -308,3 +308,164 @@ def test_smoke_test_runs_a_real_strategy_end_to_end(db_conn) -> None:  # noqa: A
     assert verdict.outcome["fills"] == 1
     assert len(verdict.outcome["orders"]) == 1
     assert verdict.outcome["orders"][0]["status"] == "FILLED"
+
+
+def test_a_crash_report_names_the_exception_rather_than_its_list_repr() -> None:
+    # The last line of the traceback is what an agent acts on. Slicing it
+    # out with `[-1:]` yields a list, and an f-string renders a list as
+    # `['ValueError: boom']` -- brackets, quotes and all -- which reads as
+    # a formatting bug in the platform rather than a fault in the strategy.
+    crashed = _outcome(
+        ok=False,
+        error="Traceback (most recent call last):\n  ...\nValueError: boom",
+        crashed_at={"handler": "on_bar", "ts": "09:31"},
+    )
+    feedback = build_verdict(crashed, crashed, _WINDOW, "runc", False).as_agent_feedback()
+    assert "ValueError: boom" in feedback
+    assert "['ValueError: boom']" not in feedback
+
+
+def test_a_crash_on_only_the_second_pass_is_caught_as_nondeterministic() -> None:
+    # The whole point of running twice is that a strategy which fails
+    # intermittently is a strategy nobody can backtest. `build_verdict`
+    # branched on the FIRST pass alone, so when neither pass ordered, the
+    # order-sequence comparison was [] == [] and a crashed second pass
+    # produced a PASS.
+    clean = _outcome()
+    crashed = _outcome(
+        ok=False,
+        code="SMOKE_CRASH",
+        error="ValueError: boom",
+        crashed_at={"handler": "on_bar", "ts": "09:31"},
+    )
+    verdict = build_verdict(clean, crashed, _WINDOW, "runc", False)
+    assert verdict.passed is False
+    assert "NONDETERMINISTIC" in [f.code for f in verdict.report.findings]
+    feedback = verdict.as_agent_feedback()
+    assert "ValueError: boom" in feedback
+    assert "pass 2" in feedback
+
+
+def test_a_timeout_on_only_the_second_pass_is_caught_too() -> None:
+    # `_outcome_of` translates a timeout and an OOM kill into the same
+    # crash shape, so they travel the same path -- but only if that path
+    # looks at the second pass at all.
+    clean = _outcome()
+    timed_out = _outcome(
+        ok=False,
+        code="SMOKE_TIMEOUT",
+        error="[SMOKE_TIMEOUT] the run exceeded its wall clock",
+        crashed_at={"handler": "SMOKE_TIMEOUT", "ts": ""},
+    )
+    verdict = build_verdict(clean, timed_out, _WINDOW, "runc", False)
+    assert verdict.passed is False
+    assert "NONDETERMINISTIC" in [f.code for f in verdict.report.findings]
+
+
+def test_only_one_nondeterminism_finding_is_raised_when_a_pass_crashes() -> None:
+    # A crashed pass reports no orders, so the sequence comparison would
+    # fire a SECOND NONDETERMINISTIC for the same underlying event and
+    # read as two separate problems.
+    clean = _outcome(orders=[{"order_id": 1, "submitted_at": "09:31"}], fills=1)
+    crashed = _outcome(
+        ok=False, code="SMOKE_CRASH", error="ValueError: boom",
+        crashed_at={"handler": "on_bar", "ts": "09:31"},
+    )
+    codes = [f.code for f in build_verdict(clean, crashed, _WINDOW, "runc", False).report.findings]
+    assert codes.count("NONDETERMINISTIC") == 1
+
+
+@pytest.mark.db
+def test_a_declared_instrument_that_does_not_resolve_is_named_not_dropped(db_conn) -> None:  # noqa: ANN001
+    """`resolve_universe` appended only the refs that matched a row, so a
+    typo'd symbol vanished and the strategy ran on a smaller universe than
+    it declared -- and passed. Silently narrowing the universe is the same
+    class of defect as a silently-zero charge: the run reports success for
+    a market that is not the one the manifest asked for."""
+    from datetime import date
+
+    from trading.agent_contract.smoke import _UnresolvedUniverse, resolve_universe
+
+    db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','RESOLVEOK','INR','ACTIVE',"
+        "'NSE:CM:RESOLVEOK')"
+    )
+    manifest = {
+        "universe": [
+            {"exchange": "NSE", "segment": "CM", "symbol": "RESOLVEOK"},
+            {"exchange": "NSE", "segment": "CM", "symbol": "NOSUCHSYM"},
+        ]
+    }
+
+    with pytest.raises(_UnresolvedUniverse) as raised:
+        resolve_universe(db_conn, manifest, date(2026, 9, 3))
+
+    message = str(raised.value)
+    assert "NSE:CM:NOSUCHSYM" in message
+    assert "declares 2" in message
+    assert "RESOLVEOK\n" not in message  # the one that DID resolve is not blamed
+
+
+@pytest.mark.db
+def test_a_fully_resolvable_universe_still_returns_its_ids(db_conn) -> None:
+    # The vacuity guard for the test above: raising on every universe
+    # would satisfy it just as well.
+    from datetime import date
+
+    from trading.agent_contract.smoke import resolve_universe
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','RESOLVEOK2','INR','ACTIVE',"
+        "'NSE:CM:RESOLVEOK2') RETURNING instrument_id"
+    ).fetchone()
+
+    manifest = {"universe": [{"exchange": "NSE", "segment": "CM", "symbol": "RESOLVEOK2"}]}
+    assert resolve_universe(db_conn, manifest, date(2026, 9, 3)) == [row[0]]
+
+
+@pytest.mark.db
+@pytest.mark.sandbox
+def test_smoke_test_reports_an_unresolvable_instrument_as_a_finding(db_conn) -> None:  # noqa: ANN001
+    """The exception is only useful if `smoke_test` turns it into a finding
+    the agent reads, rather than letting it escape as a 500."""
+    import textwrap
+
+    from trading.agent_contract.smoke import smoke_test
+
+    source = (
+        textwrap.dedent(
+            """
+            from decimal import Decimal
+            from platform_sdk import DataRequest, InstrumentRef, Strategy, StrategyManifest
+
+
+            class MyStrategy(Strategy):
+                def configure(self):
+                    return StrategyManifest(
+                        name="ghost-universe",
+                        version="1.0.0",
+                        universe=[
+                            InstrumentRef(exchange="NSE", segment="CM", symbol="NOSUCHSYM"),
+                        ],
+                        data=DataRequest(bars="1m", history_bars=10),
+                        capital=Decimal("1000000"),
+                        base_currency="INR",
+                    )
+
+                def initialize(self, ctx):
+                    pass
+
+                def on_bar(self, ctx, bars):
+                    pass
+            """
+        ).strip()
+        + "\n"
+    )
+
+    verdict = smoke_test(db_conn, source)
+
+    assert verdict.passed is False
+    assert [f.code for f in verdict.report.findings] == ["MANIFEST_UNRESOLVABLE"]
+    assert "NSE:CM:NOSUCHSYM" in verdict.as_agent_feedback()

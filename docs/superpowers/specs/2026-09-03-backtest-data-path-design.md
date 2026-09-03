@@ -166,10 +166,20 @@ Named so they read as sequencing, not oversight:
 - **1-minute strategies are provably unaffected:** `fetch_bars` output for
   `interval_sec < 86400` is asserted byte-identical to pre-change behavior.
 - **`resolve_bar_interval`** is unit-tested against all five schema values,
-  plus the unmapped/invalid case (should surface as a validation-stage
-  finding, not a runtime crash — stage 1 already validates `DataRequest`
-  against `schema.json`'s enum, so this is confirming that guarantee holds
-  rather than adding new defensive code).
+  plus the unmapped/invalid case, which must raise rather than default.
+  **Correction found while writing the implementation plan:** the spec
+  originally assumed stage 1 already validates `DataRequest` against
+  `schema.json`'s enum before this code runs. Checked directly — it does
+  not, on this call path. `api.py`'s pre-smoke-test call is
+  `validate_strategy(request.source)`, with no manifest (`configure()`
+  has not run yet), and `validate_manifest` — which does check the `bars`
+  enum — is only invoked by `register_strategy`, *after* a passing smoke
+  test. A typo'd `bars` value reaches `resolve_bar_interval` completely
+  unvalidated. It must raise a dedicated exception that `smoke_test`
+  catches into a `MANIFEST_UNRESOLVABLE` finding, mirroring the existing
+  `_UnresolvedUniverse`/`_MixedUniverse` pattern — silently defaulting to
+  `60` would be the exact silent-wrong-data failure this sub-project
+  exists to remove, just relocated one function over.
 - **`as_of` semantics:** a bar dated *before* a split shows the split's
   adjustment factor when `as_of` is after the split's `ex_date`, and does
   not when `as_of` is before it — pinning D3a-2 against the point-in-time

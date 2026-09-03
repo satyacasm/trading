@@ -39,11 +39,26 @@ The bundle is three files:
 
 ## 2. The strategy interface
 
-A strategy is a single Python class named `Strategy`. Every method except
-`configure` and `initialize` is optional; implement only the events you need.
+A strategy is a single Python class that **subclasses `Strategy`**, imported
+from `platform_sdk`. Name it whatever you like *except* `Strategy` -- that name
+belongs to the base class, and the runner skips it when looking for yours.
+Every method except `configure` and `initialize` is optional; implement only
+the events you need.
 
 ```python
-class Strategy:
+from platform_sdk import (
+    Bar,
+    Context,
+    ExpiryEvent,
+    InstrumentId,
+    OrderUpdate,
+    Strategy,
+    StrategyManifest,
+    Tick,
+)
+
+
+class MyStrategy(Strategy):          # your own name, subclassing Strategy
     def configure(self) -> StrategyManifest:
         """Declare universe, data needs, capital, schedule, and parameters.
         Called once, before anything else, outside the simulation clock.

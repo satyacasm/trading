@@ -202,3 +202,68 @@ def test_sdk_forbids_reading_the_wall_clock() -> None:
     ctx = sdk.Context()
     with pytest.raises(sdk.NotOnThisPlatform):
         _ = ctx.now
+
+
+# --- §2's example must be code, not prose -------------------------------------
+
+
+def _section_2_example() -> str:
+    """The first Python block under §2 of the contract."""
+    from pathlib import Path
+
+    import trading.agent_contract as pkg
+
+    text = (
+        Path(pkg.__file__).resolve().parents[3] / "docs" / "agent-contract" / "STRATEGY_CONTRACT.md"
+    ).read_text()
+    section = text.split("## 2. The strategy interface", 1)[1].split("\n## ", 1)[0]
+    return section.split("```python", 1)[1].split("```", 1)[0].strip() + "\n"
+
+
+def test_the_contract_example_passes_the_validator_it_documents() -> None:
+    """Found by dogfooding, and the reason this test exists at all.
+
+    §2 said "a class named `Strategy`" and showed `class Strategy:`. Stage
+    1 agreed with the document; `sandbox/runner.py` did not, and refused
+    that exact shape. A cold agent given only the contract wrote what it
+    was told and was rejected three containers later.
+
+    Nothing caught it because every test in this repo was written by
+    someone who already knew the real rule and wrote `class
+    MyStrategy(Strategy)`. So: the contract's own example is now run
+    through the real validator, and the document cannot drift from the
+    code again without this failing.
+    """
+    from trading.agent_contract.validation import validate_strategy
+
+    report = validate_strategy(_section_2_example())
+
+    assert report.ok, report.as_agent_feedback()
+
+
+def test_the_contract_example_imports_every_name_it_uses() -> None:
+    """The example annotates with Context, Bar, Tick and friends. Python
+    evaluates annotations at class-definition time, so a name used and not
+    imported is a NameError the moment the runner imports the module --
+    which an agent copying the example would inherit."""
+    import ast
+
+    tree = ast.parse(_section_2_example())
+    imported = {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    used = {
+        node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id[:1].isupper()
+    }
+    bases = {
+        b.id
+        for n in ast.walk(tree)
+        if isinstance(n, ast.ClassDef)
+        for b in n.bases
+        if isinstance(b, ast.Name)
+    }
+
+    assert (used | bases) - imported == set(), f"used but not imported: {(used | bases) - imported}"

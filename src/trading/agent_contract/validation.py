@@ -305,15 +305,24 @@ class _Scanner(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        # "A strategy" is any class inheriting something named Strategy, or
-        # named Strategy itself. Deliberately loose: the runtime resolves
-        # the real class, and this stage only checks the shape is present.
+        # Mirrors `sandbox/runner.py`'s discovery exactly: a class that
+        # inherits something named Strategy AND is not itself named
+        # Strategy. Both halves matter -- the runner filters on
+        # `name != "Strategy"` before checking the MRO, so shadowing the
+        # base class fails there even though it inherits correctly.
+        #
+        # This rule used to also accept a class merely NAMED Strategy,
+        # which is what §2 of the contract described. Dogfooding caught it:
+        # a cold agent wrote `class Strategy:`, this stage passed it, and
+        # the runtime refused it three containers later. A stage-1 rule
+        # looser than the runtime's costs exactly the round trip this
+        # stage exists to save.
         inherits_strategy = any(
             (isinstance(base, ast.Name) and base.id == "Strategy")
             or (isinstance(base, ast.Attribute) and base.attr == "Strategy")
             for base in node.bases
         )
-        if inherits_strategy or node.name == "Strategy":
+        if inherits_strategy and node.name != "Strategy":
             self.has_strategy_class = True
             if any(
                 isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef)
@@ -348,8 +357,14 @@ def validate_source(source: str) -> list[Finding]:
         scanner.findings.append(
             Finding(
                 code="NO_STRATEGY_CLASS",
-                message="defines no class inheriting `Strategy`. A strategy is a single "
-                "class named or deriving from Strategy.",
+                message=(
+                    "defines no class that subclasses `Strategy`. Write "
+                    "`from platform_sdk import Strategy`, then "
+                    "`class MyStrategy(Strategy):` -- your own name, subclassing the "
+                    "platform's base. A class merely *named* `Strategy` is not it: the "
+                    "runner skips that name deliberately, because it is the base class "
+                    "itself."
+                ),
                 contract_section="§2",
             )
         )

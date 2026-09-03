@@ -324,3 +324,72 @@ def test_feedback_states_that_static_validation_is_not_the_sandbox() -> None:
     honest mistakes; containment is the sandbox's job."""
     feedback = validate_strategy(CONFORMING).as_agent_feedback()
     assert "sandbox" in feedback.lower()
+
+
+# --- the class the runner will actually look for -------------------------------
+
+
+def test_a_class_merely_named_Strategy_is_rejected_as_the_runner_would() -> None:
+    """Found by dogfooding: an agent given only the contract wrote
+    `class Strategy:` -- exactly what §2 told it to -- and this stage waved
+    it through, because the rule was `inherits_strategy or name ==
+    "Strategy"`. `sandbox/runner.py` then refused it: it selects on
+    `name != "Strategy" and any(base.__name__ == "Strategy" ...)`, so a
+    class named Strategy is doubly disqualified.
+
+    A stage-1 rule looser than the runtime's is worse than no rule. The
+    entire justification for this stage is catching in milliseconds what
+    would otherwise cost three containers, and it was passing through the
+    single most likely misreading of the contract.
+    """
+    findings = validate_source(
+        src(
+            """
+            class Strategy:
+                def configure(self):
+                    return None
+
+                def on_bar(self, ctx, bars) -> None:
+                    pass
+            """
+        )
+    )
+
+    assert "NO_STRATEGY_CLASS" in codes(findings)
+    message = next(f.message for f in findings if f.code == "NO_STRATEGY_CLASS")
+    # Naming the actual mistake, not just the absence: "no strategy class"
+    # reads as nonsense to someone looking at the class they just wrote.
+    assert "subclass" in message.lower()
+
+
+def test_subclassing_under_your_own_name_is_what_passes() -> None:
+    # The vacuity guard for the test above: rejecting everything would
+    # satisfy it.
+    assert (
+        validate_source(
+            src(
+                """
+            class MyStrategy(Strategy):
+                def configure(self):
+                    return None
+            """
+            )
+        )
+        == []
+    )
+
+
+def test_shadowing_the_base_class_name_is_also_rejected() -> None:
+    # `class Strategy(Strategy)` inherits correctly and still fails the
+    # runner's `name != "Strategy"` guard.
+    assert "NO_STRATEGY_CLASS" in codes(
+        validate_source(
+            src(
+                """
+                class Strategy(Strategy):
+                    def configure(self):
+                        return None
+                """
+            )
+        )
+    )

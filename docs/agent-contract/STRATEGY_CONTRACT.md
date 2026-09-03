@@ -450,10 +450,15 @@ strategy ever reaches the sandbox.
 
 **About the runtime.** The plan specifies gVisor (`runsc`), which interposes a
 user-space kernel so an escape must first get through *it*. Where a host
-provides `runsc` the sandbox uses it. Where it does not — Docker Desktop on
-macOS ships `runc` only, with no supported way to add gVisor — the confinement
-above still holds, but **the host kernel is shared**, so a kernel-level exploit
-that gVisor would absorb is not contained.
+provides `runsc` the sandbox uses it. Where it does not, the confinement above
+still holds, but **the host kernel is shared**, so a kernel-level exploit that
+gVisor would absorb is not contained.
+
+An earlier revision of this section claimed gVisor was unavailable on the
+development machine because Docker Desktop ships `runc` only. That was wrong:
+the machine runs Colima, whose VM is ordinary Ubuntu, and `runsc` installs
+there normally. gVisor is verified working on arm64 in a dedicated Colima
+profile, at a measured cost of roughly 0.2s per run.
 
 Every run records which runtime confined it, rather than leaving it to be
 assumed. That distinction is load-bearing before Phase 4, when code from
@@ -572,7 +577,7 @@ like, so each is worth settling deliberately.
 |---|---|---|
 | **D1** | Universe: explicit list, query, or both? | **Settled — both.** An explicit `InstrumentRef` list for a handful of named instruments; a `Query` when the universe is dynamic. Resolution is point-in-time either way, which is where the survivorship guarantee lives. The query form exists because hardcoding today's index constituents into a 2022 backtest silently selects for survival. |
 | **D2** | How dated lot size reaches `ctx`. | **Settled.** `ctx.data.lot_size(instrument_id)`, resolved at `ctx.now`, `None` where there is no lot concept. A method on `ctx.data`, not a field on the instrument, so a 2026 lot size cannot be cached into a 2022 backtest. |
-| **D3** | Sandbox limits and the import allowlist. | **Settled** — see §8 for the enforced table. Discovered while building it: Docker Desktop ships `runc` only and cannot host gVisor, so the runtime is configurable and every result records which one confined it. gVisor becomes a requirement before Phase 4, not before V1. |
+| **D3** | Sandbox limits and the import allowlist. | **Settled** — see §8 for the enforced table. The runtime is configurable and every result records which one confined it. A first attempt concluded gVisor was unavailable here; that was an error about the local Docker backend (Colima, not Docker Desktop), corrected 2026-09-03 — `runsc` is verified working on arm64 in a dedicated Colima VM. gVisor becomes a requirement before Phase 4, not before V1, and is now available rather than hypothetical. |
 | **D4** | Worked examples. | **Open, deliberately.** Blocked on the runtime — each must be *executed* before publication, because an example is a promise the code runs. |
 | **D5** | Does `on_bar` fire for an instrument that did not trade? | **Settled — absent from the dict.** Carrying the previous close forward invents a trade that did not happen and lets a strategy act on liquidity that was not there. `ctx.data.last()` covers the "last known price" need. |
 | **D6** | Can one strategy hold more than one portfolio? | **Settled — no.** One strategy, one portfolio, one currency. This matches the platform: the currency gate is enforced at order submission and there is no FX mark model. **Consequence, stated plainly:** a single strategy cannot trade NSE equities and crypto together in V1. Revisit when multi-currency portfolios exist. |

@@ -7,8 +7,9 @@ syscalls, so a container escape has to get through gVisor's own kernel
 implementation before it reaches the host's. This module supports that --
 `SandboxLimits.runtime` passes straight to `docker run --runtime` -- but
 it does **not** assume it, because `runsc` is not available everywhere the
-platform runs. Docker Desktop on macOS ships `runc` only, and there is no
-supported way to install gVisor into its VM.
+platform runs, and a host that lacks it must still be able to run a
+strategy. On macOS the answer depends on the Docker backend: Colima's VM is
+ordinary Linux and takes `runsc` normally, while Docker Desktop's does not.
 
 Under `runc`, the guarantees below are real but of a different kind: the
 strategy is confined by namespaces, cgroups, capabilities, and seccomp,

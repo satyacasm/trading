@@ -298,3 +298,126 @@ def test_selecting_gvisor_is_recorded_as_kernel_isolated() -> None:
 
     result = SandboxResult(ok=True, stage="configure", runtime="runsc", kernel_isolated=True)
     assert "user-space kernel" in result.isolation_note
+
+
+# --- the universe crosses back -----------------------------------------------
+
+
+@pytest.mark.sandbox
+def test_the_manifest_carries_its_universe_back_to_the_host() -> None:
+    # The host cannot fetch bars without it; a manifest that omits the
+    # universe makes stage 2 impossible rather than merely degraded.
+    from trading.agent_contract.sandbox import run_strategy_in_sandbox
+
+    source = """
+from decimal import Decimal
+from platform_sdk import DataRequest, InstrumentRef, Strategy, StrategyManifest
+
+
+class Named(Strategy):
+    def configure(self):
+        return StrategyManifest(
+            name="named",
+            version="1.0.0",
+            universe=[InstrumentRef(exchange="NSE", segment="CM", symbol="RELIANCE")],
+            data=DataRequest(bars="1m", history_bars=10),
+            capital=Decimal("100000"),
+            base_currency="INR",
+        )
+"""
+    result = run_strategy_in_sandbox(source)
+    assert result.ok is True, result.error
+    assert result.manifest is not None
+    assert result.manifest["universe"] == [
+        {"exchange": "NSE", "segment": "CM", "symbol": "RELIANCE"}
+    ]
+
+
+# --- the event loop runs inside the container --------------------------------
+
+
+@pytest.mark.sandbox
+def test_a_smoke_run_returns_fills_from_inside_the_container() -> None:
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from trading.agent_contract.sandbox import run_smoke_in_sandbox
+    from trading.paper.enums import ChargeBasis, ChargeType, Product, Rounding
+    from trading.paper.models import ChargeSchedule
+    from trading.runtime.payload import MODE_SMOKE, SmokePayload
+    from trading.runtime.provider import BarRecord
+
+    source = """
+from decimal import Decimal
+from platform_sdk import DataRequest, InstrumentRef, Strategy, StrategyManifest
+
+
+class Buyer(Strategy):
+    def configure(self):
+        return StrategyManifest(
+            name="buyer",
+            version="1.0.0",
+            universe=[InstrumentRef(exchange="NSE", segment="CM", symbol="TEST")],
+            data=DataRequest(bars="1m", history_bars=10),
+            capital=Decimal("100000"),
+            base_currency="INR",
+        )
+
+    def on_bar(self, ctx, bars):
+        if not ctx.state.get("done"):
+            ctx.state["done"] = True
+            ctx.order(1, side="BUY", quantity=Decimal("10"), rationale="smoke entry")
+"""
+
+    bars = tuple(
+        BarRecord(
+            instrument_id=1,
+            ts=datetime(2026, 9, 1, 9, minute, tzinfo=UTC),
+            interval_sec=60,
+            open=Decimal("100"),
+            high=Decimal("100"),
+            low=Decimal("100"),
+            close=Decimal("100"),
+            volume=Decimal("10"),
+        )
+        for minute in range(5)
+    )
+    schedules = (
+        ChargeSchedule(
+            broker="TEST",
+            exchange="NSE",
+            asset_class="EQUITY",
+            product=Product.DELIVERY,
+            charge_type=ChargeType.BROKERAGE,
+            basis=ChargeBasis.FLAT_PER_ORDER,
+            applies_to_side="BOTH",
+            rate=Decimal("20.00"),
+            cap=None,
+            rounding=Rounding.TWO_DECIMALS,
+            gst_base_types=(),
+            effective_from=datetime(2020, 1, 1).date(),
+            effective_to=None,
+            source_note="test",
+        ),
+    )
+
+    result = run_smoke_in_sandbox(
+        SmokePayload(
+            mode=MODE_SMOKE,
+            source=source,
+            bars={1: bars},
+            charge_schedules=schedules,
+            starting_cash=Decimal("100000"),
+            slippage_bps=Decimal("0"),
+        )
+    )
+
+    assert result.ok is True, result.error
+    assert result.outcome is not None
+    assert result.outcome["bar_calls"] == 5
+    assert result.outcome["fills"] == 1
+    # BUY 10 @ 100 = 1000 notional, plus a flat 20 brokerage charge:
+    # 100000 - 1000 - 20 = 98980. (The brief's own worked example says
+    # 99980, which omits the notional and is arithmetically wrong; see
+    # the task report.)
+    assert Decimal(result.outcome["final_cash"]) == Decimal("98980")

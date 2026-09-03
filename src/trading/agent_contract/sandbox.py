@@ -49,15 +49,25 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from trading.runtime.payload import MODE_CONFIGURE, SmokePayload, encode_payload
+
 __all__ = [
     "DEFAULT_IMAGE",
+    "SMOKE_TIMEOUT_SECONDS",
     "SandboxLimits",
     "SandboxResult",
     "SandboxUnavailable",
+    "run_smoke_in_sandbox",
     "run_strategy_in_sandbox",
 ]
 
 DEFAULT_IMAGE = "trading-strategy-sandbox:0.1"
+
+# A smoke run does far more work than `configure` alone -- it runs five
+# simulated sessions through the real event loop -- so it gets a longer
+# wall clock. A timeout here is still a hard failure, and a useful one:
+# the same per-bar cost runs against years of bars in Phase 3.
+SMOKE_TIMEOUT_SECONDS = 120.0
 
 _RESULT_MARKER = "__SANDBOX_RESULT__"
 
@@ -110,6 +120,7 @@ class SandboxResult:
     kernel_isolated: bool
     strategy_class: str | None = None
     manifest: dict[str, Any] | None = None
+    outcome: dict[str, Any] | None = None
     error: str | None = None
     stdout: str = ""
     stderr: str = ""
@@ -188,15 +199,7 @@ def _parse_runner_output(stdout: str) -> dict[str, Any] | None:
     return None
 
 
-def run_strategy_in_sandbox(source: str, limits: SandboxLimits | None = None) -> SandboxResult:
-    """Run one strategy's `configure()` inside the sandbox.
-
-    Never raises on a bad strategy -- a crash, a timeout, and an
-    out-of-memory kill are all outcomes, returned as a `SandboxResult`.
-    Raises `SandboxUnavailable` only when Docker itself cannot be used,
-    which is an outage rather than a verdict on the code.
-    """
-    limits = limits or SandboxLimits()
+def _run_payload(raw: bytes, limits: SandboxLimits) -> SandboxResult:
     runtime = limits.runtime or "runc"
     kernel_isolated = runtime in _KERNEL_ISOLATING_RUNTIMES
     name = f"strategy-smoke-{uuid.uuid4().hex[:12]}"
@@ -204,9 +207,9 @@ def run_strategy_in_sandbox(source: str, limits: SandboxLimits | None = None) ->
     try:
         completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
             _docker_args(limits, name),
-            input=source,
+            input=raw,
             capture_output=True,
-            text=True,
+            text=False,
             timeout=limits.timeout_seconds,
             check=False,
         )
@@ -220,27 +223,40 @@ def run_strategy_in_sandbox(source: str, limits: SandboxLimits | None = None) ->
             check=False,
             timeout=15,
         )
+        stdout = (
+            exc.stdout.decode("utf-8", "replace")
+            if isinstance(exc.stdout, bytes)
+            else (exc.stdout or "")
+        )
+        stderr = (
+            exc.stderr.decode("utf-8", "replace")
+            if isinstance(exc.stderr, bytes)
+            else (exc.stderr or "")
+        )
         return SandboxResult(
             ok=False,
             stage="timeout",
             runtime=runtime,
             kernel_isolated=kernel_isolated,
             error=f"exceeded the {limits.timeout_seconds}s wall-clock limit and was killed",
-            stdout=exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or ""),
-            stderr=exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or ""),
+            stdout=stdout,
+            stderr=stderr,
             timed_out=True,
             limits=limits,
         )
     except FileNotFoundError as exc:
         raise SandboxUnavailable("docker is not on PATH; the strategy sandbox cannot run") from exc
 
-    payload = _parse_runner_output(completed.stdout)
+    stdout = completed.stdout.decode("utf-8", "replace")
+    stderr = completed.stderr.decode("utf-8", "replace")
+
+    payload = _parse_runner_output(stdout)
     if payload is None:
         # No structured result. Either the image is wrong, or the container
         # died before the runner could report -- an OOM kill (137) is the
         # common case, and it is reported as the strategy's outcome rather
         # than as a platform failure.
-        if "Unable to find image" in completed.stderr or "No such image" in completed.stderr:
+        if "Unable to find image" in stderr or "No such image" in stderr:
             raise SandboxUnavailable(
                 f"sandbox image {DEFAULT_IMAGE!r} is not built; run "
                 "`docker build -t trading-strategy-sandbox:0.1 sandbox/`"
@@ -256,8 +272,8 @@ def run_strategy_in_sandbox(source: str, limits: SandboxLimits | None = None) ->
                 if oom
                 else "the sandbox produced no structured result"
             ),
-            stdout=completed.stdout,
-            stderr=completed.stderr,
+            stdout=stdout,
+            stderr=stderr,
             exit_code=completed.returncode,
             limits=limits,
         )
@@ -269,9 +285,45 @@ def run_strategy_in_sandbox(source: str, limits: SandboxLimits | None = None) ->
         kernel_isolated=kernel_isolated,
         strategy_class=payload.get("strategy_class"),
         manifest=payload.get("manifest"),
+        outcome=payload.get("outcome"),
         error=payload.get("error"),
-        stdout=completed.stdout,
-        stderr=completed.stderr,
+        stdout=stdout,
+        stderr=stderr,
         exit_code=completed.returncode,
         limits=limits,
+    )
+
+
+def run_strategy_in_sandbox(source: str, limits: SandboxLimits | None = None) -> SandboxResult:
+    """Run one strategy's `configure()` inside the sandbox.
+
+    The envelope is built here rather than by callers, so every existing
+    call site keeps passing a source string. What must never happen is the
+    *runner* guessing whether it received source or an envelope: format
+    detection by sniffing is the compatibility shim that breaks silently a
+    year later.
+
+    Never raises on a bad strategy -- a crash, a timeout, and an
+    out-of-memory kill are all outcomes, returned as a `SandboxResult`.
+    Raises `SandboxUnavailable` only when Docker itself cannot be used,
+    which is an outage rather than a verdict on the code.
+    """
+    return _run_payload(
+        encode_payload(SmokePayload(mode=MODE_CONFIGURE, source=source)),
+        limits or SandboxLimits(),
+    )
+
+
+def run_smoke_in_sandbox(
+    payload: SmokePayload, limits: SandboxLimits | None = None
+) -> SandboxResult:
+    """Run five simulated sessions of a strategy (contract §9 stage 2).
+
+    A longer wall clock than `configure` because it is doing far more
+    work; a timeout here is still a hard failure, and a useful one -- the
+    same per-bar cost runs against years of bars in Phase 3.
+    """
+    return _run_payload(
+        encode_payload(payload),
+        limits or SandboxLimits(timeout_seconds=SMOKE_TIMEOUT_SECONDS),
     )

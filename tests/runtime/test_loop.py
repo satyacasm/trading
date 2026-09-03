@@ -564,3 +564,110 @@ def test_dp_charge_is_never_wrongly_suppressed_across_a_buy_sell_buy_sequence() 
     assert outcome.fills == 3
     assert outcome.final_cash == "99095.00"
     assert outcome.final_equity == "99995.00"
+
+
+def test_dp_charge_is_suppressed_on_a_second_same_day_sell() -> None:
+    # I3, the positive case the prior BUY/SELL/BUY test does not exercise:
+    # the round-3 test proves a BUY is never wrongly suppressed, but it
+    # only ever has one SELL, so `scrip_day_charge_already_applied`'s
+    # dedup never actually fires. That dedup firing on a *second* same-day
+    # SELL is the entire reason it exists (IMP-4: "two same-day delivery
+    # sells of one scrip must only incur it once"). A regression that made
+    # `already` permanently False would pass every other test in this file
+    # and only be caught here.
+    #
+    # Same schedule as the round-3 test: brokerage Rs 20.00 flat/order
+    # (BOTH), DP Rs 15.00 flat/scrip/day (BOTH). Sequence, one IST day:
+    # BUY 20 @ 100 (opens a position large enough to sell twice), SELL 10
+    # @ 110 (first sell), SELL 10 @ 90 (second sell, same scrip, same IST
+    # day). Verified against a scratch run of the real run_loop before
+    # writing this assertion -- see the fix round 4 report.
+    #
+    #   BUY  20 @ 100: dp=15.00 (not gated on side) + brokerage 20.00
+    #                  -> cash -= 2000 + 35.00 = 2035.00
+    #                  cash = 100000 - 2035.00 = 97965.00
+    #   SELL 10 @ 110: scrip_days empty (first SELL today) -> already=False
+    #                  -> dp=15.00 + brokerage 20.00
+    #                  -> cash += 1100 - 35.00 = 1065.00
+    #                  cash = 97965.00 + 1065.00 = 99030.00
+    #                  (scrip_days now holds this scrip's IST-day key)
+    #   SELL 10 @ 90:  side is SELL AND key in scrip_days -> already=True
+    #                  -> dp SUPPRESSED (0.00), only brokerage 20.00
+    #                  -> cash += 900 - 20.00 = 880.00
+    #                  cash = 99030.00 + 880.00 = 99910.00
+    #   final_cash = 99910.00
+    #   position after both sells: flat (20 - 10 - 10 = 0), so
+    #   final_equity == final_cash == 99910.00
+    #
+    # If the dedup did NOT fire (the regression this test exists to
+    # catch), the second SELL would also carry dp=15.00 (total 35.00, not
+    # 20.00), giving cash = 99030.00 + (900 - 35.00) = 99895.00 instead of
+    # 99910.00 -- 15.00 poorer than correct. The assertion below
+    # distinguishes the two.
+    brokerage = ChargeSchedule(
+        broker="TEST",
+        exchange="NSE",
+        asset_class="EQUITY",
+        product=Product.DELIVERY,
+        charge_type=ChargeType.BROKERAGE,
+        basis=ChargeBasis.FLAT_PER_ORDER,
+        applies_to_side="BOTH",
+        rate=Decimal("20.00"),
+        cap=None,
+        rounding=Rounding.TWO_DECIMALS,
+        gst_base_types=(),
+        effective_from=datetime(2020, 1, 1).date(),
+        effective_to=None,
+        source_note="test",
+    )
+    dp = ChargeSchedule(
+        broker="TEST",
+        exchange="NSE",
+        asset_class="EQUITY",
+        product=Product.DELIVERY,
+        charge_type=ChargeType.DP_CHARGES,
+        basis=ChargeBasis.FLAT_PER_SCRIP_PER_DAY,
+        applies_to_side="BOTH",
+        rate=Decimal("15.00"),
+        cap=None,
+        rounding=Rounding.TWO_DECIMALS,
+        gst_base_types=(),
+        effective_from=datetime(2020, 1, 1).date(),
+        effective_to=None,
+        source_note="test",
+    )
+
+    class BuySellSell:
+        def __init__(self) -> None:
+            self.step = 0
+
+        def on_bar(self, ctx, bars) -> None:  # noqa: ANN001
+            if self.step == 0:
+                ctx.order(1, side="BUY", quantity=Decimal("20"), rationale="open")
+            elif self.step == 2:
+                ctx.order(1, side="SELL", quantity=Decimal("10"), rationale="sell one")
+            elif self.step == 4:
+                ctx.order(1, side="SELL", quantity=Decimal("10"), rationale="sell two")
+            self.step += 1
+
+    base = datetime(2026, 9, 1, 4, tzinfo=UTC)  # 09:30 IST, one calendar day throughout
+    series = [
+        _bar(1, base, "100"),
+        _bar(1, base + timedelta(minutes=1), "100"),
+        _bar(1, base + timedelta(minutes=2), "110"),
+        _bar(1, base + timedelta(minutes=3), "110"),
+        _bar(1, base + timedelta(minutes=4), "90"),
+        _bar(1, base + timedelta(minutes=5), "90"),
+    ]
+
+    outcome = run_loop(
+        strategy=BuySellSell(),
+        bars=InMemoryBars({1: series}),
+        schedules=(brokerage, dp),
+        starting_cash=Decimal("100000"),
+        slippage_bps=Decimal("0"),
+    )
+
+    assert outcome.fills == 3
+    assert outcome.final_cash == "99910.00"
+    assert outcome.final_equity == "99910.00"

@@ -846,3 +846,150 @@ def test_resolve_bar_interval_rejects_anything_else() -> None:
     ):
         with pytest.raises(_InvalidBarInterval):
             resolve_bar_interval(manifest)
+
+
+@pytest.mark.db
+@pytest.mark.sandbox
+def test_smoke_test_serves_daily_bars_to_a_strategy_that_declares_them(db_conn) -> None:  # noqa: ANN001
+    """End-to-end proof of the whole point of this plan: a strategy
+    declaring bars="1d" gets real daily bars, not silently the 1-minute
+    ones -- through a real container, a real manifest round trip, and the
+    real adjustment layer."""
+    import textwrap
+    from datetime import date
+
+    from trading.agent_contract.smoke import smoke_test
+
+    symbol = "DAILYE2E"
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM',%s,'INR','ACTIVE',%s) "
+        "RETURNING instrument_id",
+        (symbol, f"NSE:CM:{symbol}"),
+    ).fetchone()
+    instrument_id = row[0]
+
+    # Dated to fall inside the seeded UPSTOX/NSE/EQUITY/DELIVERY charge
+    # schedule's effective range (effective_from=2024-10-01) -- smoke_test
+    # goes through _charge_key/load_schedules on the way to a fill, unlike
+    # the unit-level fetch_bars tests elsewhere in this file that use
+    # 2024-01 dates and never reach charges.
+    for day in (date(2026, 8, 25), date(2026, 8, 26), date(2026, 8, 27)):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,101,99,100,1000,1)",
+            (instrument_id, day),
+        )
+
+    source = (
+        textwrap.dedent(
+            f"""
+            from decimal import Decimal
+            from platform_sdk import DataRequest, InstrumentRef, Strategy, StrategyManifest
+
+
+            class MyStrategy(Strategy):
+                def configure(self):
+                    return StrategyManifest(
+                        name="daily-e2e",
+                        version="1.0.0",
+                        universe=[
+                            InstrumentRef(exchange="NSE", segment="CM", symbol="{symbol}"),
+                        ],
+                        data=DataRequest(bars="1d", history_bars=5),
+                        capital=Decimal("1000000"),
+                        base_currency="INR",
+                    )
+
+                def initialize(self, ctx):
+                    self._ordered = False
+
+                def on_bar(self, ctx, bars):
+                    if not self._ordered:
+                        self._ordered = True
+                        ctx.order(
+                            list(bars)[0],
+                            side="BUY",
+                            quantity=Decimal("1"),
+                            rationale="daily interval end-to-end",
+                        )
+            """
+        ).strip()
+        + "\n"
+    )
+
+    verdict = smoke_test(db_conn, source)
+
+    assert verdict.passed is True, verdict.as_agent_feedback()
+    assert verdict.window["sessions"] == 3
+    assert verdict.outcome is not None
+    assert verdict.outcome["fills"] == 1
+
+
+@pytest.mark.db
+@pytest.mark.sandbox
+def test_smoke_test_reports_an_invalid_bar_interval_without_running_the_smoke_containers(
+    db_conn,  # noqa: ANN001
+) -> None:
+    """DataRequest.bars is a Literal type hint, not a runtime-enforced one
+    (platform_sdk.py: `BarInterval = Literal[...]`) -- a real strategy can
+    genuinely pass a bad value, and this must surface as a finding after
+    the configure() container alone, never reaching the two smoke
+    containers."""
+    import textwrap
+    from datetime import UTC, datetime
+
+    from trading.agent_contract.smoke import smoke_test
+
+    symbol = "BADINTERVAL"
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM',%s,'INR','ACTIVE',%s) "
+        "RETURNING instrument_id",
+        (symbol, f"NSE:CM:{symbol}"),
+    ).fetchone()
+    instrument_id = row[0]
+
+    for day in (25, 26, 27):
+        for minute in range(5):
+            db_conn.execute(
+                "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+                "close, volume, source) VALUES (%s,%s,60,100,101,99,100,10,1)",
+                (instrument_id, datetime(2026, 8, day, 9, 15 + minute, tzinfo=UTC)),
+            )
+
+    source = (
+        textwrap.dedent(
+            f"""
+            from decimal import Decimal
+            from platform_sdk import DataRequest, InstrumentRef, Strategy, StrategyManifest
+
+
+            class MyStrategy(Strategy):
+                def configure(self):
+                    return StrategyManifest(
+                        name="bad-interval",
+                        version="1.0.0",
+                        universe=[
+                            InstrumentRef(exchange="NSE", segment="CM", symbol="{symbol}"),
+                        ],
+                        data=DataRequest(bars="2m", history_bars=5),
+                        capital=Decimal("1000000"),
+                        base_currency="INR",
+                    )
+
+                def initialize(self, ctx):
+                    pass
+
+                def on_bar(self, ctx, bars):
+                    pass
+            """
+        ).strip()
+        + "\n"
+    )
+
+    verdict = smoke_test(db_conn, source)
+
+    assert verdict.passed is False
+    assert [f.code for f in verdict.report.findings] == ["MANIFEST_UNRESOLVABLE"]
+    assert "2m" in verdict.as_agent_feedback()

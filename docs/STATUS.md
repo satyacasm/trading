@@ -45,7 +45,30 @@ that is correct behaviour and the ticket will say so.
 | **Phase 1** — streaming + manual paper trading | Shipped, bar Task 12. Crypto streaming, bar aggregation, Upstox WS, charts/watchlist UI, paper-trading core, and the trading UI are all merged to `main`. |
 | **Phase 2** — Agent Contract + strategy runtime | **Started.** Draft at `docs/agent-contract/STRATEGY_CONTRACT.md`. |
 | **Phase 2.5** — intelligence layer | Not started. Recorders were meant to start in Phase 0 and compound; check whether the news/announcements recorder is actually running. |
-| **Phase 3** — backtesting + metrics | Not started. Reuses `decide_fill` and the contract unchanged. |
+| **Phase 3** — backtesting + metrics | **Sub-project 3a complete.** `smoke_test` now honors a strategy's declared bar interval end to end (see below). 3b (backtest runs at scale + persistence), 3c–3e (metrics, report UI, walk-forward, robustness) not started. |
+
+---
+
+## Phase 3, sub-project 3a — the backtest data path (complete)
+
+`smoke_test` (`trading.agent_contract.smoke`) resolves a manifest's
+`data.bars` once, right after `configure()` returns, and threads the result
+through `select_window`/`fetch_bars` instead of the two of them hardcoding
+1-minute `bars_intraday` regardless of what a strategy asked for. `"1d"`
+routes through `bars_daily` and the existing corporate-action adjustment
+layer (`as_of` fixed to the backtest window's end date, D3a-2), so a strategy
+declaring daily bars gets real, split-adjusted daily bars rather than
+silently the wrong (1-minute) data. An interval outside the five the
+contract permits (`platform_sdk.py`'s `BarInterval` is a `Literal` hint with
+no runtime enforcement, so a typo like `"2m"` reaches this code for real) now
+surfaces as `MANIFEST_UNRESOLVABLE` right after the `configure()` container,
+before either smoke container runs, instead of silently proceeding on
+whatever bars the old hardcoded path happened to find.
+
+**Unblocks 3b:** backtest runs at scale (and the persistence/equity-curve
+work that comes with it) can now assume `bars="1d"` is served correctly
+rather than inheriting phantom drawdowns from an unadjusted or wrong-interval
+read.
 
 ---
 

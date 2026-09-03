@@ -650,6 +650,26 @@ def smoke_test(
 
     manifest = configured.manifest
     try:
+        interval_sec = resolve_bar_interval(manifest)
+    except _InvalidBarInterval as invalid:
+        return SmokeVerdict(
+            passed=False,
+            warnings_only=False,
+            report=ValidationReport(
+                findings=(
+                    Finding(
+                        code="MANIFEST_UNRESOLVABLE",
+                        message=str(invalid),
+                        contract_section="§3",
+                    ),
+                )
+            ),
+            window={"start": None, "end": None, "sessions": 0, "instruments": {}},
+            outcome=None,
+            runtime=configured.runtime,
+            kernel_isolated=configured.kernel_isolated,
+        )
+    try:
         instrument_ids = resolve_universe(conn, manifest, datetime.now(UTC).date())
     except _UnresolvedUniverse as unresolved:
         return SmokeVerdict(
@@ -670,11 +690,15 @@ def smoke_test(
             kernel_isolated=configured.kernel_isolated,
         )
     window = (
-        select_window(conn, instrument_ids)
+        select_window(conn, instrument_ids, interval_sec=interval_sec)
         if instrument_ids
         else {"start": None, "end": None, "sessions": 0, "instruments": {}}
     )
-    bars = fetch_bars(conn, instrument_ids, window) if instrument_ids else {}
+    bars = (
+        fetch_bars(conn, instrument_ids, window, interval_sec=interval_sec)
+        if instrument_ids
+        else {}
+    )
     if not bars:
         return SmokeVerdict(
             passed=False,

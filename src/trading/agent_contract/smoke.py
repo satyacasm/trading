@@ -331,6 +331,16 @@ _WINDOW_SQL = """
     LIMIT %s
 """
 
+_DAILY_WINDOW_SQL = """
+    SELECT ts::date AS session
+    FROM bars_daily
+    WHERE instrument_id = ANY(%s)
+    GROUP BY session
+    HAVING COUNT(DISTINCT instrument_id) = %s
+    ORDER BY session DESC
+    LIMIT %s
+"""
+
 _BARS_SQL = """
     SELECT instrument_id, ts, interval_sec, open, high, low, close, volume, trades,
            open_interest, oi_change
@@ -342,7 +352,7 @@ _BARS_SQL = """
 
 
 def select_window(
-    conn: Connection, instrument_ids: Sequence[int], sessions: int = 5
+    conn: Connection, instrument_ids: Sequence[int], sessions: int = 5, *, interval_sec: int = 60
 ) -> dict[str, Any]:
     """The most recent sessions EVERY instrument printed in.
 
@@ -350,10 +360,13 @@ def select_window(
     universe has no bars would hand a strategy a market in which half its
     instruments silently do not exist, and the absent-not-carried-forward
     rule would make that indistinguishable from a quiet day.
+
+    `bars_daily` has no `interval_sec` column -- it is one row per
+    instrument per day, not multiplexed like `bars_intraday` -- so the
+    daily branch's query has no equivalent filter to apply.
     """
-    rows = conn.execute(
-        _WINDOW_SQL, (list(instrument_ids), len(set(instrument_ids)), sessions)
-    ).fetchall()
+    sql = _DAILY_WINDOW_SQL if interval_sec == 86400 else _WINDOW_SQL
+    rows = conn.execute(sql, (list(instrument_ids), len(set(instrument_ids)), sessions)).fetchall()
     days = sorted(row[0] for row in rows)
     if not days:
         return {"start": None, "end": None, "sessions": 0, "instruments": {}}

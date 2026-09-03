@@ -191,6 +191,37 @@ def test_a_single_run_compared_with_itself_never_flags() -> None:
 
 
 @pytest.mark.db
+def test_select_window_finds_a_daily_only_instrument_when_asked_for_1d(db_conn) -> None:  # noqa: ANN001
+    """585,261 of this database's 585,299 instruments have bars_daily rows
+    and zero bars_intraday rows. select_window's default query would find
+    nothing for one of them -- this is the gap Task 3's fetch_bars fix
+    would otherwise ship silently inactive on.
+    """
+    from datetime import date
+
+    from trading.agent_contract.smoke import select_window
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','DAILYONLY','INR',"
+        "'ACTIVE','NSE:CM:DAILYONLY') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for day in (date(2024, 1, 8), date(2024, 1, 9), date(2024, 1, 10)):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,101,99,100,10,1)",
+            (instrument_id, day),
+        )
+
+    daily_window = select_window(db_conn, [instrument_id], sessions=5, interval_sec=86400)
+    assert daily_window["sessions"] == 3
+
+    intraday_window = select_window(db_conn, [instrument_id], sessions=5, interval_sec=60)
+    assert intraday_window["sessions"] == 0
+
+
+@pytest.mark.db
 def test_select_window_finds_the_latest_sessions_every_instrument_shares(db_conn) -> None:  # noqa: ANN001
     from datetime import UTC, datetime
     from decimal import Decimal

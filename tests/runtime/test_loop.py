@@ -1,11 +1,21 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from trading.paper.breaker import REASON_MAX_DAILY_LOSS
-from trading.paper.enums import ChargeBasis, ChargeType, OrderStatus, Product, Rounding
-from trading.paper.models import ChargeSchedule
-from trading.runtime.loop import run_loop
+from trading.paper.enums import (
+    ChargeBasis,
+    ChargeType,
+    OrderStatus,
+    OrderType,
+    Product,
+    Rounding,
+    Side,
+    TimeInForce,
+)
+from trading.paper.models import ChargeSchedule, Order
+from trading.runtime.loop import _apply_position, run_loop
 from trading.runtime.provider import BarRecord, InMemoryBars
+from trading.runtime.state import RunState
 
 
 def _schedules() -> tuple[ChargeSchedule, ...]:
@@ -258,9 +268,19 @@ def test_golden_sma_crossover_trades_exactly_where_expected() -> None:
     #     fast=(13+14)/2=13.5  slow=(11+12+13+14)/4=12.5  -> cross up, BUY
     #   during bar 7's on_bar, window = closes[3:7] = [14,15,12,10]
     #     fast=(12+10)/2=11.0  slow=(14+15+12+10)/4=12.75 -> cross down, SELL
-    # Both orders are MARKET and fill on the following bar's open (12 and
-    # 8 respectively), which is why the assertion below only checks side/
-    # quantity/status, not price.
+    # Both orders are MARKET and fill on the following bar's open: the BUY
+    # (submitted during bar 4) at bar 5's open of 12, the SELL (submitted
+    # during bar 7) at bar 8's open of 8. Money, hand-computed from the
+    # _schedules() fixture's flat Rs 20/order brokerage (no other charge
+    # type is configured):
+    #   BUY  10 @ 12: cash -= 10*12 + 20 = -140
+    #   SELL 10 @ 8:  cash += 10*8  - 20 = +60
+    #   final_cash = 100000 - 140 + 60 = 99920.00
+    # The position is flat after the SELL, so equity == cash: 99920.00.
+    # This is the one test whose job is to pin bar selection *and* money
+    # together -- side/quantity/status alone would still pass if slippage
+    # flipped sign, charges landed on the wrong side, or a market order
+    # filled at the bar's own close instead of the next bar's open.
     bars = InMemoryBars({1: _series(1, ["11", "12", "13", "14", "15", "12", "10", "8", "8"])})
     outcome = _run(_SmaCrossover(), bars)
 
@@ -270,3 +290,160 @@ def test_golden_sma_crossover_trades_exactly_where_expected() -> None:
         ("SELL", "10", "FILLED"),
     ]
     assert outcome.fills == 2
+    assert outcome.final_cash == "99920.00"
+    assert outcome.final_equity == "99920.00"
+
+
+def _order(order_id: int, side: str, quantity: str) -> Order:
+    return Order(
+        order_id=order_id,
+        portfolio_id=1,
+        instrument_id=1,
+        side=Side(side),
+        order_type=OrderType.MARKET,
+        quantity=Decimal(quantity),
+        filled_quantity=Decimal("0"),
+        limit_price=None,
+        product=Product.DELIVERY,
+        time_in_force=TimeInForce.DAY,
+        status=OrderStatus.OPEN,
+        rationale="test",
+        submitted_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+
+
+def test_a_position_reversal_reprices_avg_cost_at_the_new_fill_not_the_old_one() -> None:
+    # C1: crossing a position through zero opens a brand-new position at
+    # the reversing fill's price, not a continuation of the side that
+    # just closed. Long 10 @ 100, then SELL 30 @ 120 (closes the 10 long
+    # for +200, and opens a fresh 20 short at 120), then BUY 20 @ 120
+    # (closes that short flat, for 0 realised since it closes at its own
+    # avg_cost). Total realised_pnl must be +200, not the -200 a stale
+    # avg_cost of 100 on the short leg would produce.
+    state = RunState(
+        now=datetime(2026, 9, 1, tzinfo=UTC), cash=Decimal("0"), starting_cash=Decimal("0")
+    )
+    _apply_position(state, _order(1, "BUY", "10"), Decimal("10"), Decimal("100"))
+    _apply_position(state, _order(2, "SELL", "30"), Decimal("30"), Decimal("120"))
+    _apply_position(state, _order(3, "BUY", "20"), Decimal("20"), Decimal("120"))
+
+    position = state.positions[1]
+    assert position.quantity == Decimal("0")
+    assert position.avg_cost == Decimal("0")
+    assert position.realised_pnl == Decimal("200")
+
+
+def _bar(instrument_id: int, ts: datetime, price: str) -> BarRecord:
+    return BarRecord(
+        instrument_id=instrument_id,
+        ts=ts,
+        interval_sec=60,
+        open=Decimal(price),
+        high=Decimal(price),
+        low=Decimal(price),
+        close=Decimal(price),
+        volume=Decimal("100"),
+    )
+
+
+def test_day_open_equity_rolls_over_at_the_ist_calendar_boundary() -> None:
+    # A run-scoped day_open_equity -- set once, at starting_cash, and
+    # never rolled -- would compare day 2's ending equity against day 1's
+    # *starting* cash, letting a genuine day-2 loss hide inside a run
+    # that is still up overall. Two IST calendar days, one BUY:
+    #   Day 1 (2026-09-01 IST): BUY 100 @ 100 (bar 1's open, brokerage
+    #     Rs 20). cash = 100000 - 10000 - 20 = 89980. Mark drifts to
+    #     120.20 by day 1's last bar:
+    #     equity = 89980 + 100*120.20 = 89980 + 12020 = 102000.00
+    #   Day 2 (2026-09-02 IST): first bar rolls day_open_equity to that
+    #     102000.00 (the equity as of day 1's close, read before this
+    #     bar's own mark is applied), then marks drop to 105.20:
+    #     equity = 89980 + 100*105.20 = 89980 + 10520 = 100500.00
+    #     loss = 102000.00 - 100500.00 = 1500.00 > max_daily_loss(1000)
+    #     -> BREACH.
+    #   A run-scoped reading (day_open_equity stuck at starting_cash
+    #   100000) would compute loss = 100000 - 100500.00 = -500 (a gain)
+    #   and never trip -- exactly the miss this rollover exists to close.
+    class BuyOnce:
+        def __init__(self) -> None:
+            self.done = False
+
+        def on_bar(self, ctx, bars) -> None:  # noqa: ANN001
+            if not self.done:
+                self.done = True
+                ctx.order(1, side="BUY", quantity=Decimal("100"), rationale="entry")
+
+    day1 = datetime(2026, 9, 1, 4, tzinfo=UTC)  # 09:30 IST
+    day2 = datetime(2026, 9, 2, 4, tzinfo=UTC)  # 09:30 IST, next calendar day
+    series = [
+        _bar(1, day1, "100"),
+        _bar(1, day1 + timedelta(minutes=1), "100"),
+        _bar(1, day1 + timedelta(minutes=2), "120.20"),
+        _bar(1, day2, "105.20"),
+    ]
+    outcome = run_loop(
+        strategy=BuyOnce(),
+        bars=InMemoryBars({1: series}),
+        schedules=_schedules(),
+        starting_cash=Decimal("100000"),
+        slippage_bps=Decimal("0"),
+        max_daily_loss=Decimal("1000"),
+    )
+    assert outcome.breaker_reason is not None
+    assert outcome.breaker_reason.startswith(REASON_MAX_DAILY_LOSS)
+    assert outcome.final_equity == "100500.00"
+    # The run as a whole is still up on starting cash -- a run-scoped
+    # (never-rolled) day_open_equity would have seen a gain, not a loss,
+    # against day 2's ending equity and would never have breached.
+    assert Decimal(outcome.final_equity) > Decimal("100000") - Decimal("1000")
+
+
+def test_a_breach_cancels_resting_orders_and_stops_the_loop() -> None:
+    # Mirrors trading.paper.breaker.trip: a breach pauses the run, so no
+    # fill and no further bar dispatch may occur afterward, and whatever
+    # order is left resting at the moment of breach must be cancelled --
+    # not left OPEN as if the run had simply kept going.
+    class BuyEveryBar:
+        def on_bar(self, ctx, bars) -> None:  # noqa: ANN001
+            ctx.order(1, side="BUY", quantity=Decimal("10"), rationale="always")
+
+    base = datetime(2026, 9, 1, 9, tzinfo=UTC)
+    series = [
+        _bar(1, base, "100"),
+        # bar 1: order from bar 0 fills at this bar's open (100); the
+        # mark then crashes to 1 on this same bar's close, which is what
+        # trips the breaker in step 6 -- right after bar 1's on_bar has
+        # already submitted a second, still-resting order.
+        BarRecord(
+            instrument_id=1,
+            ts=base + timedelta(minutes=1),
+            interval_sec=60,
+            open=Decimal("100"),
+            high=Decimal("100"),
+            low=Decimal("1"),
+            close=Decimal("1"),
+            volume=Decimal("100"),
+        ),
+        # bar 2 would fill the resting order from bar 1 at 100 (a
+        # sizeable gain) if it were ever dispatched -- it must not be.
+        _bar(1, base + timedelta(minutes=2), "100"),
+    ]
+    outcome = run_loop(
+        strategy=BuyEveryBar(),
+        bars=InMemoryBars({1: series}),
+        schedules=_schedules(),
+        starting_cash=Decimal("100000"),
+        slippage_bps=Decimal("0"),
+        max_daily_loss=Decimal("1000"),
+    )
+    assert outcome.breaker_reason is not None
+    assert outcome.breaker_reason.startswith(REASON_MAX_DAILY_LOSS)
+    # Only bars 0 and 1 were ever dispatched.
+    assert outcome.bar_calls == 2
+    # Only the order from bar 0 filled; the order submitted during bar 1
+    # never got a chance to see bar 2's price events.
+    assert outcome.fills == 1
+    assert [o.status for o in outcome.orders] == [
+        str(OrderStatus.FILLED),
+        str(OrderStatus.CANCELLED),
+    ]

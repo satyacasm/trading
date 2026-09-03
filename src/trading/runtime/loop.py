@@ -27,14 +27,36 @@ intra-bar path. Stated here rather than discovered later.
 `PARTIALLY_FILLED` never occurs in a smoke run. That is a real gap in
 what stage 2 exercises, and `trading.agent_contract.smoke` reports it
 rather than letting anyone infer coverage that does not exist.
+
+**`day_open_equity` rolls over at the IST calendar boundary, not once at
+the start of the run.** A run can span several sessions, and
+`max_daily_loss` is a *daily* limit -- comparing every bar's equity
+against the run's starting cash would let a gain on day 1 mask an
+arbitrarily large loss on day 2. Each bar's `close_ts` is converted to
+its `Asia/Kolkata` calendar date (mirroring
+`trading.paper.breaker.load_day_open_equity`'s own convention); the
+first bar seen on a new IST date records the equity as of the previous
+bar -- before that bar's own marks are applied -- as the new day's
+opening equity, exactly mirroring `load_day_open_equity`'s use of the
+last snapshot strictly before the day started.
+
+**A breach stops the run.** `trading.paper.breaker.trip` pauses the
+portfolio and cancels every non-terminal order the moment a limit is
+breached; a smoke run that kept dispatching bars afterward would report
+cash and equity for a sequence of fills that could never have happened
+against a paused portfolio. On breach this loop calls
+`_cancel_resting_orders` (mirroring `trip`'s cancellation) and then
+stops -- no further bar is dispatched, no further fill occurs.
 """
 
 from __future__ import annotations
 
 import traceback
 from collections.abc import Sequence
+from datetime import date
 from decimal import Decimal
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
 from trading.paper.breaker import evaluate_breach
 from trading.paper.charges import compute_charges
@@ -49,6 +71,12 @@ from trading.runtime.state import RunState
 __all__ = ["run_loop"]
 
 _TERMINAL = (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED)
+
+# DP charges (FLAT_PER_SCRIP_PER_DAY) are an Indian broker-day
+# convention, matching trading.paper.breaker's _IST / trading.paper.
+# engine's _ist_day_bounds_utc -- the scrip-day key below uses this,
+# not the UTC date, so a fill near midnight IST is not misclassified.
+_IST = ZoneInfo("Asia/Kolkata")
 
 
 class _StrategyLike(Protocol):
@@ -115,7 +143,18 @@ def _apply_position(state: RunState, order: Order, quantity: Decimal, price: Dec
         closed = min(abs(signed), abs(existing.quantity))
         direction = Decimal("1") if existing.quantity > 0 else Decimal("-1")
         realised = (price - existing.avg_cost) * closed * direction
-        avg_cost = existing.avg_cost if new_quantity != 0 else Decimal("0")
+        if new_quantity == 0:
+            avg_cost = Decimal("0")
+        elif (existing.quantity > 0) != (new_quantity > 0):
+            # Reversed through zero (C1): the surviving position is a
+            # brand-new one opened at this fill's price, not a
+            # continuation of the side that just closed -- carrying the
+            # old avg_cost forward here would misprice every subsequent
+            # close of the new side (and, since realised_pnl is derived
+            # from avg_cost, silently flip its sign).
+            avg_cost = price
+        else:
+            avg_cost = existing.avg_cost
         state.positions[order.instrument_id] = existing.model_copy(
             update={
                 "quantity": new_quantity,
@@ -137,6 +176,17 @@ def _price_events(bar: BarRecord) -> tuple[Decimal, ...]:
 
 def _snapshots(state: RunState) -> tuple[OrderSnapshot, ...]:
     return tuple(_snapshot(state.orders[i]) for i in state.submissions if i in state.orders)
+
+
+def _cancel_resting_orders(state: RunState) -> None:
+    """I6: mirrors `trading.paper.breaker.trip`, which cancels every
+    non-terminal order on a breach rather than leaving OPEN/PENDING/
+    PARTIALLY_FILLED orders alive on a portfolio that is supposed to have
+    stopped.
+    """
+    for order_id, order in list(state.orders.items()):
+        if order.status not in _TERMINAL:
+            state.orders[order_id] = order.model_copy(update={"status": OrderStatus.CANCELLED})
 
 
 def run_loop(
@@ -163,7 +213,7 @@ def run_loop(
     reported: dict[int, OrderStatus] = {}
     # A FLAT_PER_SCRIP_PER_DAY charge (DP) is once per scrip per day, not
     # per fill. `compute_charges` stays pure and is told, not asked.
-    scrip_days: set[tuple[int, Any]] = set()
+    scrip_days: set[tuple[int, date]] = set()
 
     def _deliver_updates(ts_iso: str) -> None:
         nonlocal rejections
@@ -175,7 +225,7 @@ def run_loop(
             if previous == order.status:
                 continue
             if previous is not None or order.status is not OrderStatus.OPEN:
-                update = _Update(order, previous or OrderStatus.OPEN)
+                update = _Update(order, previous if previous is not None else OrderStatus.OPEN)
                 _call(strategy, "on_order_update", ts_iso, ctx, update)
                 if order.status is OrderStatus.REJECTED and order.rejection_reason:
                     rejections.append(order.rejection_reason)
@@ -188,9 +238,23 @@ def run_loop(
         state.now = first_ts[0]
         _call(strategy, "initialize", state.now.isoformat(), ctx)
 
+        current_ist_day: date | None = None
         for close_ts, indexed in bars.indexed_groups():
             state.now = close_ts
             ts_iso = close_ts.isoformat()
+
+            # Roll day_open_equity at the IST calendar boundary -- see
+            # the module docstring. Read equity *before* this bar's own
+            # marks are applied, so the new day's opening reading is the
+            # portfolio as it stood at the previous bar's close, not
+            # already moved by today's first print.
+            ist_day = close_ts.astimezone(_IST).date()
+            if current_ist_day is None:
+                current_ist_day = ist_day
+            elif ist_day != current_ist_day:
+                state.day_open_equity = ctx.portfolio.equity
+                current_ist_day = ist_day
+
             printed = {bar.instrument_id: bar for bar, _ in indexed}
             for instrument_id, bar in printed.items():
                 state.marks[instrument_id] = bar.close
@@ -211,8 +275,18 @@ def run_loop(
                     decision = decide_fill(order, price, close_ts, slippage_bps)
                     if decision is None:
                         continue
-                    key = (order.instrument_id, close_ts.date())
-                    already = key in scrip_days
+                    # I3: the flag is considered only for SELL,
+                    # mirroring trading.paper.engine's
+                    # `order.side is Side.SELL and _dp_already_applied_today(...)`
+                    # -- a BUY neither reads nor writes it, so a
+                    # same-day BUY-then-SELL still pays DP exactly
+                    # once, on the SELL. The key's date is IST, not
+                    # UTC: DP is an Indian broker-day convention
+                    # (breaker.py's _IST / engine.py's
+                    # _ist_day_bounds_utc), and a UTC date would
+                    # split an IST trading day in two.
+                    key = (order.instrument_id, close_ts.astimezone(_IST).date())
+                    already = order.side is Side.SELL and key in scrip_days
                     breakdown = compute_charges(
                         schedules,
                         order.side,
@@ -257,17 +331,33 @@ def run_loop(
             for bar, index in indexed:
                 state.cursor[bar.instrument_id] = index + 1
 
-            # 6. The breaker.
+            # 6. The breaker. Explicit `is None` checks, not `or` --
+            # `state.peak_equity`/`state.day_open_equity` are seeded to
+            # starting_cash before the loop and never left `None` here,
+            # but a legitimate equity of exactly `0` must not be treated
+            # as unset by a truthy-style fallback (see the module's
+            # calling brief; both are always Decimal by this point).
             equity = ctx.portfolio.equity
-            state.peak_equity = max(state.peak_equity or equity, equity)
-            if state.breaker_reason is None:
-                state.breaker_reason = evaluate_breach(
-                    equity,
-                    state.day_open_equity or starting_cash,
-                    state.peak_equity,
-                    max_daily_loss,
-                    max_drawdown_pct,
-                )
+            peak_equity = equity if state.peak_equity is None else max(state.peak_equity, equity)
+            state.peak_equity = peak_equity
+            if state.day_open_equity is None:
+                day_open_equity = starting_cash
+            else:
+                day_open_equity = state.day_open_equity
+            state.breaker_reason = evaluate_breach(
+                equity,
+                day_open_equity,
+                peak_equity,
+                max_daily_loss,
+                max_drawdown_pct,
+            )
+            if state.breaker_reason is not None:
+                # Mirror trading.paper.breaker.trip: stop trading the
+                # instant a declared limit is breached. Continuing would
+                # report fills for a run that could never have happened
+                # against a portfolio that trip() would have paused.
+                _cancel_resting_orders(state)
+                break
     except _Crash as crash:
         return RunOutcome(
             ok=False,
@@ -276,7 +366,7 @@ def run_loop(
             fills=fills,
             rejections=tuple(rejections),
             final_cash=str(state.cash),
-            final_equity=str(state.cash),
+            final_equity=str(ctx.portfolio.equity),
             breaker_reason=state.breaker_reason,
             logs=tuple(state.logs),
             error=crash.detail,

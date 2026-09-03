@@ -87,7 +87,7 @@ class MyStrategy(Strategy):          # your own name, subclassing Strategy
         """Called on EVERY state change -- including each partial fill, not
         only on reaching a terminal state. A GTC limit can rest partially
         filled indefinitely, and a strategy sizing its next order from
-        `filled_quantity` needs to see that as it happens.
+        `update.order.filled_quantity` needs to see that as it happens.
 
         A rejection arrives here too, and is a normal outcome rather than
         an exception. Your strategy must survive one."""
@@ -361,6 +361,28 @@ backtest and sizing every F&O order wrong.
 Terminal: `FILLED`, `CANCELLED`, `REJECTED`, `EXPIRED`.
 
 A `DAY` order that has not filled by session close becomes `EXPIRED`.
+
+### OrderUpdate
+
+What `on_order_update` receives. **It is a wrapper, not an order** — the two
+fields below are all it has, and everything about the order itself is reached
+through `.order`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `order` | Order | The order in its **new** state — read `status`, `filled_quantity`, `rejection_reason` from here |
+| `previous_status` | str | The status it held before this update, so you can tell what changed |
+
+```python
+def on_order_update(self, ctx: Context, update: OrderUpdate) -> None:
+    if update.order.status == "REJECTED":
+        ctx.log("rejected", reason=update.order.rejection_reason)
+    filled = update.order.filled_quantity      # NOT update.filled_quantity
+```
+
+Reading `update.status` or `update.filled_quantity` directly is the most common
+way to crash a strategy in this handler: those fields exist, one level down, on
+`update.order`.
 
 ### Position
 

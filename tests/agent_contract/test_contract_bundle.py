@@ -267,3 +267,48 @@ def test_the_contract_example_imports_every_name_it_uses() -> None:
     }
 
     assert (used | bases) - imported == set(), f"used but not imported: {(used | bases) - imported}"
+
+
+def _documented_fields(section: str) -> set[str]:
+    """Field names from a `| \\`name\\` | type | notes |` table under a §5 heading."""
+    import re
+    from pathlib import Path
+
+    import trading.agent_contract as pkg
+
+    text = (
+        Path(pkg.__file__).resolve().parents[3] / "docs" / "agent-contract" / "STRATEGY_CONTRACT.md"
+    ).read_text()
+    body = text.split(f"### {section}", 1)[1].split("\n### ", 1)[0]
+    names: set[str] = set()
+    for line in body.splitlines():
+        match = re.match(r"\|\s*`([^`]+)`\s*\|", line)
+        if match:
+            names.update(part.strip().strip("`") for part in match.group(1).split(","))
+    return names
+
+
+def test_the_documented_OrderUpdate_matches_the_object_strategies_receive() -> None:
+    """Second defect found by dogfooding. A cold agent implemented
+    `on_order_update` reading `update.order_id`, `update.status` and
+    `update.filled_quantity`, and crashed: the runtime hands over a
+    wrapper whose only fields are `order` and `previous_status`.
+
+    It was not the agent's mistake. `OrderUpdate` appeared in the contract
+    exactly twice -- in an import list and in a method signature -- and §5
+    never described it, while §2's prose named `filled_quantity` without
+    saying it lives one level down. The one type you must destructure to
+    implement the handler was the one type the data model omitted.
+
+    Pins all three together: the table, the SDK stub agents type-check
+    against, and the object the loop actually constructs.
+    """
+    from trading.agent_contract.platform_sdk import OrderUpdate
+    from trading.runtime.loop import _Update
+
+    documented = _documented_fields("OrderUpdate")
+    assert documented == {"order", "previous_status"}
+    assert set(OrderUpdate.__annotations__) == documented
+
+    delivered = _Update(order="sentinel", previous_status="OPEN")  # type: ignore[arg-type]
+    assert set(vars(delivered)) == documented

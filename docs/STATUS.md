@@ -52,12 +52,13 @@ that is correct behaviour and the ticket will say so.
 ## Recent merges on `main`
 
 ```
+05470bb  Merge 'agent-contract-smoke-run': §9 stage 2, the smoke run
 f49f069  Merge 'frontend-paper-trading': trade from the UI
 ec6fa0c  Merge 'paper-trading-core': paper trading core (Phase 1)
 ```
 
-Both feature branches (`paper-trading-core`, `frontend-paper-trading`) still
-exist as local refs. Fully merged; safe to delete with `git branch -d`.
+`paper-trading-core` and `frontend-paper-trading` still exist as local refs.
+Fully merged; safe to delete with `git branch -d`.
 
 Test counts: **935 backend** (8 golden deselected; 18 sandbox tests spawn real
 containers, and the smoke-run end-to-end tests spawn three each), **36

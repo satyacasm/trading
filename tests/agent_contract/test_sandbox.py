@@ -333,6 +333,41 @@ class Named(Strategy):
     ]
 
 
+@pytest.mark.sandbox
+def test_the_manifest_carries_a_query_universe_as_criteria_not_a_resolved_list() -> None:
+    # A Query crosses back as the criteria that produced it, not a list
+    # the container guessed at -- the host resolves it point-in-time
+    # against listed_on/delisted_on (the survivorship-bias guarantee).
+    # Task 5's resolve_universe has a branch that consumes exactly this
+    # shape, so the key names here are load-bearing.
+    from trading.agent_contract.sandbox import run_strategy_in_sandbox
+
+    source = """
+from decimal import Decimal
+from platform_sdk import DataRequest, Query, Strategy, StrategyManifest
+
+
+class Queried(Strategy):
+    def configure(self):
+        return StrategyManifest(
+            name="queried",
+            version="1.0.0",
+            universe=Query(asset_class="EQUITY", exchange="NSE"),
+            data=DataRequest(bars="1m", history_bars=10),
+            capital=Decimal("100000"),
+            base_currency="INR",
+        )
+"""
+    result = run_strategy_in_sandbox(source)
+    assert result.ok is True, result.error
+    assert result.manifest is not None
+    assert result.manifest["universe"] == {
+        "asset_class": "EQUITY",
+        "exchange": "NSE",
+        "index": None,
+    }
+
+
 # --- the event loop runs inside the container --------------------------------
 
 

@@ -46,6 +46,7 @@ from trading.agent_contract.sandbox import (
 )
 from trading.agent_contract.validation import Finding, ValidationReport
 from trading.config import get_settings
+from trading.corpactions.adjust import adjusted_bars
 from trading.paper.charges import load_schedules
 from trading.paper.enums import Product
 from trading.runtime.payload import MODE_SMOKE, SmokePayload
@@ -56,6 +57,7 @@ __all__ = [
     "build_verdict",
     "fetch_bars",
     "record_smoke_run",
+    "resolve_bar_interval",
     "resolve_universe",
     "select_window",
     "smoke_test",
@@ -330,6 +332,16 @@ _WINDOW_SQL = """
     LIMIT %s
 """
 
+_DAILY_WINDOW_SQL = """
+    SELECT ts::date AS session
+    FROM bars_daily
+    WHERE instrument_id = ANY(%s)
+    GROUP BY session
+    HAVING COUNT(DISTINCT instrument_id) = %s
+    ORDER BY session DESC
+    LIMIT %s
+"""
+
 _BARS_SQL = """
     SELECT instrument_id, ts, interval_sec, open, high, low, close, volume, trades,
            open_interest, oi_change
@@ -341,7 +353,7 @@ _BARS_SQL = """
 
 
 def select_window(
-    conn: Connection, instrument_ids: Sequence[int], sessions: int = 5
+    conn: Connection, instrument_ids: Sequence[int], sessions: int = 5, *, interval_sec: int = 60
 ) -> dict[str, Any]:
     """The most recent sessions EVERY instrument printed in.
 
@@ -349,10 +361,13 @@ def select_window(
     universe has no bars would hand a strategy a market in which half its
     instruments silently do not exist, and the absent-not-carried-forward
     rule would make that indistinguishable from a quiet day.
+
+    `bars_daily` has no `interval_sec` column -- it is one row per
+    instrument per day, not multiplexed like `bars_intraday` -- so the
+    daily branch's query has no equivalent filter to apply.
     """
-    rows = conn.execute(
-        _WINDOW_SQL, (list(instrument_ids), len(set(instrument_ids)), sessions)
-    ).fetchall()
+    sql = _DAILY_WINDOW_SQL if interval_sec == 86400 else _WINDOW_SQL
+    rows = conn.execute(sql, (list(instrument_ids), len(set(instrument_ids)), sessions)).fetchall()
     days = sorted(row[0] for row in rows)
     if not days:
         return {"start": None, "end": None, "sessions": 0, "instruments": {}}
@@ -366,11 +381,50 @@ def select_window(
     }
 
 
-def fetch_bars(
+def _fetch_daily_bars(
     conn: Connection, instrument_ids: Sequence[int], window: dict[str, Any]
+) -> dict[int, tuple[BarRecord, ...]]:
+    """The `bars="1d"` path: one `adjusted_bars` call per instrument.
+
+    `as_of` is the window's end date for every instrument and every bar in
+    the run (D3a-2) -- one fixed factor set, so the series is continuous
+    and returns are correct throughout the run, at the accepted cost that
+    an early bar's absolute price level may not match what the exchange
+    printed that day if a split lands later in the window.
+    """
+    start = datetime.fromisoformat(window["start"]).date()
+    end = datetime.fromisoformat(window["end"]).date()
+    series: dict[int, list[BarRecord]] = {}
+    for instrument_id in instrument_ids:
+        frame = adjusted_bars(conn, instrument_id, start, end, as_of=end)
+        for row in frame.iter_rows(named=True):
+            series.setdefault(instrument_id, []).append(
+                BarRecord(
+                    instrument_id=instrument_id,
+                    ts=row["ts"],
+                    interval_sec=86400,
+                    open=row["open"],
+                    high=row["high"],
+                    low=row["low"],
+                    close=row["close"],
+                    volume=None if row["volume"] is None else Decimal(row["volume"]),
+                )
+            )
+    window["instruments"] = {str(k): {"bars": len(v)} for k, v in series.items()}
+    return {k: tuple(v) for k, v in series.items()}
+
+
+def fetch_bars(
+    conn: Connection,
+    instrument_ids: Sequence[int],
+    window: dict[str, Any],
+    *,
+    interval_sec: int = 60,
 ) -> dict[int, tuple[BarRecord, ...]]:
     if window["start"] is None:
         return {}
+    if interval_sec == 86400:
+        return _fetch_daily_bars(conn, instrument_ids, window)
     rows = conn.execute(
         _BARS_SQL,
         (
@@ -383,7 +437,7 @@ def fetch_bars(
     for (
         instrument_id,
         ts,
-        interval_sec,
+        interval_sec_row,
         open_,
         high,
         low,
@@ -397,7 +451,7 @@ def fetch_bars(
             BarRecord(
                 instrument_id=instrument_id,
                 ts=ts,
-                interval_sec=interval_sec,
+                interval_sec=interval_sec_row,
                 open=open_,
                 high=high,
                 low=low,
@@ -414,6 +468,62 @@ def fetch_bars(
 
 class _UnresolvedUniverse(Exception):
     """A declared instrument has no row at `as_of`."""
+
+
+_BAR_INTERVALS_SEC: dict[str, int] = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "1h": 3600,
+    "1d": 86400,
+}
+
+# Which of the five contract-legal intervals this platform can actually
+# serve today. select_window/fetch_bars route interval_sec == 86400
+# through bars_daily and everything else through bars_intraday -- but
+# bars_intraday holds ONLY 60-second rows (confirmed directly against
+# this database: every row has interval_sec = 60, no other value exists).
+# Before this check existed, a schema-legal "5m"/"15m"/"1h" manifest
+# resolved cleanly and was then silently served 1-minute bars anyway --
+# exactly the defect this whole file exists to remove, just for three of
+# five values instead of one. Serving them for real needs genuine 5m/
+# 15m/1h aggregation or a resampling path -- real work, not a one-line
+# change -- so for now, an unserved value raises rather than lies.
+_SERVED_INTERVALS_SEC = frozenset({60, 86400})
+
+
+class _InvalidBarInterval(Exception):
+    """The manifest's data.bars is not recognized, or not yet served.
+
+    Raised rather than defaulted in both cases: nothing schema-checks
+    this value before smoke_test uses it -- api.py's pre-smoke-test
+    validate_strategy() call has no manifest yet, and validate_manifest
+    only runs inside register_strategy, after a passing smoke test. A
+    silent default to 60 -- or silently serving 1-minute bars for a
+    schema-legal value this platform cannot yet honor -- would both be
+    the exact silent-wrong-data failure this plan exists to remove.
+    """
+
+
+def resolve_bar_interval(manifest: dict[str, Any]) -> int:
+    data = manifest.get("data")
+    raw = data.get("bars") if isinstance(data, dict) else None
+    try:
+        interval_sec = _BAR_INTERVALS_SEC[raw]  # type: ignore[index]
+    except (KeyError, TypeError):
+        raise _InvalidBarInterval(
+            f"the manifest declares data.bars={raw!r}, which is not one of the five "
+            f"values the contract permits: {sorted(_BAR_INTERVALS_SEC)}. "
+            "See STRATEGY_CONTRACT.md §3."
+        ) from None
+    if interval_sec not in _SERVED_INTERVALS_SEC:
+        raise _InvalidBarInterval(
+            f"data.bars={raw!r} is one of the contract's five permitted values, but "
+            'this platform does not yet serve it. Only "1m" and "1d" are served '
+            "today -- serving 5m/15m/1h needs bar aggregation this platform does not "
+            "yet have. See STRATEGY_CONTRACT.md §3."
+        )
+    return interval_sec
 
 
 def resolve_universe(conn: Connection, manifest: dict[str, Any], as_of: date) -> list[int]:
@@ -562,6 +672,26 @@ def smoke_test(
 
     manifest = configured.manifest
     try:
+        interval_sec = resolve_bar_interval(manifest)
+    except _InvalidBarInterval as invalid:
+        return SmokeVerdict(
+            passed=False,
+            warnings_only=False,
+            report=ValidationReport(
+                findings=(
+                    Finding(
+                        code="MANIFEST_UNRESOLVABLE",
+                        message=str(invalid),
+                        contract_section="§3",
+                    ),
+                )
+            ),
+            window={"start": None, "end": None, "sessions": 0, "instruments": {}},
+            outcome=None,
+            runtime=configured.runtime,
+            kernel_isolated=configured.kernel_isolated,
+        )
+    try:
         instrument_ids = resolve_universe(conn, manifest, datetime.now(UTC).date())
     except _UnresolvedUniverse as unresolved:
         return SmokeVerdict(
@@ -582,11 +712,15 @@ def smoke_test(
             kernel_isolated=configured.kernel_isolated,
         )
     window = (
-        select_window(conn, instrument_ids)
+        select_window(conn, instrument_ids, interval_sec=interval_sec)
         if instrument_ids
         else {"start": None, "end": None, "sessions": 0, "instruments": {}}
     )
-    bars = fetch_bars(conn, instrument_ids, window) if instrument_ids else {}
+    bars = (
+        fetch_bars(conn, instrument_ids, window, interval_sec=interval_sec)
+        if instrument_ids
+        else {}
+    )
     if not bars:
         return SmokeVerdict(
             passed=False,
@@ -598,8 +732,8 @@ def smoke_test(
                         message=(
                             f"the manifest's universe resolved to {len(instrument_ids)} "
                             "instrument(s), and no window exists where all of them have "
-                            "1-minute bars. A smoke run needs recorded data for every "
-                            "instrument it will feed."
+                            "recorded bars at the declared interval. A smoke run needs "
+                            "recorded data for every instrument it will feed."
                         ),
                         contract_section="§3",
                     ),

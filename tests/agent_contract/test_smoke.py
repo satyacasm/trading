@@ -191,6 +191,37 @@ def test_a_single_run_compared_with_itself_never_flags() -> None:
 
 
 @pytest.mark.db
+def test_select_window_finds_a_daily_only_instrument_when_asked_for_1d(db_conn) -> None:  # noqa: ANN001
+    """585,261 of this database's 585,299 instruments have bars_daily rows
+    and zero bars_intraday rows. select_window's default query would find
+    nothing for one of them -- this is the gap Task 3's fetch_bars fix
+    would otherwise ship silently inactive on.
+    """
+    from datetime import date
+
+    from trading.agent_contract.smoke import select_window
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','DAILYONLY','INR',"
+        "'ACTIVE','NSE:CM:DAILYONLY') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for day in (date(2024, 1, 8), date(2024, 1, 9), date(2024, 1, 10)):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,101,99,100,10,1)",
+            (instrument_id, day),
+        )
+
+    daily_window = select_window(db_conn, [instrument_id], sessions=5, interval_sec=86400)
+    assert daily_window["sessions"] == 3
+
+    intraday_window = select_window(db_conn, [instrument_id], sessions=5, interval_sec=60)
+    assert intraday_window["sessions"] == 0
+
+
+@pytest.mark.db
 def test_select_window_finds_the_latest_sessions_every_instrument_shares(db_conn) -> None:  # noqa: ANN001
     from datetime import UTC, datetime
     from decimal import Decimal
@@ -221,6 +252,155 @@ def test_select_window_finds_the_latest_sessions_every_instrument_shares(db_conn
     bars = fetch_bars(db_conn, ids, window)
     assert set(bars) == set(ids)
     assert all(isinstance(bar.close, Decimal) for series in bars.values() for bar in series)
+
+
+@pytest.mark.db
+def test_fetch_bars_daily_branch_reconstructs_a_continuous_series_across_a_split(
+    db_conn,  # noqa: ANN001
+) -> None:
+    """A 1:2 split printed on day 3. Unadjusted closes would show a ~50%
+    drop between day 2 and day 3 -- the exact defect measured against real
+    NSE splits in the spec (COLAB: -51.0%, VLL: -49.0%, NAVKARURB: -47.6%).
+    With as_of set to the window's end (D3a-2: fixed for the whole run,
+    after the split), the adjusted series must be continuous instead.
+    """
+    from datetime import date
+
+    from trading.agent_contract.smoke import fetch_bars
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','DAILYSPLIT','INR',"
+        "'ACTIVE','NSE:CM:DAILYSPLIT') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+
+    # Day 3 is the ex-date. Its own bar is already printed post-split, per
+    # adjusted_bars's factor_for: an action scales a bar only when the
+    # ex_date is STRICTLY AFTER that bar's day.
+    closes = {
+        date(2024, 1, 8): 200,  # 2 days before ex-date
+        date(2024, 1, 9): 210,  # 1 day before ex-date
+        date(2024, 1, 10): 105,  # ex-date -- already post-split as printed
+        date(2024, 1, 11): 106,  # 1 day after
+        date(2024, 1, 12): 104,  # 2 days after
+    }
+    for day, close in closes.items():
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,%s,%s,%s,%s,10,1)",
+            (instrument_id, day, close, close, close, close),
+        )
+    db_conn.execute(
+        "INSERT INTO corporate_actions (instrument_id, action_type, ex_date, "
+        "ratio_from, ratio_to, source) VALUES (%s,'SPLIT','2024-01-10',1,2,'test')",
+        (instrument_id,),
+    )
+
+    window = {
+        "start": "2024-01-08T00:00:00+00:00",
+        "end": "2024-01-12T23:59:59.999999+00:00",
+        "sessions": 5,
+        "instruments": {},
+    }
+    bars = fetch_bars(db_conn, [instrument_id], window, interval_sec=86400)
+
+    series = [b.close for b in bars[instrument_id]]
+    assert series == [
+        Decimal("100.0000"),  # 200 * 0.5
+        Decimal("105.0000"),  # 210 * 0.5
+        Decimal("105.0000"),  # ex-date, unscaled
+        Decimal("106.0000"),  # unscaled
+        Decimal("104.0000"),  # unscaled
+    ]
+    # The regression itself: no jump anywhere near 50%.
+    for a, b in zip(series, series[1:], strict=False):
+        assert abs(b / a - 1) < Decimal("0.1"), (a, b)
+
+
+@pytest.mark.db
+def test_fetch_bars_daily_branch_uses_the_windows_end_as_as_of_not_some_other_date(
+    db_conn,  # noqa: ANN001
+) -> None:
+    """Pins D3a-2's specific choice, not just that adjustment happens at
+    all. `adjustment_factors`' query filters `ex_date <= as_of` -- an
+    action whose ex_date is after `as_of` is not merely left unscaled, it
+    is invisible entirely (confirmed by direct inspection of
+    `_ACTION_QUERY`). So a window that ENDS before the split's ex-date
+    must come back completely raw. If `_fetch_daily_bars` passed the
+    wrong date here -- `date.today()`, the window's START, anything but
+    `window["end"]` -- this is the test that would catch it: today's real
+    calendar date is long after 2024, so a `date.today()` bug would make
+    this test see the split as already known and silently pass adjusted
+    values instead of raw ones.
+    """
+    from datetime import date
+
+    from trading.agent_contract.smoke import fetch_bars
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','DAILYPRESPLIT','INR',"
+        "'ACTIVE','NSE:CM:DAILYPRESPLIT') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for day, close in {date(2024, 1, 8): 200, date(2024, 1, 9): 210}.items():
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,%s,%s,%s,%s,10,1)",
+            (instrument_id, day, close, close, close, close),
+        )
+    db_conn.execute(
+        "INSERT INTO corporate_actions (instrument_id, action_type, ex_date, "
+        "ratio_from, ratio_to, source) VALUES (%s,'SPLIT','2024-01-10',1,2,'test')",
+        (instrument_id,),
+    )
+
+    # Window ends 2024-01-09 -- the DAY BEFORE the split's ex_date.
+    window = {
+        "start": "2024-01-08T00:00:00+00:00",
+        "end": "2024-01-09T23:59:59.999999+00:00",
+        "sessions": 2,
+        "instruments": {},
+    }
+    bars = fetch_bars(db_conn, [instrument_id], window, interval_sec=86400)
+
+    series = [b.close for b in bars[instrument_id]]
+    assert series == [Decimal("200.0000"), Decimal("210.0000")]  # raw, NOT halved
+
+
+@pytest.mark.db
+def test_fetch_bars_1m_path_is_unaffected_by_the_daily_branch(db_conn) -> None:  # noqa: ANN001
+    """The default interval_sec=60 must produce identical output to before
+    this plan -- the vacuity guard for every 1-minute strategy already on
+    this platform."""
+    from datetime import UTC, datetime
+
+    from trading.agent_contract.smoke import fetch_bars
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','MINUTEONLY','INR',"
+        "'ACTIVE','NSE:CM:MINUTEONLY') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for minute in range(3):
+        db_conn.execute(
+            "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, "
+            "low, close, volume, source) VALUES (%s,%s,60,100,101,99,100,10,1)",
+            (instrument_id, datetime(2024, 1, 8, 9, 15 + minute, tzinfo=UTC)),
+        )
+    window = {
+        "start": "2024-01-08T00:00:00+00:00",
+        "end": "2024-01-08T23:59:59.999999+00:00",
+        "sessions": 1,
+        "instruments": {},
+    }
+
+    bars = fetch_bars(db_conn, [instrument_id], window)  # interval_sec defaults to 60
+
+    assert len(bars[instrument_id]) == 3
+    assert all(b.interval_sec == 60 for b in bars[instrument_id])
 
 
 @pytest.mark.db
@@ -637,3 +817,202 @@ def test_a_crashed_run_reports_no_money_at_all() -> None:
     )
     assert verdict.pnl is None
     assert "P&L" not in verdict.as_agent_feedback()
+
+
+def test_resolve_bar_interval_maps_every_schema_value_to_seconds() -> None:
+    """Only "1m" and "1d" are actually served today -- the other three
+    schema-legal values are covered separately below, since they now
+    raise rather than resolve (see
+    test_resolve_bar_interval_rejects_contract_legal_but_unserved_intervals).
+    """
+    from trading.agent_contract.smoke import resolve_bar_interval
+
+    expected = {"1m": 60, "1d": 86400}
+    for bars, seconds in expected.items():
+        manifest = {"data": {"bars": bars}}
+        assert resolve_bar_interval(manifest) == seconds
+
+
+def test_resolve_bar_interval_rejects_anything_else() -> None:
+    """No silent default. A typo'd interval reaching this function
+    unvalidated -- nothing schema-checks it before smoke_test calls this,
+    see the spec's testing-section correction -- must be a loud failure,
+    not a quiet 60.
+    """
+    from trading.agent_contract.smoke import _InvalidBarInterval, resolve_bar_interval
+
+    for manifest in (
+        {"data": {"bars": "2m"}},
+        {"data": {"bars": None}},
+        {"data": {}},
+        {},
+        {"data": {"bars": ["1m"]}},  # unhashable type (list)
+        {"data": "1m"},  # data is not a dict
+    ):
+        with pytest.raises(_InvalidBarInterval):
+            resolve_bar_interval(manifest)
+
+
+def test_resolve_bar_interval_rejects_contract_legal_but_unserved_intervals() -> None:
+    """ "5m"/"15m"/"1h" are legal per STRATEGY_CONTRACT.md §3, but
+    select_window/fetch_bars only route interval_sec == 60 or 86400 to a
+    table that actually holds those rows -- bars_intraday holds ONLY
+    60-second bars. Resolving these to their nominal seconds and letting
+    the caller proceed would silently serve 1-minute bars under a "5m"
+    label -- the exact defect this whole plan exists to eliminate. They
+    must raise, not resolve, until real aggregation exists.
+    """
+    from trading.agent_contract.smoke import _InvalidBarInterval, resolve_bar_interval
+
+    for bars in ("5m", "15m", "1h"):
+        with pytest.raises(_InvalidBarInterval):
+            resolve_bar_interval({"data": {"bars": bars}})
+
+
+@pytest.mark.db
+@pytest.mark.sandbox
+def test_smoke_test_serves_daily_bars_to_a_strategy_that_declares_them(db_conn) -> None:  # noqa: ANN001
+    """End-to-end proof of the whole point of this plan: a strategy
+    declaring bars="1d" gets real daily bars, not silently the 1-minute
+    ones -- through a real container, a real manifest round trip, and the
+    real bars_daily path (adjustment itself is proven at the fetch_bars
+    unit level elsewhere in this file)."""
+    import textwrap
+    from datetime import date
+
+    from trading.agent_contract.smoke import smoke_test
+
+    symbol = "DAILYE2E"
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM',%s,'INR','ACTIVE',%s) "
+        "RETURNING instrument_id",
+        (symbol, f"NSE:CM:{symbol}"),
+    ).fetchone()
+    instrument_id = row[0]
+
+    # Dated to fall inside the seeded UPSTOX/NSE/EQUITY/DELIVERY charge
+    # schedule's effective range (effective_from=2024-10-01) -- smoke_test
+    # goes through _charge_key/load_schedules on the way to a fill, unlike
+    # the unit-level fetch_bars tests elsewhere in this file that use
+    # 2024-01 dates and never reach charges.
+    for day in (date(2026, 8, 25), date(2026, 8, 26), date(2026, 8, 27)):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,101,99,100,1000,1)",
+            (instrument_id, day),
+        )
+
+    source = (
+        textwrap.dedent(
+            f"""
+            from decimal import Decimal
+            from platform_sdk import DataRequest, InstrumentRef, Strategy, StrategyManifest
+
+
+            class MyStrategy(Strategy):
+                def configure(self):
+                    return StrategyManifest(
+                        name="daily-e2e",
+                        version="1.0.0",
+                        universe=[
+                            InstrumentRef(exchange="NSE", segment="CM", symbol="{symbol}"),
+                        ],
+                        data=DataRequest(bars="1d", history_bars=5),
+                        capital=Decimal("1000000"),
+                        base_currency="INR",
+                    )
+
+                def initialize(self, ctx):
+                    self._ordered = False
+
+                def on_bar(self, ctx, bars):
+                    if not self._ordered:
+                        self._ordered = True
+                        ctx.order(
+                            list(bars)[0],
+                            side="BUY",
+                            quantity=Decimal("1"),
+                            rationale="daily interval end-to-end",
+                        )
+            """
+        ).strip()
+        + "\n"
+    )
+
+    verdict = smoke_test(db_conn, source)
+
+    assert verdict.passed is True, verdict.as_agent_feedback()
+    assert verdict.window["sessions"] == 3
+    assert verdict.window["instruments"] == {str(instrument_id): {"bars": 3}}
+    assert verdict.outcome is not None
+    assert verdict.outcome["fills"] == 1
+
+
+@pytest.mark.db
+@pytest.mark.sandbox
+def test_smoke_test_reports_an_invalid_bar_interval_without_running_the_smoke_containers(
+    db_conn,  # noqa: ANN001
+) -> None:
+    """DataRequest.bars is a Literal type hint, not a runtime-enforced one
+    (platform_sdk.py: `BarInterval = Literal[...]`) -- a real strategy can
+    genuinely pass a bad value, and this must surface as a finding after
+    the configure() container alone, never reaching the two smoke
+    containers."""
+    import textwrap
+    from datetime import UTC, datetime
+
+    from trading.agent_contract.smoke import smoke_test
+
+    symbol = "BADINTERVAL"
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM',%s,'INR','ACTIVE',%s) "
+        "RETURNING instrument_id",
+        (symbol, f"NSE:CM:{symbol}"),
+    ).fetchone()
+    instrument_id = row[0]
+
+    for day in (25, 26, 27):
+        for minute in range(5):
+            db_conn.execute(
+                "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+                "close, volume, source) VALUES (%s,%s,60,100,101,99,100,10,1)",
+                (instrument_id, datetime(2026, 8, day, 9, 15 + minute, tzinfo=UTC)),
+            )
+
+    source = (
+        textwrap.dedent(
+            f"""
+            from decimal import Decimal
+            from platform_sdk import DataRequest, InstrumentRef, Strategy, StrategyManifest
+
+
+            class MyStrategy(Strategy):
+                def configure(self):
+                    return StrategyManifest(
+                        name="bad-interval",
+                        version="1.0.0",
+                        universe=[
+                            InstrumentRef(exchange="NSE", segment="CM", symbol="{symbol}"),
+                        ],
+                        data=DataRequest(bars="2m", history_bars=5),
+                        capital=Decimal("1000000"),
+                        base_currency="INR",
+                    )
+
+                def initialize(self, ctx):
+                    pass
+
+                def on_bar(self, ctx, bars):
+                    pass
+            """
+        ).strip()
+        + "\n"
+    )
+
+    verdict = smoke_test(db_conn, source)
+
+    assert verdict.passed is False
+    assert [f.code for f in verdict.report.findings] == ["MANIFEST_UNRESOLVABLE"]
+    assert "2m" in verdict.as_agent_feedback()

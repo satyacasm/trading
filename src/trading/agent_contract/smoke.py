@@ -478,16 +478,30 @@ _BAR_INTERVALS_SEC: dict[str, int] = {
     "1d": 86400,
 }
 
+# Which of the five contract-legal intervals this platform can actually
+# serve today. select_window/fetch_bars route interval_sec == 86400
+# through bars_daily and everything else through bars_intraday -- but
+# bars_intraday holds ONLY 60-second rows (confirmed directly against
+# this database: every row has interval_sec = 60, no other value exists).
+# Before this check existed, a schema-legal "5m"/"15m"/"1h" manifest
+# resolved cleanly and was then silently served 1-minute bars anyway --
+# exactly the defect this whole file exists to remove, just for three of
+# five values instead of one. Serving them for real needs genuine 5m/
+# 15m/1h aggregation or a resampling path -- real work, not a one-line
+# change -- so for now, an unserved value raises rather than lies.
+_SERVED_INTERVALS_SEC = frozenset({60, 86400})
+
 
 class _InvalidBarInterval(Exception):
-    """The manifest's data.bars is not one of the five values §3 permits.
+    """The manifest's data.bars is not recognized, or not yet served.
 
-    Raised rather than defaulted: nothing schema-checks this value before
-    smoke_test uses it -- api.py's pre-smoke-test validate_strategy() call
-    has no manifest yet, and validate_manifest only runs inside
-    register_strategy, after a passing smoke test. A silent default to
-    60 here would be the exact silent-wrong-data failure this plan exists
-    to remove, one function over.
+    Raised rather than defaulted in both cases: nothing schema-checks
+    this value before smoke_test uses it -- api.py's pre-smoke-test
+    validate_strategy() call has no manifest yet, and validate_manifest
+    only runs inside register_strategy, after a passing smoke test. A
+    silent default to 60 -- or silently serving 1-minute bars for a
+    schema-legal value this platform cannot yet honor -- would both be
+    the exact silent-wrong-data failure this plan exists to remove.
     """
 
 
@@ -495,13 +509,21 @@ def resolve_bar_interval(manifest: dict[str, Any]) -> int:
     data = manifest.get("data")
     raw = data.get("bars") if isinstance(data, dict) else None
     try:
-        return _BAR_INTERVALS_SEC[raw]  # type: ignore[index]
+        interval_sec = _BAR_INTERVALS_SEC[raw]  # type: ignore[index]
     except (KeyError, TypeError):
         raise _InvalidBarInterval(
             f"the manifest declares data.bars={raw!r}, which is not one of the five "
             f"values the contract permits: {sorted(_BAR_INTERVALS_SEC)}. "
             "See STRATEGY_CONTRACT.md §3."
         ) from None
+    if interval_sec not in _SERVED_INTERVALS_SEC:
+        raise _InvalidBarInterval(
+            f"data.bars={raw!r} is one of the contract's five permitted values, but "
+            'this platform does not yet serve it. Only "1m" and "1d" are served '
+            "today -- serving 5m/15m/1h needs bar aggregation this platform does not "
+            "yet have. See STRATEGY_CONTRACT.md §3."
+        )
+    return interval_sec
 
 
 def resolve_universe(conn: Connection, manifest: dict[str, Any], as_of: date) -> list[int]:
@@ -710,8 +732,8 @@ def smoke_test(
                         message=(
                             f"the manifest's universe resolved to {len(instrument_ids)} "
                             "instrument(s), and no window exists where all of them have "
-                            "1-minute bars. A smoke run needs recorded data for every "
-                            "instrument it will feed."
+                            "recorded bars at the declared interval. A smoke run needs "
+                            "recorded data for every instrument it will feed."
                         ),
                         contract_section="§3",
                     ),

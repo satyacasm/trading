@@ -45,7 +45,7 @@ that is correct behaviour and the ticket will say so.
 | **Phase 1** — streaming + manual paper trading | Shipped, bar Task 12. Crypto streaming, bar aggregation, Upstox WS, charts/watchlist UI, paper-trading core, and the trading UI are all merged to `main`. |
 | **Phase 2** — Agent Contract + strategy runtime | **Started.** Draft at `docs/agent-contract/STRATEGY_CONTRACT.md`. |
 | **Phase 2.5** — intelligence layer | Not started. Recorders were meant to start in Phase 0 and compound; check whether the news/announcements recorder is actually running. |
-| **Phase 3** — backtesting + metrics | **Sub-project 3a complete.** `smoke_test` now honors a strategy's declared bar interval end to end (see below). 3b (backtest runs at scale + persistence), 3c–3e (metrics, report UI, walk-forward, robustness) not started. |
+| **Phase 3** — backtesting + metrics | **Sub-project 3a complete.** `smoke_test` now reads a strategy's declared `data.bars` and either serves it correctly (`"1m"`, `"1d"`) or rejects it with an honest finding naming the gap (see below). 3b (backtest runs at scale + persistence), 3c–3e (metrics, report UI, walk-forward, robustness) not started. |
 
 ---
 
@@ -65,10 +65,32 @@ surfaces as `MANIFEST_UNRESOLVABLE` right after the `configure()` container,
 before either smoke container runs, instead of silently proceeding on
 whatever bars the old hardcoded path happened to find.
 
+A whole-branch review caught that this was only half true at first landing:
+`resolve_bar_interval` validated all five contract-legal values, but
+`select_window`/`fetch_bars` only route `interval_sec == 86400` to
+`bars_daily` -- `"5m"`/`"15m"`/`"1h"` (300/900/3600) fell through to the
+same hardcoded `bars_intraday` path as `"1m"`, which holds ONLY 60-second
+rows (confirmed directly against the database). A schema-legal `"5m"`
+manifest was validated as fine and then silently served 1-minute bars
+anyway -- the exact defect this plan exists to eliminate, for three of
+five values instead of one. Fixed: `resolve_bar_interval` now also
+distinguishes "not a recognized interval" from "recognized, but not yet
+served," and `"5m"`/`"15m"`/`"1h"` raise `MANIFEST_UNRESOLVABLE` rather than
+being silently misserved. Only `"1m"` and `"1d"` are served today; the
+other three need real bar aggregation this platform does not yet have.
+
+**Known limitation carried forward for 3b:** `bars_daily` rows are
+timestamped at session CLOSE (verified: every row is 10:00 UTC / 15:30
+IST), but the platform's `Bar.ts` contract defines the interval START --
+a uniform, conservative one-day lag on the simulated clock for daily
+strategies. Not a money or fill-order bug (every daily bar is affected
+identically), but worth normalizing before a metrics layer persists
+equity-curve timestamps built from it.
+
 **Unblocks 3b:** backtest runs at scale (and the persistence/equity-curve
-work that comes with it) can now assume `bars="1d"` is served correctly
-rather than inheriting phantom drawdowns from an unadjusted or wrong-interval
-read.
+work that comes with it) can now assume `bars="1d"` is served correctly,
+and that `bars="5m"/"15m"/"1h"` fails loudly rather than inheriting
+phantom drawdowns from an unadjusted or wrong-interval read.
 
 ---
 

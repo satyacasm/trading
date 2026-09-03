@@ -820,9 +820,14 @@ def test_a_crashed_run_reports_no_money_at_all() -> None:
 
 
 def test_resolve_bar_interval_maps_every_schema_value_to_seconds() -> None:
+    """Only "1m" and "1d" are actually served today -- the other three
+    schema-legal values are covered separately below, since they now
+    raise rather than resolve (see
+    test_resolve_bar_interval_rejects_contract_legal_but_unserved_intervals).
+    """
     from trading.agent_contract.smoke import resolve_bar_interval
 
-    expected = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "1d": 86400}
+    expected = {"1m": 60, "1d": 86400}
     for bars, seconds in expected.items():
         manifest = {"data": {"bars": bars}}
         assert resolve_bar_interval(manifest) == seconds
@@ -848,13 +853,30 @@ def test_resolve_bar_interval_rejects_anything_else() -> None:
             resolve_bar_interval(manifest)
 
 
+def test_resolve_bar_interval_rejects_contract_legal_but_unserved_intervals() -> None:
+    """ "5m"/"15m"/"1h" are legal per STRATEGY_CONTRACT.md §3, but
+    select_window/fetch_bars only route interval_sec == 60 or 86400 to a
+    table that actually holds those rows -- bars_intraday holds ONLY
+    60-second bars. Resolving these to their nominal seconds and letting
+    the caller proceed would silently serve 1-minute bars under a "5m"
+    label -- the exact defect this whole plan exists to eliminate. They
+    must raise, not resolve, until real aggregation exists.
+    """
+    from trading.agent_contract.smoke import _InvalidBarInterval, resolve_bar_interval
+
+    for bars in ("5m", "15m", "1h"):
+        with pytest.raises(_InvalidBarInterval):
+            resolve_bar_interval({"data": {"bars": bars}})
+
+
 @pytest.mark.db
 @pytest.mark.sandbox
 def test_smoke_test_serves_daily_bars_to_a_strategy_that_declares_them(db_conn) -> None:  # noqa: ANN001
     """End-to-end proof of the whole point of this plan: a strategy
     declaring bars="1d" gets real daily bars, not silently the 1-minute
     ones -- through a real container, a real manifest round trip, and the
-    real adjustment layer."""
+    real bars_daily path (adjustment itself is proven at the fetch_bars
+    unit level elsewhere in this file)."""
     import textwrap
     from datetime import date
 
@@ -922,6 +944,7 @@ def test_smoke_test_serves_daily_bars_to_a_strategy_that_declares_them(db_conn) 
 
     assert verdict.passed is True, verdict.as_agent_feedback()
     assert verdict.window["sessions"] == 3
+    assert verdict.window["instruments"] == {str(instrument_id): {"bars": 3}}
     assert verdict.outcome is not None
     assert verdict.outcome["fills"] == 1
 

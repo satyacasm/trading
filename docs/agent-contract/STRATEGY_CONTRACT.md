@@ -476,7 +476,33 @@ against your strategy.
 1. **Static validation** — manifest schema check, import allowlist, AST scan.
    **Implemented** (`trading.agent_contract.validation`).
 2. **Smoke run** — five simulated days in a throwaway sandbox. Must not crash
-   and must parse orders correctly. *Waiting on the sandbox.*
+   and must parse orders correctly. **Implemented**
+   (`trading.agent_contract.smoke`).
+
+   **Your strategy is run twice, and the two order sequences are compared.**
+   §2 makes determinism a rule; this is what enforces it. Static validation
+   catches a literal `datetime.now()` and misses iterating a set, `random`
+   without a seed, and depending on dict insertion order — all of which two
+   runs catch immediately. Differing sequences are a rejection, not a warning:
+   a strategy whose orders are not reproducible makes every number a backtest
+   would report meaningless.
+
+   **What a smoke run does not exercise**, stated so a pass is not read as more
+   than it is:
+
+   - **Partial fills.** The fill model fills an order's full remaining
+     quantity, so `PARTIALLY_FILLED` never occurs and your handling of it is
+     untested.
+   - **Ticks, `on_expiry`, and `ctx.intel`.** Not routed by a smoke run.
+   - **The window is not permanent.** A run is against the most recent sessions
+     every instrument in your universe shares. Re-submitting next week meets
+     different bars, so a pass is a statement about a stated window rather than
+     about the strategy for all time. The window is stored with the run.
+
+   A run that places no orders **passes with a warning**, loudly. Five
+   arbitrary days may not trigger a selective signal, so failing it would
+   refuse legitimate strategies — but the report leads with the fact that
+   nothing about your order path was tested.
 3. **Registration** — versioned and stored, ready to backtest or forward-run.
    **Implemented** (`trading.agent_contract.registry`).
 
@@ -507,9 +533,16 @@ REJECTED: static validation found 3 problems.
 Fix these and resubmit. All findings are listed above, not only the first.
 ```
 
-Finding codes are stable, so an agent can branch on them: `SYNTAX_ERROR`,
-`IMPORT_NOT_ALLOWED`, `FORBIDDEN_CALL`, `FORBIDDEN_ATTRIBUTE`, `WALL_CLOCK`,
-`NO_STRATEGY_CLASS`, `MISSING_CONFIGURE`, `MANIFEST_INVALID`.
+Finding codes are stable, so an agent can branch on them.
+
+Stage 1, static validation: `SYNTAX_ERROR`, `IMPORT_NOT_ALLOWED`,
+`FORBIDDEN_CALL`, `FORBIDDEN_ATTRIBUTE`, `WALL_CLOCK`, `NO_STRATEGY_CLASS`,
+`MISSING_CONFIGURE`, `MANIFEST_INVALID`.
+
+Stage 2, the smoke run: `SMOKE_CRASH`, `SMOKE_TIMEOUT`, `SMOKE_OOM`,
+`NO_DATA`, `MANIFEST_UNRESOLVABLE`, `NONDETERMINISTIC`, `NO_ORDERS`,
+`ALL_ORDERS_REJECTED`, `BREAKER_TRIPPED`. The first six are rejections; the
+last three pass with warnings.
 
 Fix, resubmit, repeat. Closing that loop is the point.
 

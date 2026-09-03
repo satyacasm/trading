@@ -28,6 +28,7 @@ recorded on the row, so "never exercised" stays distinguishable from
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
@@ -53,6 +54,7 @@ __all__ = [
     "SmokeVerdict",
     "build_verdict",
     "fetch_bars",
+    "record_smoke_run",
     "resolve_universe",
     "select_window",
     "smoke_test",
@@ -610,3 +612,85 @@ def _outcome_of(result: SandboxResult) -> dict[str, Any]:
         "error": f"[{stage}] {result.error or 'the sandbox produced no outcome'}",
         "crashed_at": {"handler": stage, "ts": ""},
     }
+
+
+_INSERT_SMOKE_RUN = """
+    INSERT INTO strategy_smoke_runs (
+        strategy_id, verdict, window_start, window_end, sessions, instruments,
+        bar_calls, orders_placed, fills, rejections, rejection_reasons, final_cash,
+        final_equity, breaker_reason, findings, runtime, kernel_isolated, contract_version
+    ) VALUES (
+        %(strategy_id)s, %(verdict)s, %(window_start)s, %(window_end)s, %(sessions)s,
+        %(instruments)s, %(bar_calls)s, %(orders_placed)s, %(fills)s, %(rejections)s,
+        %(rejection_reasons)s, %(final_cash)s, %(final_equity)s, %(breaker_reason)s,
+        %(findings)s, %(runtime)s, %(kernel_isolated)s, %(contract_version)s
+    ) RETURNING smoke_run_id
+"""
+
+
+def _money(raw: Any) -> Decimal | None:
+    """A money field from the container's JSON, as a Decimal.
+
+    The runtime serialises cash and equity as strings precisely so no
+    float ever exists between the loop and this row (§5). Postgres would
+    cast the string for us on the way into NUMERIC, but doing it here
+    keeps the "no float in a money path" rule checkable in Python rather
+    than resting on an implicit database cast.
+    """
+    return None if raw is None else Decimal(str(raw))
+
+
+def _timestamp(raw: Any) -> datetime | None:
+    return None if raw is None else datetime.fromisoformat(str(raw))
+
+
+def record_smoke_run(conn: Connection, strategy_id: int, verdict: SmokeVerdict) -> int:
+    """Store one smoke run against a registered strategy.
+
+    Following this codebase's convention, nothing here commits: the caller
+    owns the transaction boundary, so a registration and the smoke run
+    that justified it can land as one unit.
+    """
+    outcome = verdict.outcome or {}
+    label = (
+        "REJECTED"
+        if not verdict.passed
+        else ("PASSED_WITH_WARNINGS" if verdict.warnings_only else "PASSED")
+    )
+    rejections = list(outcome.get("rejections") or [])
+    row = conn.execute(
+        _INSERT_SMOKE_RUN,
+        {
+            "strategy_id": strategy_id,
+            "verdict": label,
+            "window_start": _timestamp(verdict.window.get("start")),
+            "window_end": _timestamp(verdict.window.get("end")),
+            "sessions": verdict.window.get("sessions", 0),
+            "instruments": json.dumps(verdict.window.get("instruments", {})),
+            "bar_calls": outcome.get("bar_calls", 0),
+            "orders_placed": len(outcome.get("orders", [])),
+            "fills": outcome.get("fills", 0),
+            "rejections": len(rejections),
+            "rejection_reasons": json.dumps(rejections),
+            "final_cash": _money(outcome.get("final_cash")),
+            "final_equity": _money(outcome.get("final_equity")),
+            "breaker_reason": outcome.get("breaker_reason"),
+            "findings": json.dumps(
+                [
+                    {
+                        "code": f.code,
+                        "message": f.message,
+                        "line": f.line,
+                        "contract_section": f.contract_section,
+                    }
+                    for f in verdict.report.findings
+                ]
+            ),
+            "runtime": verdict.runtime,
+            "kernel_isolated": verdict.kernel_isolated,
+            "contract_version": CONTRACT_VERSION,
+        },
+    ).fetchone()
+    if row is None:  # pragma: no cover - RETURNING on INSERT always yields a row
+        raise RuntimeError("the smoke run insert returned no row")
+    return int(row[0])

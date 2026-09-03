@@ -368,7 +368,9 @@ def test_only_one_nondeterminism_finding_is_raised_when_a_pass_crashes() -> None
     # read as two separate problems.
     clean = _outcome(orders=[{"order_id": 1, "submitted_at": "09:31"}], fills=1)
     crashed = _outcome(
-        ok=False, code="SMOKE_CRASH", error="ValueError: boom",
+        ok=False,
+        code="SMOKE_CRASH",
+        error="ValueError: boom",
         crashed_at={"handler": "on_bar", "ts": "09:31"},
     )
     codes = [f.code for f in build_verdict(clean, crashed, _WINDOW, "runc", False).report.findings]

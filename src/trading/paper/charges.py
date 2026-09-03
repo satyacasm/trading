@@ -16,11 +16,18 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
-
-from psycopg import Connection
+from typing import TYPE_CHECKING
 
 from trading.paper.enums import ChargeBasis, ChargeType, Product, Rounding, Side
 from trading.paper.models import ChargeBreakdown, ChargeSchedule
+
+if TYPE_CHECKING:
+    # trading.runtime imports this module for its pure compute_charges;
+    # psycopg must not load at runtime inside the sandbox, which has no
+    # database. `from __future__ import annotations` (above) already makes
+    # every annotation below a string at runtime, so this import is only
+    # ever needed by a type checker.
+    from psycopg import Connection
 
 _TWO_DP = Decimal("0.01")
 _ONE = Decimal("1")

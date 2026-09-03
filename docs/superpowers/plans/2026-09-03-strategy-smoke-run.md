@@ -39,7 +39,7 @@ The data carrier. Pure, no Docker, no database. Everything later in the plan mov
 - Consumes: `trading.paper.models.ChargeSchedule`, `trading.agent_contract.registry.CONTRACT_VERSION`.
 - Produces:
   - `BarRecord` — frozen dataclass with `instrument_id: int`, `ts: datetime`, `interval_sec: int`, `open/high/low/close: Decimal`, `volume: Decimal | None`, `trades: int | None`, `open_interest: int | None`, `oi_change: int | None`, and a `close_ts` property.
-  - `InMemoryBars(bars: Mapping[int, Sequence[BarRecord]])` with `.instruments() -> tuple[int, ...]`, `.groups() -> Iterator[tuple[datetime, tuple[BarRecord, ...]]]`, `.history(instrument_id, upto_index) -> tuple[BarRecord, ...]`.
+  - `InMemoryBars(bars: Mapping[int, Sequence[BarRecord]])` with `.instruments() -> tuple[int, ...]`, `.total_bars() -> int`, `.groups() -> Iterator[tuple[datetime, tuple[BarRecord, ...]]]`, `.indexed_groups() -> Iterator[tuple[datetime, tuple[tuple[BarRecord, int], ...]]]`, `.history(instrument_id, upto_index) -> tuple[BarRecord, ...]`. Task 3's loop iterates `indexed_groups()`, so it is required, not optional.
   - `SmokePayload` frozen dataclass and `encode_payload(payload) -> bytes` / `decode_payload(raw: bytes) -> SmokePayload`.
 
 - [ ] **Step 1: Write the failing provider test**
@@ -545,7 +545,7 @@ The surface a strategy touches. Still pure — no fills yet; orders are submitte
 **Interfaces:**
 - Consumes: `BarRecord`, `InMemoryBars` (Task 1); `platform_sdk.{Context, DataAccess, PortfolioView}`; `trading.paper.models.{Order, Position}`; `trading.paper.enums.{OrderStatus, OrderType, Product, Side, TimeInForce}`.
 - Produces:
-  - `RunState` — mutable dataclass: `now: datetime`, `cash: Decimal`, `starting_cash: Decimal`, `positions: dict[int, Position]`, `orders: dict[int, Order]`, `submissions: list[Order]`, `logs: list[dict[str, Any]]`, `bar_calls: int`, `next_order_id: int`, `cursor: dict[int, int]`, `marks: dict[int, Decimal]`, `rejections: list[str]`.
+  - `RunState` — mutable dataclass: `now: datetime`, `cash: Decimal`, `starting_cash: Decimal`, `positions: dict[int, Position]`, `orders: dict[int, Order]`, `submissions: list[int]` (order ids in submission order — dict ordering is an implementation detail and Task 5 compares sequences), `logs: list[dict[str, Any]]`, `cursor: dict[int, int]`, `marks: dict[int, Decimal]`, `bar_calls: int`, `next_order_id: int`, `day_open_equity: Decimal | None`, `peak_equity: Decimal | None`, `breaker_reason: str | None`. There is deliberately no `rejections` field: the loop accumulates those locally, because they are a property of one execution rather than of the portfolio's state.
   - `LiveContext(state: RunState, bars: InMemoryBars, portfolio_id: int = 1)` subclassing `platform_sdk.Context`.
   - `SMOKE_PORTFOLIO_ID = 1`.
 
@@ -1684,7 +1684,7 @@ PARTIALLY_FILLED is never exercised by a smoke run."
 Puts the runtime inside the container. Everything before this ran in-process.
 
 **Files:**
-- Modify: `sandbox/runner.py` (full rewrite of `main()`; keep `_emit` and `_describe_manifest`)
+- Modify: `sandbox/runner.py` (full rewrite of `main()`; extend `_describe_manifest`; keep `_emit`)
 - Modify: `sandbox/Dockerfile:26-31` (the COPY block)
 - Modify: `src/trading/agent_contract/sandbox.py:190-277` (`run_strategy_in_sandbox` builds an envelope; add `run_smoke_in_sandbox`)
 - Create: `tests/agent_contract/test_image_contents.py`
@@ -1719,7 +1719,11 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 RUNTIME = REPO / "src" / "trading" / "runtime"
-DOCKERFILE = REPO / "sandbox" / "Dockerfile"
+# The Dockerfile copies the assembled tree wholesale (`COPY trading
+# /opt/trading`), so it is build.sh -- which selects WHICH modules get
+# assembled -- that is the real drift surface. Asserting against the
+# Dockerfile would either fail on the parent copy or pass vacuously.
+BUILD_SCRIPT = REPO / "sandbox" / "build.sh"
 
 FORBIDDEN_IN_CONTAINER = {"psycopg", "docker", "trading.config", "requests", "redis"}
 
@@ -1745,24 +1749,34 @@ def test_no_runtime_module_imports_something_the_container_lacks() -> None:
     assert offenders == [], f"these would fail inside the sandbox: {offenders}"
 
 
-def test_every_trading_module_the_runtime_needs_is_copied_into_the_image() -> None:
+def test_every_trading_module_the_runtime_needs_is_assembled_into_the_image() -> None:
     needed: set[str] = set()
     for path in sorted(RUNTIME.glob("*.py")):
         needed.update(m for m in _imported_modules(path) if m.startswith("trading."))
-    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    build = BUILD_SCRIPT.read_text(encoding="utf-8")
     missing = []
     for module in sorted(needed):
-        relative = module.replace(".", "/") + ".py"
-        package = "/".join(relative.split("/")[:2])
-        if relative not in dockerfile and package not in dockerfile:
+        leaf = module.rsplit(".", 1)[-1]
+        package_dir = "/".join(module.split(".")[:-1])
+        # build.sh copies either a brace-expanded set of leaf names out of
+        # a package, or that package's *.py wholesale.
+        copied_wholesale = f"src/{package_dir}/*.py" in build
+        copied_by_name = f"src/{package_dir}/" in build and leaf in build
+        if not (copied_wholesale or copied_by_name):
             missing.append(module)
-    assert missing == [], f"imported by trading.runtime but never COPYed: {missing}"
+    assert missing == [], f"imported by trading.runtime but never assembled: {missing}"
+
+
+def test_the_runtime_package_itself_is_assembled() -> None:
+    # Guards the case where build.sh copies trading.paper correctly but
+    # forgets the package this whole plan adds.
+    assert "src/trading/runtime/*.py" in BUILD_SCRIPT.read_text(encoding="utf-8")
 ```
 
 - [ ] **Step 2: Run it and confirm it fails**
 
 Run: `uv run pytest tests/agent_contract/test_image_contents.py -v`
-Expected: `test_every_trading_module_the_runtime_needs_is_copied_into_the_image` FAILS listing `trading.paper.breaker`, `trading.paper.charges`, `trading.paper.enums`, `trading.paper.fills`, `trading.paper.models`, `trading.runtime.*`.
+Expected: both assembly tests FAIL — `sandbox/build.sh` does not exist yet, so the `Path.read_text` raises `FileNotFoundError`. That is the correct starting failure; Step 3 creates the script. The forbidden-import test should already PASS, since nothing under `trading.runtime` imports psycopg.
 
 - [ ] **Step 3: Update the Dockerfile**
 
@@ -1822,9 +1836,77 @@ uv run pytest tests/agent_contract/test_image_contents.py -v
 ```
 Expected: 2 passed; image builds. If `trading/paper/charges.py` fails to import inside the image because it imports `psycopg` at module level for `load_schedules`, move that import inside the function — `compute_charges` is the pure half and must not drag psycopg in. Note this in the commit if it happens.
 
-- [ ] **Step 5: Rewrite the runner to dispatch on mode**
+- [ ] **Step 5: Make `_describe_manifest` carry the universe**
 
-Replace `main()` in `sandbox/runner.py` (keep `_emit` and `_describe_manifest` as they are) with:
+**Without this the smoke run cannot work at all.** Task 5's host code calls
+`resolve_universe(conn, manifest, ...)`, which reads `manifest["universe"]` to
+learn which instruments to fetch bars for — but `_describe_manifest` currently
+serialises only name, version, base_currency, capital, the two limits, and
+`data`. The universe never crosses back from the container, so the host has
+nothing to resolve. Add to `_describe_manifest` in `sandbox/runner.py`, just
+before the `data` block:
+
+```python
+    universe = getattr(manifest, "universe", None)
+    if universe is not None:
+        if isinstance(universe, list):
+            # Explicit instruments, named one by one.
+            fields["universe"] = [
+                {
+                    "exchange": getattr(ref, "exchange", None),
+                    "segment": getattr(ref, "segment", None),
+                    "symbol": getattr(ref, "symbol", None),
+                }
+                for ref in universe
+            ]
+        else:
+            # A Query, resolved point-in-time on the host against
+            # listed_on/delisted_on -- which is why only its criteria
+            # cross back, never a resolved list the container guessed at.
+            fields["universe"] = {
+                "asset_class": getattr(universe, "asset_class", None),
+                "exchange": getattr(universe, "exchange", None),
+                "index": getattr(universe, "index", None),
+            }
+```
+
+Then extend the existing test in `tests/agent_contract/test_sandbox.py` that
+asserts on a returned manifest (or add one) so the universe is covered:
+
+```python
+@pytest.mark.sandbox
+def test_the_manifest_carries_its_universe_back_to_the_host() -> None:
+    # The host cannot fetch bars without it; a manifest that omits the
+    # universe makes stage 2 impossible rather than merely degraded.
+    from trading.agent_contract.sandbox import run_strategy_in_sandbox
+
+    source = '''
+from decimal import Decimal
+from platform_sdk import DataRequest, InstrumentRef, Strategy, StrategyManifest
+
+
+class Named(Strategy):
+    def configure(self):
+        return StrategyManifest(
+            name="named",
+            version="1.0.0",
+            universe=[InstrumentRef(exchange="NSE", segment="CM", symbol="RELIANCE")],
+            data=DataRequest(bars="1m", history_bars=10),
+            capital=Decimal("100000"),
+            base_currency="INR",
+        )
+'''
+    result = run_strategy_in_sandbox(source)
+    assert result.ok is True, result.error
+    assert result.manifest is not None
+    assert result.manifest["universe"] == [
+        {"exchange": "NSE", "segment": "CM", "symbol": "RELIANCE"}
+    ]
+```
+
+- [ ] **Step 6: Rewrite the runner to dispatch on mode**
+
+Replace `main()` in `sandbox/runner.py` (keep `_emit` and the now-extended `_describe_manifest`) with:
 
 ```python
 def _install_sdk_alias() -> None:
@@ -1946,7 +2028,7 @@ def main() -> int:
     return 0
 ```
 
-- [ ] **Step 6: Update the host sandbox module**
+- [ ] **Step 7: Update the host sandbox module**
 
 In `src/trading/agent_contract/sandbox.py`:
 
@@ -1988,7 +2070,7 @@ def run_smoke_in_sandbox(
 
 5. Pass `outcome=payload.get("outcome")` when constructing the final `SandboxResult`.
 
-- [ ] **Step 7: Add the container smoke test**
+- [ ] **Step 8: Add the container smoke test**
 
 Append to `tests/agent_contract/test_sandbox.py`:
 
@@ -2076,15 +2158,15 @@ class Buyer(Strategy):
     assert Decimal(result.outcome["final_cash"]) == Decimal("99980")
 ```
 
-- [ ] **Step 8: Rebuild the image and run the full agent_contract suite**
+- [ ] **Step 9: Rebuild the image and run the full agent_contract suite**
 
 ```bash
 ./sandbox/build.sh
 uv run pytest tests/agent_contract tests/runtime -v
 ```
-Expected: all pass, including the fifteen pre-existing isolation tests, which must not have needed any change (Step 6's envelope is built inside `run_strategy_in_sandbox`).
+Expected: all pass, including the fifteen pre-existing isolation tests, which must not have needed any change (Step 7's envelope is built inside `run_strategy_in_sandbox`).
 
-- [ ] **Step 9: Lint, type-check, and commit**
+- [ ] **Step 10: Lint, type-check, and commit**
 
 ```bash
 uv run ruff check src tests && uv run ruff format --check src tests && uv run mypy src

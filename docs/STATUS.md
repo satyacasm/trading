@@ -1,6 +1,6 @@
 # Where this project stands
 
-**Updated:** 2026-09-03, ~01:15 IST. Keep this file current — it is the
+**Updated:** 2026-09-03, ~16:30 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
@@ -59,8 +59,9 @@ ec6fa0c  Merge 'paper-trading-core': paper trading core (Phase 1)
 Both feature branches (`paper-trading-core`, `frontend-paper-trading`) still
 exist as local refs. Fully merged; safe to delete with `git branch -d`.
 
-Test counts: **862 backend** (8 golden deselected, 15 of them sandbox tests that spawn real containers), **36 frontend**. ruff,
-mypy, eslint, tsc all clean.
+Test counts: **935 backend** (8 golden deselected; 18 sandbox tests spawn real
+containers, and the smoke-run end-to-end tests spawn three each), **36
+frontend**. ruff, mypy, eslint, tsc all clean.
 
 ---
 
@@ -74,11 +75,9 @@ exist.
 **Five of the seven open decisions are settled** (D1, D2, D5, D6, D7 — each
 with its reasoning in the contract's decisions table). Two remain:
 
-- **D3 (sandbox limits)** — the *environment* is decided: gVisor runs inside
-  **Docker Desktop's Linux VM** on this machine (gVisor is Linux-only and
-  cannot run on macOS directly); a VPS is a scale question, not a correctness
-  one. The specific limits, timeout, and import allowlist stay open until the
-  sandbox is built.
+- **D3 (sandbox limits)** — settled, and the environment turned out better
+  than this file long claimed. See "Isolation" below: gVisor runs, for free,
+  in a second Colima VM on this machine. No VPS is needed.
 - **D4 (worked examples)** — deliberately unwritten. An example in a contract
   is a promise the code runs; none can be executed until the runtime exists,
   and an agent copying a broken example produces broken strategies
@@ -121,32 +120,86 @@ so a caller can hand it straight back.
 `sandbox/`). Build it with `docker build -t trading-strategy-sandbox:0.1
 sandbox/` — the tests need it.
 
-**Correction to an earlier assumption in this file: Docker Desktop cannot run
-gVisor.** It ships `runc` only, and there is no supported way to install
-`runsc` into its VM. So the sandbox enforces network-none, read-only rootfs,
-all capabilities dropped, `no-new-privileges`, memory/CPU/PID ceilings, a
-host-enforced wall-clock timeout, and a non-root uid — real confinement, but
-**the host kernel is shared**. `SandboxLimits(runtime="runsc")` selects gVisor
-on a host that has one, and every `SandboxResult` records `runtime` and
-`kernel_isolated` so a stored run can never be misread as better isolated than
-it was. Proportionate for single-user V1 (the code is your own agent's);
-**gVisor is required before Phase 4**, when strangers' code runs here. That
-likely means a Linux VPS after all — not for scale, for isolation.
+### Isolation — corrected 2026-09-03, and verified
+
+**Two earlier claims in this file were wrong, and both were wrong in the
+pessimistic direction.** They said this machine runs Docker Desktop, which
+ships `runc` only with no supported way to add gVisor, and concluded that a
+paid Linux VPS would eventually be needed for isolation. Neither holds.
+
+This machine runs **Colima**, not Docker Desktop. Colima is a Lima VM running
+ordinary Ubuntu 24.04 that you have root in via `colima ssh` — so `runsc`
+installs like any other package. The whole thing is free.
+
+What is now set up and measured:
+
+```bash
+colima start --profile sandbox --cpu 2 --memory 4 --disk 20   # a SECOND VM
+colima ssh --profile sandbox
+  ARCH=$(uname -m)   # aarch64
+  wget https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/runsc
+  wget https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/containerd-shim-runsc-v1
+  chmod +x runsc containerd-shim-runsc-v1 && sudo mv runsc containerd-shim-runsc-v1 /usr/local/bin/
+  sudo runsc install && sudo systemctl restart docker
+```
+
+`runsc release-20260817.0` is installed in the `sandbox` profile and works:
+a container there reports kernel `4.19.0-gvisor`. Measured end to end,
+`DOCKER_CONTEXT=colima-sandbox`, same strategy both ways:
+
+| runtime | configure | smoke | `kernel_isolated` | final cash |
+|---|---|---|---|---|
+| `runc` | 0.38s | 0.31s | `False` | 98980.00 |
+| `runsc` | 0.54s | 0.56s | **`True`** | 98980.00 |
+
+numpy and pandas import and compute fine under gVisor, and the cost model
+returns an identical figure. The overhead is ~0.2s per run — irrelevant
+against a 120s smoke budget. All 18 container tests pass in that VM.
+
+**The separate VM matters more than gVisor does right now.** The `default`
+profile holds `trading_tsdb`, `trading_redis`, and `trading_redis_test`.
+A container escape there never reaches macOS — Lima's hypervisor stops that —
+but it lands in the same kernel as 51M bars of market data and the paper
+ledger. Running strategies in a second VM removes the data plane from the
+blast radius, and costs nothing but RAM.
+
+**Not yet wired up.** `run_strategy_in_sandbox` still uses the ambient Docker
+context and defaults to `runc`, so today's isolation gain is available rather
+than automatic. Turning it on means pointing `SandboxLimits` at the sandbox
+VM's socket and defaulting `runtime="runsc"`. Every `SandboxResult` already
+records `runtime` and `kernel_isolated`, so a stored run can never be misread
+as better isolated than it was.
 
 Strategy source is piped over **stdin**, not bind-mounted: no host path is
-exposed, and it sidesteps Docker Desktop's fixed share list, which excludes the
-system temp directory (the first implementation failed on exactly that).
+exposed, and it sidesteps the VM's fixed share list, which excludes the system
+temp directory (the first implementation failed on exactly that). That reason
+survives the Docker Desktop correction above — every macOS Docker backend
+shares only a configured set of host directories, Colima included.
 
 15 tests attempt the forbidden thing and assert containment — socket, DNS,
 writing outside `/tmp`, memory exhaustion, an infinite loop, running as root.
 Verified non-vacuous by weakening the sandbox (network on, rootfs writable) and
 watching them fail.
 
-Next in Phase 2: **§9 stage 2, the smoke run** — five simulated days through a
-real `Context`. The sandbox now runs `configure()` and returns the manifest;
-what remains is feeding a strategy actual bars over the RPC boundary. That also
-unblocks D4 (the worked examples, which must be *executed* before publication).
-Upload path so far: validate → register → run `configure()` in the sandbox.
+**§9 stage 2, the smoke run, is implemented** (`trading.agent_contract.smoke`,
+`trading.runtime`). A submitted strategy is run against real bars, real fills,
+and the real cost model inside the sandbox, and gets back a verdict written to
+be pasted straight back into the agent that wrote it. One upload costs three
+container runs: `configure` resolves the manifest — the host cannot fetch bars
+until the strategy says which instruments it wants — then the smoke payload
+runs **twice** and the two order sequences are compared. That comparison is
+what finally enforces §2: determinism was a documented rule that nothing
+checked, and a static scan that catches `datetime.now()` misses set iteration,
+unseeded `random`, and dict-hash dependence. Runs are stored in
+`strategy_smoke_runs` (migration 0011) — one row per run, many per version,
+because the window moves even though the version does not.
+
+Upload path, complete: validate → smoke → register.
+
+Next in Phase 2: **D4, the worked examples.** They were withheld because an
+example in a contract is a promise the code runs, and nothing could run it.
+Stage 2 is that runner, so the four examples can now be executed before they
+are published.
 
 **Acceptance bar** (plan §10): the contract is not done until *three different
 frontier agents*, each given only that file, each produce a working strategy

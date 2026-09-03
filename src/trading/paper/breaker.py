@@ -92,13 +92,22 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, time
 from decimal import ROUND_HALF_UP, Decimal
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from psycopg import Connection
-
-from trading.paper.alerts import enqueue_alert
 from trading.paper.enums import OrderStatus
 from trading.paper.models import Position
+
+if TYPE_CHECKING:
+    # trading.runtime imports this module for its pure evaluate_breach;
+    # psycopg must not load at runtime inside the sandbox, which has no
+    # database. `from __future__ import annotations` (above) already makes
+    # every annotation below a string at runtime, so this import is only
+    # ever needed by a type checker. `enqueue_alert` (trading.paper.alerts)
+    # is deliberately NOT imported at module scope either -- it pulls in
+    # httpx, structlog, and trading.config, none of which the sandbox has --
+    # so `trip()`, its one caller, imports it locally instead.
+    from psycopg import Connection
 
 _MONEY_DP = Decimal("0.0001")
 _PCT_DP = Decimal("0.0001")
@@ -313,7 +322,11 @@ def trip(
     # network), so it participates in this same uncommitted transaction
     # exactly like the two writes above; the caller's own commit is what
     # makes the pause, the cancels, the event, and this alert one atomic
-    # unit.
+    # unit. Imported here, not at module scope: trading.paper.alerts pulls
+    # in httpx, structlog, and trading.config, none of which trading.runtime's
+    # sandbox has, and trip() (this function) is the only caller.
+    from trading.paper.alerts import enqueue_alert
+
     enqueue_alert(
         conn,
         "BREACH",

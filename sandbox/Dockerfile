@@ -14,19 +14,24 @@ FROM python:3.12-slim
 
 # Pinned so a smoke run is reproducible: the same strategy against the same
 # image must behave the same way tomorrow.
+# pydantic joins numpy and pandas because trading.paper.models is a
+# pydantic model set and the real cost model runs in here (design D-S3).
 RUN pip install --no-cache-dir --disable-pip-version-check \
       numpy==2.5.2 \
-      pandas==2.3.3
+      pandas==2.3.3 \
+      pydantic==2.12.3
 
 # Non-root, and with no writable home. The runner writes nothing; the only
 # writable surface is the tmpfs the caller mounts at /tmp.
 RUN useradd --create-home --shell /usr/sbin/nologin --uid 10001 strategy
 
 # The runner is baked in rather than mounted, so a caller cannot swap it
-# for something that skips the guards below.
+# for something that skips the guards below. The same is true of the
+# runtime: a strategy must not be able to replace the event loop that
+# decides what its orders did.
 COPY runner.py /opt/runner.py
-COPY platform_sdk.py /opt/platform_sdk.py
-RUN chmod 0444 /opt/runner.py /opt/platform_sdk.py
+COPY trading /opt/trading
+RUN chmod -R a-w /opt
 
 USER strategy
 # The working directory is the ephemeral tmpfs, not a directory of its

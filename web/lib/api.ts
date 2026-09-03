@@ -273,3 +273,22 @@ export async function uploadStrategy(body: {
   if (!res.ok) throw await readError(res, `POST /strategies failed: ${res.status}`);
   return res.json();
 }
+
+/**
+ * The contract and SDK stub, for handing to an external agent.
+ *
+ * Fetched rather than bundled: a copy compiled into this app would drift
+ * from the file the validator actually enforces, and an agent writing
+ * against stale rules produces rejections that look like its own fault.
+ */
+export type ContractBundle = {
+  contract: string;
+  sdk_stub: string;
+  contract_version: string;
+};
+
+export async function fetchContractBundle(): Promise<ContractBundle> {
+  const res = await fetch(`${API_URL}/strategies/contract`);
+  if (!res.ok) throw await readError(res, `GET /strategies/contract failed: ${res.status}`);
+  return res.json();
+}

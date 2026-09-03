@@ -1,8 +1,22 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
-import { ApiError, uploadStrategy, type StrategyVerdict, type UploadStrategyResult } from "@/lib/api";
+import { useMemo, useState } from "react";
+import {
+  ApiError,
+  fetchContractBundle,
+  uploadStrategy,
+  type ContractBundle,
+  type StrategyVerdict,
+  type UploadStrategyResult,
+} from "@/lib/api";
+import {
+  FIX_VARIATION_ID,
+  VARIATIONS,
+  composeFixPrompt,
+  composePrompt,
+  type PromptVariation,
+} from "@/lib/prompts";
 
 /**
  * Upload → validate → smoke → register, in one blocking request.
@@ -64,6 +78,13 @@ class MyStrategy(Strategy):
             )
 `;
 
+type CopyTarget = "prompt" | "contract" | "sdk";
+
+/** Bytes as an at-a-glance size, so a 42KB paste is not a surprise. */
+function formatSize(text: string): string {
+  return `${Math.round(new Blob([text]).size / 1024)}KB`;
+}
+
 export default function StrategiesPage() {
   const [name, setName] = useState("my-strategy");
   const [version, setVersion] = useState("1.0.0");
@@ -72,6 +93,51 @@ export default function StrategiesPage() {
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [variationId, setVariationId] = useState(VARIATIONS[0].id);
+  const [kitOpen, setKitOpen] = useState(true);
+  const [kitCopied, setKitCopied] = useState<CopyTarget | null>(null);
+  const [kitError, setKitError] = useState<string | null>(null);
+
+  // Fetched on first copy rather than on mount: the bundle is ~42KB and
+  // only a session that actually reaches for a prompt needs it. Held in
+  // state rather than a ref because its size and version are rendered,
+  // and a ref cannot be read during render.
+  const [bundle, setBundle] = useState<ContractBundle | null>(null);
+
+  const variation = useMemo(
+    () => VARIATIONS.find((v) => v.id === variationId) ?? VARIATIONS[0],
+    [variationId],
+  );
+
+  async function ensureBundle(): Promise<ContractBundle> {
+    if (bundle !== null) return bundle;
+    const fetched = await fetchContractBundle();
+    setBundle(fetched);
+    return fetched;
+  }
+
+  async function copyKit(target: CopyTarget) {
+    setKitError(null);
+    try {
+      let text: string;
+      if (target === "prompt" && variation.id === FIX_VARIATION_ID) {
+        if (result === null) {
+          setKitError("Upload something first — this prompt carries the report you got back.");
+          return;
+        }
+        text = composeFixPrompt(result.feedback);
+      } else {
+        const bundle = await ensureBundle();
+        if (target === "contract") text = bundle.contract;
+        else if (target === "sdk") text = bundle.sdk_stub;
+        else text = composePrompt(bundle.contract, bundle.contract_version, variation);
+      }
+      await navigator.clipboard.writeText(text);
+      setKitCopied(target);
+    } catch (err) {
+      setKitError(err instanceof ApiError ? err.message : String(err));
+    }
+  }
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -80,7 +146,16 @@ export default function StrategiesPage() {
     setResult(null);
     setCopied(false);
     try {
-      setResult(await uploadStrategy({ name, version, source }));
+      const uploaded = await uploadStrategy({ name, version, source });
+      setResult(uploaded);
+      // After a rejection the next prompt is always the follow-up, and it
+      // embeds the report that just arrived. Selected here, where the
+      // verdict is known, rather than in an effect watching for it.
+      if (!uploaded.accepted) {
+        setVariationId(FIX_VARIATION_ID);
+        setKitCopied(null);
+        setKitOpen(true);
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : String(err));
     } finally {
@@ -108,6 +183,104 @@ export default function StrategiesPage() {
           </p>
         </div>
       </header>
+
+      <section className="border-b border-line px-4 py-4 sm:px-8">
+        <button
+          type="button"
+          onClick={() => setKitOpen((open) => !open)}
+          className="flex items-center gap-2 text-sm text-muted hover:text-text"
+          aria-expanded={kitOpen}
+        >
+          <span className="font-display text-text">Prompt kit</span>
+          <span>— hand the contract to an external agent</span>
+          <span aria-hidden="true">{kitOpen ? "▾" : "▸"}</span>
+        </button>
+
+        {kitOpen && (
+          <div className="mt-4 flex flex-col gap-4">
+            <ol className="text-muted text-xs flex flex-col gap-1 max-w-prose list-decimal pl-4">
+              <li>
+                Pick a variation, hit <span className="text-text">Copy full prompt</span>, and paste
+                the whole thing into a fresh chat with any capable model.
+              </li>
+              <li>
+                Paste what it writes into the Source box below and upload. It is checked, then run
+                against real bars.
+              </li>
+              <li>
+                On a rejection, this panel switches to <span className="text-text">Fix a rejection</span>{" "}
+                with the report already in it. Send that in the same chat, then resubmit with a
+                bumped version.
+              </li>
+            </ol>
+
+            <div className="flex flex-wrap gap-2">
+              {VARIATIONS.map((v: PromptVariation) => (
+                <button
+                  key={v.id}
+                  type="button"
+                  onClick={() => {
+                    setVariationId(v.id);
+                    setKitCopied(null);
+                  }}
+                  className={`rounded border px-2.5 py-1 text-xs ${
+                    v.id === variation.id
+                      ? "border-live text-text"
+                      : "border-line text-muted hover:text-text"
+                  }`}
+                >
+                  {v.label}
+                </button>
+              ))}
+            </div>
+
+            <p className="text-muted text-xs max-w-prose">
+              <span className="text-text">{variation.group}.</span> {variation.blurb}
+            </p>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={() => copyKit("prompt")}
+                className="bg-raised border border-line rounded px-3 py-1.5 text-sm hover:border-live"
+              >
+                {kitCopied === "prompt" ? "Copied" : "Copy full prompt"}
+              </button>
+              <button
+                type="button"
+                onClick={() => copyKit("contract")}
+                className="text-muted hover:text-text text-xs border border-line rounded px-2 py-1"
+              >
+                {kitCopied === "contract" ? "Copied" : "Contract only"}
+              </button>
+              <button
+                type="button"
+                onClick={() => copyKit("sdk")}
+                className="text-muted hover:text-text text-xs border border-line rounded px-2 py-1"
+              >
+                {kitCopied === "sdk" ? "Copied" : "SDK stub"}
+              </button>
+              {bundle !== null && (
+                <span className="num text-muted text-xs">
+                  contract {formatSize(bundle.contract)} · v{bundle.contract_version}
+                </span>
+              )}
+            </div>
+
+            {kitError !== null && <p className="text-down text-xs">{kitError}</p>}
+
+            <p className="text-muted text-xs max-w-prose">
+              The contract is sent first and the ask last — an instruction placed above 600 lines of
+              specification competes with it for attention. Where your agent accepts file
+              attachments, <span className="text-text">Contract only</span> plus a one-line ask works
+              just as well. <span className="text-text">SDK stub</span> is for agents that can run
+              code: importing against it catches a misspelled method before you spend a round trip,
+              and every call raising <span className="num">NotOnThisPlatform</span> is the expected
+              result, not a failure.
+            </p>
+          </div>
+        )}
+      </section>
 
       <div className="grid gap-6 px-4 py-6 sm:px-8 lg:grid-cols-2">
         <form onSubmit={submit} className="flex flex-col gap-4 min-w-0">

@@ -45,13 +45,14 @@ structured report an agent iterates against.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends
 from psycopg import Connection
 from pydantic import BaseModel, Field
 
-from trading.agent_contract.registry import register_strategy
+from trading.agent_contract.registry import CONTRACT_VERSION, register_strategy
 from trading.agent_contract.smoke import SmokeVerdict, record_smoke_run, smoke_test
 from trading.agent_contract.validation import Finding, ValidationReport, validate_strategy
 from trading.streaming.db import get_db_connection
@@ -62,6 +63,11 @@ router = APIRouter()
 # so an upload that does not name one is attributed to it rather than
 # inventing an owner or refusing.
 _LOCAL_USER_EMAIL = "local@paper.trading"
+
+_PACKAGE_ROOT = Path(__file__).resolve().parent
+_REPO_ROOT = _PACKAGE_ROOT.parents[2]
+_CONTRACT_PATH = _REPO_ROOT / "docs" / "agent-contract" / "STRATEGY_CONTRACT.md"
+_SDK_STUB_PATH = _PACKAGE_ROOT / "platform_sdk.py"
 
 
 class UploadStrategyRequest(BaseModel):
@@ -180,4 +186,41 @@ def upload_strategy(
     return _from_verdict(verdict, strategy_id=registered.strategy_id)
 
 
-__all__ = ["Finding", "UploadStrategyRequest", "UploadStrategyResponse", "router"]
+class ContractBundle(BaseModel):
+    """Everything an agent needs before it writes a line.
+
+    The contract is the prompt; the stub is what a capable agent can
+    import to check its own work offline. Both travel together because
+    handing over one without the other is the common way a round trip
+    gets wasted.
+    """
+
+    contract: str
+    sdk_stub: str
+    contract_version: str
+
+
+@router.get("/strategies/contract", response_model=ContractBundle)
+def get_contract() -> ContractBundle:
+    """The contract and SDK stub, read from disk on every request.
+
+    Deliberately uncached. A prompt kit that hands out a stale contract is
+    worse than one that hands out none: the agent writes against rules
+    nothing enforces any more, the upload is rejected, and the rejection
+    reads as the agent's fault rather than the platform's. Two file reads
+    are cheap next to the three containers the sibling route spawns.
+    """
+    return ContractBundle(
+        contract=_CONTRACT_PATH.read_text(encoding="utf-8"),
+        sdk_stub=_SDK_STUB_PATH.read_text(encoding="utf-8"),
+        contract_version=CONTRACT_VERSION,
+    )
+
+
+__all__ = [
+    "ContractBundle",
+    "Finding",
+    "UploadStrategyRequest",
+    "UploadStrategyResponse",
+    "router",
+]

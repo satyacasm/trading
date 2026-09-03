@@ -230,3 +230,39 @@ def test_a_strategy_whose_universe_has_no_bars_is_rejected_and_stores_nothing(
     assert body["verdict"] == "REJECTED"
     assert [f["code"] for f in body["findings"]] == ["NO_DATA"]
     assert db_conn.execute("SELECT COUNT(*) FROM strategies").fetchone()[0] == before
+
+
+# --- GET /strategies/contract: the prompt kit's payload ------------------------
+
+
+def test_the_contract_is_served_from_the_file_the_validator_enforces(client) -> None:  # noqa: ANN001
+    """A prompt kit that hands out a stale contract is worse than one that
+    hands out none: the agent writes against rules nobody checks any more,
+    and the rejection reads as the agent's fault. Served from disk, not
+    from a copy."""
+    from pathlib import Path
+
+    import trading.agent_contract as pkg
+    from trading.agent_contract.registry import CONTRACT_VERSION
+
+    response = client.get("/strategies/contract")
+
+    assert response.status_code == 200
+    body = response.json()
+    on_disk = (
+        Path(pkg.__file__).resolve().parents[3] / "docs" / "agent-contract" / "STRATEGY_CONTRACT.md"
+    ).read_text()
+    assert body["contract"] == on_disk
+    assert body["sdk_stub"] == (Path(pkg.__file__).parent / "platform_sdk.py").read_text()
+    # Read from the registry, never retyped: a hardcoded "0.1" here would
+    # keep passing after the real version moved on.
+    assert body["contract_version"] == CONTRACT_VERSION
+
+
+def test_the_served_contract_is_substantial_enough_to_be_the_real_thing(client) -> None:  # noqa: ANN001
+    # The vacuity guard: returning "" would satisfy an equality check
+    # against a file this test also read as "".
+    body = client.get("/strategies/contract").json()
+    assert len(body["contract"]) > 10_000
+    assert "## 9. Upload, validation, and the feedback loop" in body["contract"]
+    assert "NotOnThisPlatform" in body["sdk_stub"]

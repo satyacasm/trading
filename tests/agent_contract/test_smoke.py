@@ -506,13 +506,31 @@ def test_both_container_passes_run_under_the_configured_runtime(monkeypatch) -> 
     assert [getattr(limit, "runtime", None) for limit in seen] == ["runsc"]
 
 
-def test_the_runtime_is_unset_by_default_so_the_daemon_decides() -> None:
-    # The vacuity guard: hard-coding "runsc" would satisfy the test above
-    # and would break every machine that does not have gVisor installed.
-    from trading.agent_contract.smoke import _resolve_limits
+def test_nothing_about_the_runtime_is_hardcoded(monkeypatch) -> None:  # noqa: ANN001
+    """The vacuity guard: hard-coding "runsc" would satisfy the test above
+    and break every machine without gVisor installed.
 
-    get_settings.cache_clear()
-    assert _resolve_limits(None).runtime is None
+    Asserted against a stubbed settings object rather than the real
+    default, because `Settings` reads `.env.local` -- so a developer who
+    configures gVisor on their own machine would otherwise fail this test
+    for doing exactly what the docs tell them to. The claim here is about
+    the code, not about the host.
+    """
+    from types import SimpleNamespace
+
+    from trading.agent_contract import smoke as smoke_module
+
+    monkeypatch.setattr(
+        smoke_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            strategy_sandbox_runtime=None, strategy_sandbox_docker_context=None
+        ),
+    )
+    limits = smoke_module._resolve_limits(None)
+
+    assert limits.runtime is None
+    assert limits.docker_context is None
 
 
 def test_the_configured_docker_context_reaches_every_container(monkeypatch) -> None:  # noqa: ANN001

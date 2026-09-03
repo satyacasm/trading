@@ -247,6 +247,8 @@ export type StrategyWindow = {
   end: string | null;
   sessions: number;
   instruments?: Record<string, { bars: number }>;
+  bars: string | null;
+  interval_sec: number | null;
 };
 
 /**
@@ -257,6 +259,9 @@ export type RunSummary = {
   bar_calls: number;
   orders: number;
   fills: number;
+  rejections: number;
+  rejection_reasons: string[];
+  breaker_reason: string | null;
   starting_cash: string | null;
   final_cash: string | null;
   final_equity: string | null;
@@ -307,5 +312,52 @@ export type ContractBundle = {
 export async function fetchContractBundle(): Promise<ContractBundle> {
   const res = await fetch(`${API_URL}/strategies/contract`);
   if (!res.ok) throw await readError(res, `GET /strategies/contract failed: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * The most recent smoke run for a registered strategy, as summarised by
+ * `GET /strategies` -- one row's worth, not the full upload payload.
+ */
+export type LatestRun = {
+  smoke_run_id: number;
+  verdict: StrategyVerdict;
+  window_start: string | null;
+  window_end: string | null;
+  sessions: number;
+  bar_calls: number;
+  orders_placed: number;
+  fills: number;
+  rejections: number;
+  final_equity: string | null;
+  breaker_reason: string | null;
+  runtime: string;
+  kernel_isolated: boolean;
+  contract_version: string;
+  ran_at: string;
+};
+
+/**
+ * A registered strategy. `latest_run` is only ever the run that got it
+ * registered: `strategy_smoke_runs.strategy_id` is NOT NULL, so a
+ * rejected upload never gets a row to hang off a strategy in the first
+ * place -- only PASSING uploads appear here at all.
+ */
+export type RegisteredStrategy = {
+  strategy_id: number;
+  name: string;
+  version: string;
+  status: string;
+  contract_version: string;
+  registered_at: string;
+  bars: string | null;
+  latest_run: LatestRun | null;
+};
+
+export async function fetchStrategies(limit?: number): Promise<RegisteredStrategy[]> {
+  const url =
+    limit === undefined ? `${API_URL}/strategies` : `${API_URL}/strategies?limit=${limit}`;
+  const res = await fetch(url);
+  if (!res.ok) throw await readError(res, `GET /strategies failed: ${res.status}`);
   return res.json();
 }

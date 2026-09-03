@@ -1,16 +1,26 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ApiError,
   fetchContractBundle,
+  fetchStrategies,
   uploadStrategy,
   type ContractBundle,
+  type RegisteredStrategy,
   type RunSummary,
   type StrategyVerdict,
   type UploadStrategyResult,
 } from "@/lib/api";
+import {
+  SERVED_BARS,
+  UNSERVED_BARS,
+  dailyClockCaveat,
+  describeWindow,
+  explainNoFills,
+  orderForDisplay,
+} from "@/lib/strategies";
 import {
   FIX_VARIATION_ID,
   VARIATIONS,
@@ -52,8 +62,9 @@ from platform_sdk import DataRequest, InstrumentRef, Strategy, StrategyManifest
 
 class MyStrategy(Strategy):
     def configure(self):
-        # Every symbol here must exist in \`instruments\` and have 1-minute
-        # bars, or the smoke run rejects with NO_DATA.
+        # Every symbol here must exist in \`instruments\`, and \`data.bars\`
+        # must be an interval this platform actually serves -- see the note
+        # below the Source box -- or the smoke run rejects.
         return StrategyManifest(
             name="my-strategy",
             version="1.0.0",
@@ -115,6 +126,7 @@ function formatSize(text: string): string {
 function PerformanceRow({ summary }: { summary: RunSummary }) {
   const pnl = summary.pnl === null ? null : Number(summary.pnl);
   const tone = pnl === null ? "text-text" : pnl > 0 ? "text-up" : pnl < 0 ? "text-down" : "text-muted";
+  const noFills = explainNoFills(summary);
   return (
     <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1">
       {summary.final_equity !== null && (
@@ -136,6 +148,13 @@ function PerformanceRow({ summary }: { summary: RunSummary }) {
       <span className="num text-muted text-xs">
         {summary.bar_calls.toLocaleString()} bars · {summary.orders} orders · {summary.fills} fills
       </span>
+      {/*
+        `text-live` here, not `text-down`: nothing failed -- the run
+        completed -- this is the system flagging something that needs a
+        look. Without it, "3 orders · 0 fills" reads as a strategy that
+        chose not to trade, when every order in fact bounced.
+      */}
+      {noFills !== null && <span className="text-live text-xs">{noFills}</span>}
     </div>
   );
 }
@@ -158,6 +177,27 @@ export default function StrategiesPage() {
   // state rather than a ref because its size and version are rendered,
   // and a ref cannot be read during render.
   const [bundle, setBundle] = useState<ContractBundle | null>(null);
+
+  // The registered-strategies list. `null` means "still loading" so the
+  // empty state ("nothing registered yet") is never shown for the instant
+  // before the first response arrives.
+  const [strategies, setStrategies] = useState<RegisteredStrategy[] | null>(null);
+  const [strategiesError, setStrategiesError] = useState<string | null>(null);
+
+  async function reloadStrategies() {
+    try {
+      const list = await fetchStrategies();
+      setStrategies(list);
+      setStrategiesError(null);
+    } catch (err) {
+      setStrategiesError(err instanceof ApiError ? err.message : String(err));
+    }
+  }
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    reloadStrategies();
+  }, []);
 
   const variation = useMemo(
     () => VARIATIONS.find((v) => v.id === variationId) ?? VARIATIONS[0],
@@ -210,6 +250,13 @@ export default function StrategiesPage() {
         setVariationId(FIX_VARIATION_ID);
         setKitCopied(null);
         setKitOpen(true);
+      } else {
+        // Only an accepted upload can have changed the registered list --
+        // a rejection stores nothing (`strategy_smoke_runs.strategy_id` is
+        // NOT NULL, so a rejected run has no row to hang on) -- but
+        // reloading unconditionally would be harmless too; this just
+        // avoids a request that can never return something new.
+        await reloadStrategies();
       }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : String(err));
@@ -238,6 +285,11 @@ export default function StrategiesPage() {
           </p>
         </div>
       </header>
+
+      <RegisteredStrategiesSection
+        strategies={strategies}
+        error={strategiesError}
+      />
 
       <section className="border-b border-line px-4 py-4 sm:px-8">
         <button
@@ -371,6 +423,18 @@ export default function StrategiesPage() {
             />
           </label>
 
+          {/*
+            Said before upload, not just after a rejection: without this, a
+            user writes `data.bars="5m"`, uploads, and reads the resulting
+            MANIFEST_UNRESOLVABLE as their own bug rather than a platform
+            limit. The contract permits all five; this platform serves two.
+          */}
+          <p className="text-muted text-xs max-w-prose">
+            <span className="text-text">{SERVED_BARS.join(" and ")}</span> bars are served.{" "}
+            <span className="num">{UNSERVED_BARS.join(", ")}</span> are contract-legal but rejected
+            — the platform has no bar aggregation for them yet.
+          </p>
+
           <div className="flex items-center gap-4">
             <button
               type="submit"
@@ -419,12 +483,19 @@ export default function StrategiesPage() {
 
               {result.summary !== null && <PerformanceRow summary={result.summary} />}
 
-              {result.window !== null && result.window.start !== null && (
-                <p className="text-muted text-xs">
-                  Window: <span className="num">{result.window.start.slice(0, 10)}</span> to{" "}
-                  <span className="num">{result.window.end?.slice(0, 10)}</span> ·{" "}
-                  <span className="num">{result.window.sessions}</span> sessions
-                </p>
+              {result.window !== null && (
+                <>
+                  <p className="num text-muted text-xs">{describeWindow(result.window)}</p>
+                  {/*
+                    Daily bars are timestamped at session close while the
+                    Bar contract defines the interval start, so a daily run's
+                    simulated clock sits a uniform one day behind -- worth
+                    surfacing every time, not just in a release note.
+                  */}
+                  {dailyClockCaveat(result.window.bars) !== null && (
+                    <p className="text-muted text-xs">{dailyClockCaveat(result.window.bars)}</p>
+                  )}
+                </>
               )}
 
               {/*
@@ -449,6 +520,43 @@ export default function StrategiesPage() {
                 </p>
               )}
 
+              {/*
+                The structured findings, above the prose. `feedback` is the
+                narrative report; this is the same facts as data -- a code
+                plus a contract section is what lets someone spot
+                "MANIFEST_UNRESOLVABLE §3" at a glance instead of reading a
+                paragraph to find it.
+              */}
+              {result.findings.length > 0 && (
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-muted text-xs uppercase tracking-wide">Findings</span>
+                  <ul className="flex flex-col gap-1.5">
+                    {result.findings.map((f, i) => (
+                      <li
+                        key={i}
+                        className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs border border-line rounded px-2 py-1.5 bg-surface"
+                      >
+                        {/*
+                          A report's findings share one class: `smoke_test`
+                          only reaches REJECTED when at least one finding is
+                          a hard-fail code, and PASSED_WITH_WARNINGS only
+                          exists when none are -- so the overall verdict's
+                          tone is the correct tone for every finding in it,
+                          without the frontend needing its own copy of the
+                          backend's fail-code list.
+                        */}
+                        <span className={`num ${VERDICT_TONE[result.verdict]}`}>{f.code}</span>
+                        {f.contract_section !== "" && (
+                          <span className="text-muted">§{f.contract_section}</span>
+                        )}
+                        {f.line !== null && <span className="num text-muted">line {f.line}</span>}
+                        <span className="text-text w-full">{f.message}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
               <div className="flex items-center justify-between gap-3">
                 <span className="text-muted text-xs uppercase tracking-wide">Report</span>
                 <button
@@ -467,5 +575,95 @@ export default function StrategiesPage() {
         </section>
       </div>
     </main>
+  );
+}
+
+/**
+ * What's already registered, above the upload form.
+ *
+ * Only PASSING uploads ever appear here: `strategy_smoke_runs.strategy_id`
+ * is a NOT NULL foreign key to `strategies`, so a rejected upload never
+ * gets a run row to hang off a strategy in the first place -- there is
+ * nothing to list.
+ *
+ * Sorted by name, then by registration time, so two versions of the same
+ * strategy sit on adjacent rows. That adjacency is the point: it is what
+ * makes the platform's immutability rule (re-registering a version with
+ * different code is refused; ship a bump instead) visible rather than
+ * asserted -- you can see both attempts side by side.
+ */
+function RegisteredStrategiesSection({
+  strategies,
+  error,
+}: {
+  strategies: RegisteredStrategy[] | null;
+  error: string | null;
+}) {
+  const sorted = useMemo(
+    () => (strategies === null ? null : orderForDisplay(strategies)),
+    [strategies],
+  );
+
+  return (
+    <section className="border-b border-line px-4 py-4 sm:px-8">
+      <h2 className="font-display text-sm tracking-wide mb-3">REGISTERED STRATEGIES</h2>
+
+      {error !== null && (
+        <p className="text-down text-sm">Could not load registered strategies: {error}</p>
+      )}
+
+      {error === null && sorted === null && (
+        <p className="text-muted text-sm">Loading…</p>
+      )}
+
+      {error === null && sorted !== null && sorted.length === 0 && (
+        <p className="text-muted text-sm">Nothing registered yet.</p>
+      )}
+
+      {error === null && sorted !== null && sorted.length > 0 && (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm border border-line rounded">
+            <thead>
+              <tr className="text-muted text-xs uppercase tracking-wide bg-surface">
+                <th className="text-left font-normal px-3 py-2">Name</th>
+                <th className="text-left font-normal px-3 py-2">Version</th>
+                <th className="text-left font-normal px-3 py-2">Bars</th>
+                <th className="text-left font-normal px-3 py-2">Latest run</th>
+                <th className="text-right font-normal px-3 py-2">Sessions</th>
+                <th className="text-right font-normal px-3 py-2">Final equity</th>
+                <th className="text-left font-normal px-3 py-2">Contract</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((s) => (
+                <tr key={s.strategy_id} className="border-t border-line">
+                  <td className="px-3 py-2">{s.name}</td>
+                  <td className="num px-3 py-2 text-muted">{s.version}</td>
+                  <td className="num px-3 py-2 text-muted">{s.bars ?? "--"}</td>
+                  <td className="px-3 py-2">
+                    {s.latest_run === null ? (
+                      <span className="text-muted">--</span>
+                    ) : (
+                      <span className={VERDICT_TONE[s.latest_run.verdict]}>
+                        {VERDICT_LABEL[s.latest_run.verdict]}
+                      </span>
+                    )}
+                  </td>
+                  <td className="num text-right px-3 py-2">
+                    {s.latest_run !== null ? s.latest_run.sessions : "--"}
+                  </td>
+                  <td className="num text-right px-3 py-2">
+                    {s.latest_run?.final_equity !== null && s.latest_run?.final_equity !== undefined
+                      ? money(s.latest_run.final_equity)
+                      : "--"}
+                  </td>
+                  <td className="num px-3 py-2 text-muted">v{s.contract_version}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }

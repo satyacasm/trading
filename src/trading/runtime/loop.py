@@ -344,13 +344,18 @@ def run_loop(
                 day_open_equity = starting_cash
             else:
                 day_open_equity = state.day_open_equity
-            state.breaker_reason = evaluate_breach(
-                equity,
-                day_open_equity,
-                peak_equity,
-                max_daily_loss,
-                max_drawdown_pct,
-            )
+            # Latched explicitly, not left to the `break` below to make
+            # true only by construction: once tripped, stays tripped,
+            # and that invariant must hold on its own terms so it
+            # survives any future restructuring of this loop.
+            if state.breaker_reason is None:
+                state.breaker_reason = evaluate_breach(
+                    equity,
+                    day_open_equity,
+                    peak_equity,
+                    max_daily_loss,
+                    max_drawdown_pct,
+                )
             if state.breaker_reason is not None:
                 # Mirror trading.paper.breaker.trip: stop trading the
                 # instant a declared limit is breached. Continuing would

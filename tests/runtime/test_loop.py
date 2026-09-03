@@ -447,3 +447,120 @@ def test_a_breach_cancels_resting_orders_and_stops_the_loop() -> None:
         str(OrderStatus.FILLED),
         str(OrderStatus.CANCELLED),
     ]
+
+
+def test_dp_charge_is_never_wrongly_suppressed_across_a_buy_sell_buy_sequence() -> None:
+    # I3: `already = order.side is Side.SELL and key in scrip_days` mirrors
+    # trading.paper.engine's `_dp_already_applied_today`, whose own query
+    # filters `AND o.side = 'SELL'` -- the once-per-scrip-per-day dedup is
+    # scoped to SELL history only, and a BUY neither reads nor writes it.
+    # `applies_to_side="BOTH"` on the DP row below is deliberate: it is the
+    # one configuration that puts a BUY fill through the same `already`
+    # check a SELL does, which is exactly what the *old*, ungated read
+    # (`key in scrip_days`, with no side check) would have gotten wrong --
+    # the SELL's dedup marker would have leaked into the following BUY and
+    # wrongly zeroed its DP charge. The fixed code must not do that.
+    #
+    # Schedule: brokerage Rs 20.00 flat/order (BOTH), DP Rs 15.00
+    # flat/scrip/day (BOTH). Sequence, same IST day: BUY 10 @ 100, SELL 10
+    # @ 110, BUY 10 @ 90 (each a MARKET order, so it fills at the next
+    # bar's open; verified against `run_loop`'s own scrip_days bookkeeping
+    # before writing this test -- see the fix round 3 report for the
+    # cross-check).
+    #
+    # Because the dedup is SELL-scoped and there is only one SELL in this
+    # sequence, it never actually fires: DP is charged on *all three*
+    # fills, not deduplicated to once -- BUY orders are simply never
+    # subject to the once-per-day marker at all, by design (matching
+    # `_dp_already_applied_today`'s SELL-only history query). That is the
+    # property this test pins: had the old, ungated read been in place,
+    # the SELL's marker would have wrongly suppressed BUY 2's DP, and the
+    # arithmetic below would not match.
+    #
+    #   BUY  10 @ 100: dp=15.00 (not gated on side, so unaffected by
+    #                  scrip_days) + brokerage 20.00 -> cash -= 1035.00
+    #                  cash = 100000 - 1035.00 = 98965.00
+    #   SELL 10 @ 110: scrip_days is still empty (only a SELL writes to
+    #                  it, and this is the first one) -> already=False ->
+    #                  dp=15.00 + brokerage 20.00 -> cash += 1065.00
+    #                  cash = 98965.00 + 1065.00 = 100030.00
+    #                  (scrip_days now holds this scrip's IST-day key)
+    #   BUY  10 @ 90:  side is BUY, so `already` is False regardless of
+    #                  scrip_days -- NOT suppressed by the SELL above ->
+    #                  dp=15.00 + brokerage 20.00 -> cash -= 935.00
+    #                  cash = 100030.00 - 935.00 = 99095.00
+    #   final_cash = 99095.00
+    #   position after fill 3: long 10 @ avg_cost 90, marked at the last
+    #   bar's close of 90 -> final_equity = 99095.00 + 10*90 = 99995.00
+    #
+    # A buggy, ungated read would have zeroed BUY 2's dp_charges (its
+    # total would have been only the 20.00 brokerage), giving cash =
+    # 100030.00 - 920.00 = 99110.00 instead of 99095.00 -- 15.00 richer
+    # than correct. The assertion below distinguishes the two.
+    brokerage = ChargeSchedule(
+        broker="TEST",
+        exchange="NSE",
+        asset_class="EQUITY",
+        product=Product.DELIVERY,
+        charge_type=ChargeType.BROKERAGE,
+        basis=ChargeBasis.FLAT_PER_ORDER,
+        applies_to_side="BOTH",
+        rate=Decimal("20.00"),
+        cap=None,
+        rounding=Rounding.TWO_DECIMALS,
+        gst_base_types=(),
+        effective_from=datetime(2020, 1, 1).date(),
+        effective_to=None,
+        source_note="test",
+    )
+    dp = ChargeSchedule(
+        broker="TEST",
+        exchange="NSE",
+        asset_class="EQUITY",
+        product=Product.DELIVERY,
+        charge_type=ChargeType.DP_CHARGES,
+        basis=ChargeBasis.FLAT_PER_SCRIP_PER_DAY,
+        applies_to_side="BOTH",
+        rate=Decimal("15.00"),
+        cap=None,
+        rounding=Rounding.TWO_DECIMALS,
+        gst_base_types=(),
+        effective_from=datetime(2020, 1, 1).date(),
+        effective_to=None,
+        source_note="test",
+    )
+
+    class BuySellBuy:
+        def __init__(self) -> None:
+            self.step = 0
+
+        def on_bar(self, ctx, bars) -> None:  # noqa: ANN001
+            if self.step == 0:
+                ctx.order(1, side="BUY", quantity=Decimal("10"), rationale="open")
+            elif self.step == 2:
+                ctx.order(1, side="SELL", quantity=Decimal("10"), rationale="close")
+            elif self.step == 4:
+                ctx.order(1, side="BUY", quantity=Decimal("10"), rationale="reopen")
+            self.step += 1
+
+    base = datetime(2026, 9, 1, 4, tzinfo=UTC)  # 09:30 IST, one calendar day throughout
+    series = [
+        _bar(1, base, "100"),
+        _bar(1, base + timedelta(minutes=1), "100"),
+        _bar(1, base + timedelta(minutes=2), "110"),
+        _bar(1, base + timedelta(minutes=3), "110"),
+        _bar(1, base + timedelta(minutes=4), "90"),
+        _bar(1, base + timedelta(minutes=5), "90"),
+    ]
+
+    outcome = run_loop(
+        strategy=BuySellBuy(),
+        bars=InMemoryBars({1: series}),
+        schedules=(brokerage, dp),
+        starting_cash=Decimal("100000"),
+        slippage_bps=Decimal("0"),
+    )
+
+    assert outcome.fills == 3
+    assert outcome.final_cash == "99095.00"
+    assert outcome.final_equity == "99995.00"

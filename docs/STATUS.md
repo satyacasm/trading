@@ -79,10 +79,18 @@ with its reasoning in the contract's decisions table). Two remain:
 - **D3 (sandbox limits)** — settled, and the environment turned out better
   than this file long claimed. See "Isolation" below: gVisor runs, for free,
   in a second Colima VM on this machine. No VPS is needed.
-- **D4 (worked examples)** — deliberately unwritten. An example in a contract
-  is a promise the code runs; none can be executed until the runtime exists,
-  and an agent copying a broken example produces broken strategies
-  confidently.
+- **D4 (worked examples)** — unblocked and started. Stage 2 can execute them
+  now, and the first one exists: `docs/agent-contract/dogfood/passing-buy-and-hold.py`
+  is a cold agent's unedited output that PASSED (491 on_bar calls, 1 fill,
+  +118.99 INR over 5 sessions). Three more archetypes to go before D4 closes.
+
+**Dogfooding has started and it is finding real defects** — see
+`docs/agent-contract/dogfood/RESULTS.md`. Two rounds, two contract bugs: §2
+described a class shape the runner refuses (`2fbcfc5`), and `OrderUpdate` was
+never documented at all (`2daf103`). Neither was findable by the test suite:
+every strategy in this repo was written by someone who already knew the rule.
+Round 3 passed first-try. **1 of the 3 model families §10 requires has
+cleared**, and the other two must be run against the *current* contract.
 
 Consequence of D6 worth remembering: **one strategy → one portfolio → one
 currency**, so a single strategy cannot trade NSE equities and crypto together

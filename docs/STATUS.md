@@ -1,6 +1,6 @@
 # Where this project stands
 
-**Updated:** 2026-09-03, ~16:30 IST. Keep this file current — it is the
+**Updated:** 2026-09-03, ~23:15 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
@@ -45,7 +45,7 @@ that is correct behaviour and the ticket will say so.
 | **Phase 1** — streaming + manual paper trading | Shipped, bar Task 12. Crypto streaming, bar aggregation, Upstox WS, charts/watchlist UI, paper-trading core, and the trading UI are all merged to `main`. |
 | **Phase 2** — Agent Contract + strategy runtime | **Started.** Draft at `docs/agent-contract/STRATEGY_CONTRACT.md`. |
 | **Phase 2.5** — intelligence layer | Not started. Recorders were meant to start in Phase 0 and compound; check whether the news/announcements recorder is actually running. |
-| **Phase 3** — backtesting + metrics | **Sub-project 3a complete.** `smoke_test` now reads a strategy's declared `data.bars` and either serves it correctly (`"1m"`, `"1d"`) or rejects it with an honest finding naming the gap (see below). 3b (backtest runs at scale + persistence), 3c–3e (metrics, report UI, walk-forward, robustness) not started. |
+| **Phase 3** — backtesting + metrics | **Sub-project 3a complete, and now visible in the UI.** `smoke_test` reads a strategy's declared `data.bars` and either serves it correctly (`"1m"`, `"1d"`) or rejects it with an honest finding naming the gap (see below); `/strategies` reports which interval a run actually received, and lists what is registered. 3b (backtest runs at scale + persistence), 3c–3e (metrics, report UI, walk-forward, robustness) not started. |
 
 ---
 
@@ -94,6 +94,59 @@ phantom drawdowns from an unadjusted or wrong-interval read.
 
 ---
 
+## What 3a looks like from the app (added 2026-09-03 evening)
+
+3a was correct in the engine and invisible on screen: `select_window`
+returned `start`/`end`/`sessions` and nothing else, so `/strategies` could
+say "5 sessions" but could not say *which bars* — a distinction worth ~100×
+in `on_bar` calls. Five changes closed that, and one of them was a real data
+bug rather than a display gap.
+
+- **The window now names its interval.** `select_window` stamps `bars` and
+  `interval_sec` on both return paths, derived by inverting
+  `_BAR_INTERVALS_SEC` so the label and the seconds cannot drift. Paths that
+  resolved no interval (configure() produced no manifest; the manifest
+  declared an unserved one) carry `None`, never a default of `60`/`"1m"` —
+  the same refusal-to-default the rest of the module runs on.
+- **The manifest survives registration.** `register_strategy` has always
+  accepted a `manifest=`, and `POST /strategies` never passed one, so **every
+  strategy registered before today stores `NULL`** and shows `--` in the new
+  Bars column permanently. `SmokeVerdict` now carries the manifest
+  `configure()` returned and the upload route hands it to stage 3. This was
+  the only actual data loss in the set; the rest were presentation.
+- **`GET /strategies` exists.** The registry was write-only from the app's
+  side: an upload wrote `strategies` and `strategy_smoke_runs` and nothing
+  could read either back, so §9's immutability rule (re-registering a version
+  with different source is refused) was invisible — you could never see two
+  versions side by side. Plain `def`, `LEFT JOIN LATERAL` to the newest run
+  so a run-less strategy still lists, ordered `registered_at DESC,
+  strategy_id DESC`. **Not scoped by `user_id`** — harmless with one seeded
+  user and no auth, and the line to change when auth lands.
+- **A run that filled nothing says why.** `RunSummary` gained `rejections`,
+  `rejection_reasons` and `breaker_reason`, mirroring what `record_smoke_run`
+  stores so the response and the row cannot disagree. "12 orders · 0 fills"
+  previously read as a strategy that chose not to trade when in fact every
+  order bounced — the same shape of half-truth as serving the wrong interval.
+- **The page stops teaching the old world.** The starter template no longer
+  claims 1-minute bars are a requirement, and a line above the upload button
+  states that `1m`/`1d` are served while `5m`/`15m`/`1h` are contract-legal
+  and rejected — so that rejection reads as a platform limit, not the agent's
+  bug. Structured `findings` (code, §section, line) now render alongside the
+  prose report, and the daily-clock caveat above appears on any `1d` run.
+
+Verified against the live stack, not just tests: an upload returned `PASSED`
+with `bars="1m"` under `runtime=runsc`/`kernel_isolated=true`, a `"5m"`
+manifest was rejected `MANIFEST_UNRESOLVABLE §3` after the configure
+container alone, and the page renders in a browser with no console errors.
+`phase3a-interval-proof` 1.0.0 is that verification upload — it is the only
+row with a populated manifest, and `DELETE FROM strategies WHERE name LIKE
+'phase3a-%'` removes it.
+
+Frontend presentation logic lives in `web/lib/strategies.ts` (pure, unit
+tested against the exact sentences) rather than inside the page component.
+
+---
+
 ## Recent merges on `main`
 
 ```
@@ -105,9 +158,11 @@ ec6fa0c  Merge 'paper-trading-core': paper trading core (Phase 1)
 `paper-trading-core` and `frontend-paper-trading` still exist as local refs.
 Fully merged; safe to delete with `git branch -d`.
 
-Test counts: **935 backend** (8 golden deselected; 18 sandbox tests spawn real
-containers, and the smoke-run end-to-end tests spawn three each), **36
-frontend**. ruff, mypy, eslint, tsc all clean.
+Test counts: **987 backend collected** — 952 green in the fast set (golden,
+sandbox and live excluded); the 27 sandbox tests spawn real containers (the
+smoke-run end-to-end ones spawn three each) and the 6 `live` tests need an
+open NSE session, so they fail out of hours by design. **62 frontend** (was
+36; `web/lib/strategies.ts` brought 17). ruff, mypy, eslint, tsc all clean.
 
 ---
 

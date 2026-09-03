@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Any
@@ -92,6 +92,12 @@ class SmokeVerdict:
     # baseline to 0 would report the whole closing equity as profit.
     starting_cash: Decimal | None = None
     currency: str = ""
+    # The manifest configure() returned, so a caller downstream of the
+    # verdict (registration, the listing route) can see what stage 2
+    # actually resolved without re-running the sandbox. None on every
+    # path that returns before configure() produced one -- there is
+    # nothing here to carry.
+    manifest: dict[str, Any] | None = None
 
     @property
     def final_equity(self) -> Decimal | None:
@@ -369,8 +375,16 @@ def select_window(
     sql = _DAILY_WINDOW_SQL if interval_sec == 86400 else _WINDOW_SQL
     rows = conn.execute(sql, (list(instrument_ids), len(set(instrument_ids)), sessions)).fetchall()
     days = sorted(row[0] for row in rows)
+    bars_label = _BAR_LABELS_BY_SEC.get(interval_sec)
     if not days:
-        return {"start": None, "end": None, "sessions": 0, "instruments": {}}
+        return {
+            "start": None,
+            "end": None,
+            "sessions": 0,
+            "instruments": {},
+            "bars": bars_label,
+            "interval_sec": interval_sec,
+        }
     start = datetime.combine(days[0], time.min, tzinfo=UTC)
     end = datetime.combine(days[-1], time.max, tzinfo=UTC)
     return {
@@ -378,6 +392,8 @@ def select_window(
         "end": end.isoformat(),
         "sessions": len(days),
         "instruments": {},
+        "bars": bars_label,
+        "interval_sec": interval_sec,
     }
 
 
@@ -477,6 +493,12 @@ _BAR_INTERVALS_SEC: dict[str, int] = {
     "1h": 3600,
     "1d": 86400,
 }
+
+# Built once by inverting _BAR_INTERVALS_SEC rather than hardcoding a
+# second literal mapping -- two copies of the same five pairs can drift,
+# and a window naming the wrong bar label would be exactly the kind of
+# quiet lie this module exists to remove.
+_BAR_LABELS_BY_SEC: dict[int, str] = {sec: label for label, sec in _BAR_INTERVALS_SEC.items()}
 
 # Which of the five contract-legal intervals this platform can actually
 # serve today. select_window/fetch_bars route interval_sec == 86400
@@ -664,7 +686,13 @@ def smoke_test(
                     ),
                 )
             ),
-            window={"start": None, "end": None, "sessions": 0},
+            window={
+                "start": None,
+                "end": None,
+                "sessions": 0,
+                "bars": None,
+                "interval_sec": None,
+            },
             outcome=None,
             runtime=configured.runtime,
             kernel_isolated=configured.kernel_isolated,
@@ -686,10 +714,18 @@ def smoke_test(
                     ),
                 )
             ),
-            window={"start": None, "end": None, "sessions": 0, "instruments": {}},
+            window={
+                "start": None,
+                "end": None,
+                "sessions": 0,
+                "instruments": {},
+                "bars": None,
+                "interval_sec": None,
+            },
             outcome=None,
             runtime=configured.runtime,
             kernel_isolated=configured.kernel_isolated,
+            manifest=manifest,
         )
     try:
         instrument_ids = resolve_universe(conn, manifest, datetime.now(UTC).date())
@@ -706,10 +742,18 @@ def smoke_test(
                     ),
                 )
             ),
-            window={"start": None, "end": None, "sessions": 0, "instruments": {}},
+            window={
+                "start": None,
+                "end": None,
+                "sessions": 0,
+                "instruments": {},
+                "bars": None,
+                "interval_sec": None,
+            },
             outcome=None,
             runtime=configured.runtime,
             kernel_isolated=configured.kernel_isolated,
+            manifest=manifest,
         )
     window = (
         select_window(conn, instrument_ids, interval_sec=interval_sec)
@@ -743,6 +787,7 @@ def smoke_test(
             outcome=None,
             runtime=configured.runtime,
             kernel_isolated=configured.kernel_isolated,
+            manifest=manifest,
         )
 
     try:
@@ -762,6 +807,7 @@ def smoke_test(
             outcome=None,
             runtime=configured.runtime,
             kernel_isolated=configured.kernel_isolated,
+            manifest=manifest,
         )
     schedules = load_schedules(
         conn,
@@ -783,7 +829,7 @@ def smoke_test(
     )
     first = run_smoke_in_sandbox(payload, limits)
     second = run_smoke_in_sandbox(payload, limits)
-    return build_verdict(
+    verdict = build_verdict(
         _outcome_of(first),
         _outcome_of(second),
         window,
@@ -792,6 +838,11 @@ def smoke_test(
         starting_cash=payload.starting_cash,
         currency=str(manifest.get("base_currency", "")),
     )
+    # build_verdict's signature stays free of a manifest parameter -- it is
+    # also called directly by tests with a hand-built outcome and no
+    # manifest in scope -- so the manifest this real run resolved is
+    # attached here instead, after the fact.
+    return replace(verdict, manifest=manifest)
 
 
 def _outcome_of(result: SandboxResult) -> dict[str, Any]:

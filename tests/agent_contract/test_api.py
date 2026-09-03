@@ -266,3 +266,21 @@ def test_the_served_contract_is_substantial_enough_to_be_the_real_thing(client) 
     assert len(body["contract"]) > 10_000
     assert "## 9. Upload, validation, and the feedback loop" in body["contract"]
     assert "NotOnThisPlatform" in body["sdk_stub"]
+
+
+def test_the_response_carries_the_money_as_strings_not_json_numbers(client) -> None:  # noqa: ANN001
+    """JSON has no decimal type -- a number here would be parsed as a
+    float by every client, which is the one representation this codebase
+    refuses to let money take. Strings cross the wire; the frontend
+    formats them for display only."""
+    import json as jsonlib
+
+    response = client.post(
+        "/strategies",
+        json={"name": "reaches-out", "version": "1.0.0", "source": REACHES_THE_NETWORK},
+    )
+    # A static rejection ran no strategy, so there is no summary to give.
+    assert response.json()["summary"] is None
+
+    raw = jsonlib.loads(response.text)
+    assert "summary" in raw

@@ -7,6 +7,7 @@ import {
   fetchContractBundle,
   uploadStrategy,
   type ContractBundle,
+  type RunSummary,
   type StrategyVerdict,
   type UploadStrategyResult,
 } from "@/lib/api";
@@ -80,9 +81,63 @@ class MyStrategy(Strategy):
 
 type CopyTarget = "prompt" | "contract" | "sdk";
 
+/**
+ * Money for display. Parsed here and nowhere else: these arrive as strings
+ * precisely so no float exists in the path, and the moment one is used for
+ * arithmetic that guarantee is gone.
+ */
+function money(value: string): string {
+  return Number(value).toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+function signed(value: string): string {
+  const n = Number(value);
+  return `${n >= 0 ? "+" : ""}${money(value)}`;
+}
+
 /** Bytes as an at-a-glance size, so a 42KB paste is not a surprise. */
 function formatSize(text: string): string {
   return `${Math.round(new Blob([text]).size / 1024)}KB`;
+}
+
+/**
+ * Equity and P&L. Shown for every completed run, pass or fail: orders and
+ * fills say the code ran, and only this says whether it was worth running
+ * -- which is the number you compare two agents on.
+ *
+ * P&L is omitted rather than zeroed when the baseline is unknown. Showing
+ * "+0.00" for "we do not know" would be a fabricated number in the
+ * direction that flatters.
+ */
+function PerformanceRow({ summary }: { summary: RunSummary }) {
+  const pnl = summary.pnl === null ? null : Number(summary.pnl);
+  const tone = pnl === null ? "text-text" : pnl > 0 ? "text-up" : pnl < 0 ? "text-down" : "text-muted";
+  return (
+    <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1">
+      {summary.final_equity !== null && (
+        <span className="flex items-baseline gap-2">
+          <span className="text-muted text-xs uppercase tracking-wide">Equity</span>
+          <span className="num text-lg">{money(summary.final_equity)}</span>
+          <span className="text-muted text-xs">{summary.currency}</span>
+        </span>
+      )}
+      {summary.pnl !== null && (
+        <span className="flex items-baseline gap-2">
+          <span className="text-muted text-xs uppercase tracking-wide">P&amp;L</span>
+          <span className={`num text-lg ${tone}`}>{signed(summary.pnl)}</span>
+          {summary.pnl_pct !== null && (
+            <span className={`num text-xs ${tone}`}>{signed(summary.pnl_pct)}%</span>
+          )}
+        </span>
+      )}
+      <span className="num text-muted text-xs">
+        {summary.bar_calls.toLocaleString()} bars · {summary.orders} orders · {summary.fills} fills
+      </span>
+    </div>
+  );
 }
 
 export default function StrategiesPage() {
@@ -361,6 +416,8 @@ export default function StrategiesPage() {
                   </span>
                 )}
               </div>
+
+              {result.summary !== null && <PerformanceRow summary={result.summary} />}
 
               {result.window !== null && result.window.start !== null && (
                 <p className="text-muted text-xs">

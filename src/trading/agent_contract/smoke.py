@@ -83,6 +83,35 @@ class SmokeVerdict:
     runtime: str
     kernel_isolated: bool
     notes: tuple[str, ...] = ()
+    # The manifest's declared capital, and the currency it is denominated
+    # in. Optional because a verdict can exist without one -- a crash
+    # before configure() resolved, or a caller that did not supply it --
+    # and `None` must stay distinguishable from zero: defaulting the
+    # baseline to 0 would report the whole closing equity as profit.
+    starting_cash: Decimal | None = None
+    currency: str = ""
+
+    @property
+    def final_equity(self) -> Decimal | None:
+        raw = (self.outcome or {}).get("final_equity")
+        return None if raw is None else Decimal(str(raw))
+
+    @property
+    def pnl(self) -> Decimal | None:
+        """Closing equity less declared capital, or None if either is unknown."""
+        equity = self.final_equity
+        if equity is None or self.starting_cash is None:
+            return None
+        return (equity - self.starting_cash).quantize(Decimal("0.01"))
+
+    @property
+    def pnl_pct(self) -> Decimal | None:
+        """P&L as a percentage of capital. None on zero capital -- a return
+        on nothing is undefined, not infinite, and not zero."""
+        pnl = self.pnl
+        if pnl is None or not self.starting_cash:
+            return None
+        return (pnl / self.starting_cash * 100).quantize(Decimal("0.01"))
 
     def as_agent_feedback(self) -> str:
         if not self.passed:
@@ -103,6 +132,13 @@ class SmokeVerdict:
                 f"  on_bar calls: {self.outcome['bar_calls']:,}   "
                 f"orders: {len(self.outcome['orders'])}   fills: {self.outcome['fills']}"
             )
+            equity, pnl = self.final_equity, self.pnl
+            if equity is not None:
+                money = f"  Final equity: {equity:,.2f} {self.currency}".rstrip()
+                if pnl is not None:
+                    pct = "" if self.pnl_pct is None else f" ({self.pnl_pct:+.2f}%)"
+                    money += f"   P&L: {pnl:+,.2f}{pct}"
+                lines.append(money)
         lines.append("")
 
         for finding in self.report.findings:
@@ -151,6 +187,9 @@ def build_verdict(
     window: dict[str, Any],
     runtime: str,
     kernel_isolated: bool,
+    *,
+    starting_cash: Decimal | None = None,
+    currency: str = "",
 ) -> SmokeVerdict:
     findings: list[Finding] = []
 
@@ -276,6 +315,8 @@ def build_verdict(
         runtime=runtime,
         kernel_isolated=kernel_isolated,
         notes=tuple(notes),
+        starting_cash=starting_cash,
+        currency=currency,
     )
 
 
@@ -614,6 +655,8 @@ def smoke_test(
         window,
         first.runtime,
         first.kernel_isolated,
+        starting_cash=payload.starting_cash,
+        currency=str(manifest.get("base_currency", "")),
     )
 
 

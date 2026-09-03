@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from trading.agent_contract.smoke import SmokeVerdict, build_verdict  # noqa: F401
@@ -559,3 +561,79 @@ def test_an_explicit_limits_argument_still_wins() -> None:
 
     asked = SandboxLimits(runtime=None, docker_context=None, memory="512m")
     assert _resolve_limits(asked) is asked
+
+
+# --- what the run was actually worth -------------------------------------------
+
+
+def test_the_report_states_the_money_a_run_ended_with() -> None:
+    """orders and fills say the code ran; only equity says whether it was
+    worth running. The number an operator compares two agents on cannot
+    live solely in a Postgres column."""
+    outcome = _outcome(
+        orders=[{"order_id": 1}], fills=1, final_cash="98688.46", final_equity="99912.30"
+    )
+    verdict = build_verdict(
+        outcome,
+        outcome,
+        _WINDOW,
+        "runc",
+        False,
+        starting_cash=Decimal("100000"),
+        currency="INR",
+    )
+    feedback = verdict.as_agent_feedback()
+
+    assert "99,912.30 INR" in feedback
+    assert "-87.70" in feedback  # 99912.30 - 100000
+    assert "-0.09%" in feedback
+
+
+def test_a_profit_is_signed_so_it_cannot_be_misread() -> None:
+    outcome = _outcome(orders=[{"order_id": 1}], fills=1, final_equity="101500")
+    verdict = build_verdict(
+        outcome,
+        outcome,
+        _WINDOW,
+        "runc",
+        False,
+        starting_cash=Decimal("100000"),
+        currency="INR",
+    )
+    assert "+1,500.00" in verdict.as_agent_feedback()
+    assert verdict.pnl == Decimal("1500.00")
+
+
+def test_no_pnl_is_claimed_when_the_starting_capital_is_unknown() -> None:
+    # Defaulting the baseline to zero would report the entire equity as
+    # profit -- a fabricated number, in the direction that flatters.
+    verdict = build_verdict(_outcome(final_equity="99912.30"), _outcome(), _WINDOW, "runc", False)
+
+    assert verdict.pnl is None
+    assert verdict.pnl_pct is None
+    assert "P&L" not in verdict.as_agent_feedback()
+
+
+def test_zero_starting_capital_yields_no_percentage_rather_than_a_crash() -> None:
+    verdict = build_verdict(
+        _outcome(final_equity="0"),
+        _outcome(final_equity="0"),
+        _WINDOW,
+        "runc",
+        False,
+        starting_cash=Decimal("0"),
+        currency="INR",
+    )
+    assert verdict.pnl == Decimal("0")
+    assert verdict.pnl_pct is None
+
+
+def test_a_crashed_run_reports_no_money_at_all() -> None:
+    # `outcome` is None on a crash, so there is nothing to report and
+    # nothing to invent.
+    crashed = _outcome(ok=False, error="boom", crashed_at={"handler": "on_bar", "ts": "x"})
+    verdict = build_verdict(
+        crashed, crashed, _WINDOW, "runc", False, starting_cash=Decimal("100000"), currency="INR"
+    )
+    assert verdict.pnl is None
+    assert "P&L" not in verdict.as_agent_feedback()

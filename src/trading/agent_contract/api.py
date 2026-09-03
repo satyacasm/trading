@@ -84,6 +84,26 @@ class FindingOut(BaseModel):
     contract_section: str = ""
 
 
+class RunSummary(BaseModel):
+    """What the run was worth, for a caller that wants numbers not prose.
+
+    Every money field is a string. JSON has no decimal type, so a number
+    here would reach every client as a float -- the one representation
+    this codebase refuses to let money take (contract §5). The frontend
+    parses these for display only, never for arithmetic.
+    """
+
+    bar_calls: int
+    orders: int
+    fills: int
+    starting_cash: str | None
+    final_cash: str | None
+    final_equity: str | None
+    pnl: str | None
+    pnl_pct: str | None
+    currency: str
+
+
 class UploadStrategyResponse(BaseModel):
     """What the agent that wrote the code reads back.
 
@@ -100,6 +120,7 @@ class UploadStrategyResponse(BaseModel):
     window: dict[str, Any] | None
     runtime: str | None
     kernel_isolated: bool | None
+    summary: RunSummary | None
 
 
 def _findings_of(report: ValidationReport) -> list[FindingOut]:
@@ -130,7 +151,29 @@ def _static_rejection(report: ValidationReport) -> UploadStrategyResponse:
         window=None,
         runtime=None,
         kernel_isolated=None,
+        summary=None,
     )
+
+
+def _summary_of(verdict: SmokeVerdict) -> RunSummary | None:
+    outcome = verdict.outcome
+    if outcome is None:
+        return None
+    return RunSummary(
+        bar_calls=int(outcome.get("bar_calls", 0)),
+        orders=len(outcome.get("orders", [])),
+        fills=int(outcome.get("fills", 0)),
+        starting_cash=None if verdict.starting_cash is None else str(verdict.starting_cash),
+        final_cash=_as_str(outcome.get("final_cash")),
+        final_equity=_as_str(outcome.get("final_equity")),
+        pnl=None if verdict.pnl is None else str(verdict.pnl),
+        pnl_pct=None if verdict.pnl_pct is None else str(verdict.pnl_pct),
+        currency=verdict.currency,
+    )
+
+
+def _as_str(value: Any) -> str | None:
+    return None if value is None else str(value)
 
 
 def _from_verdict(verdict: SmokeVerdict, strategy_id: int | None) -> UploadStrategyResponse:
@@ -148,6 +191,7 @@ def _from_verdict(verdict: SmokeVerdict, strategy_id: int | None) -> UploadStrat
         window=verdict.window,
         runtime=verdict.runtime,
         kernel_isolated=verdict.kernel_isolated,
+        summary=_summary_of(verdict),
     )
 
 
@@ -219,6 +263,7 @@ def get_contract() -> ContractBundle:
 
 __all__ = [
     "ContractBundle",
+    "RunSummary",
     "Finding",
     "UploadStrategyRequest",
     "UploadStrategyResponse",

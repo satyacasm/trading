@@ -249,6 +249,22 @@ export type StrategyWindow = {
   instruments?: Record<string, { bars: number }>;
 };
 
+/**
+ * Money arrives as strings: JSON has no decimal type, so a number field
+ * would be a float by the time it got here. Parsed for display only.
+ */
+export type RunSummary = {
+  bar_calls: number;
+  orders: number;
+  fills: number;
+  starting_cash: string | null;
+  final_cash: string | null;
+  final_equity: string | null;
+  pnl: string | null;
+  pnl_pct: string | null;
+  currency: string;
+};
+
 export type UploadStrategyResult = {
   accepted: boolean;
   verdict: StrategyVerdict;
@@ -258,6 +274,7 @@ export type UploadStrategyResult = {
   window: StrategyWindow | null;
   runtime: string | null;
   kernel_isolated: boolean | null;
+  summary: RunSummary | null;
 };
 
 export async function uploadStrategy(body: {

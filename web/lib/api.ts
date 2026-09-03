@@ -220,3 +220,56 @@ export async function cancelOrder(orderId: number): Promise<Order> {
   if (!res.ok) throw await readError(res, `DELETE /orders/${orderId} failed: ${res.status}`);
   return res.json();
 }
+
+/**
+ * The §9 upload pipeline: validate, smoke, register, in one request.
+ *
+ * Slow by construction -- three containers run before this resolves (one
+ * to resolve the manifest, then the smoke payload twice so the two order
+ * sequences can be compared), so a pending state is mandatory rather than
+ * polish.
+ *
+ * A rejection comes back as 200 with `accepted: false`, not as an HTTP
+ * error: the verdict is the payload. `readError` therefore only ever fires
+ * here for a genuine transport or schema failure.
+ */
+export type StrategyVerdict = "PASSED" | "PASSED_WITH_WARNINGS" | "REJECTED";
+
+export type StrategyFinding = {
+  code: string;
+  message: string;
+  line: number | null;
+  contract_section: string;
+};
+
+export type StrategyWindow = {
+  start: string | null;
+  end: string | null;
+  sessions: number;
+  instruments?: Record<string, { bars: number }>;
+};
+
+export type UploadStrategyResult = {
+  accepted: boolean;
+  verdict: StrategyVerdict;
+  strategy_id: number | null;
+  feedback: string;
+  findings: StrategyFinding[];
+  window: StrategyWindow | null;
+  runtime: string | null;
+  kernel_isolated: boolean | null;
+};
+
+export async function uploadStrategy(body: {
+  name: string;
+  version: string;
+  source: string;
+}): Promise<UploadStrategyResult> {
+  const res = await fetch(`${API_URL}/strategies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw await readError(res, `POST /strategies failed: ${res.status}`);
+  return res.json();
+}

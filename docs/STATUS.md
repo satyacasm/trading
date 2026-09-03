@@ -195,7 +195,12 @@ unseeded `random`, and dict-hash dependence. Runs are stored in
 `strategy_smoke_runs` (migration 0011) — one row per run, many per version,
 because the window moves even though the version does not.
 
-Upload path, complete: validate → smoke → register.
+Upload path, complete: validate → smoke → register, reachable over HTTP at
+`POST /strategies` and from the UI at `/strategies`. The request blocks for the
+whole run -- three containers, a few seconds -- which is right for one operator
+and wrong for a queue. Start the gateway with `DOCKER_CONTEXT=colima-sandbox`
+to get gVisor; without it every run records `kernel_isolated=false`, correctly
+but more weakly than you may assume.
 
 Next in Phase 2: **D4, the worked examples.** They were withheld because an
 example in a contract is a promise the code runs, and nothing could run it.

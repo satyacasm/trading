@@ -89,6 +89,35 @@ class InMemoryBars:
         flat.sort(key=lambda pair: (pair[0].close_ts, pair[0].instrument_id))
         self._flat = flat
 
+    def append(self, bar: BarRecord) -> tuple[BarRecord, int]:
+        """Add one newly-closed bar, returning it with its index in its own
+        instrument's series.
+
+        A forward run learns its bars one at a time, where a backtest is
+        handed all of them up front. The index is what the loop's cursor
+        advances to, so `ctx.data.bars()` sees this bar only after the step
+        that dispatched it has finished -- the same anti-lookahead rule the
+        backtest enforces, by the same mechanism.
+
+        A bar older than the instrument's latest is refused rather than
+        sorted into place. Reordering would change history a strategy has
+        already read, leaving its lookback silently different from what it
+        saw a moment ago; a late bar is a feed problem and must surface as
+        one.
+
+        `_flat` is deliberately not maintained here: it exists for
+        `groups()`, which is the backtest's whole-run iteration and has no
+        meaning for a run that has not finished.
+        """
+        series = self._bars.get(bar.instrument_id, ())
+        if series and bar.ts <= series[-1].ts:
+            raise ValueError(
+                f"bar for instrument {bar.instrument_id} at {bar.ts.isoformat()} arrived "
+                f"out of order -- the latest is {series[-1].ts.isoformat()}"
+            )
+        self._bars[bar.instrument_id] = (*series, bar)
+        return bar, len(series)
+
     def instruments(self) -> tuple[int, ...]:
         return tuple(sorted(self._bars))
 

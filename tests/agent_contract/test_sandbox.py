@@ -518,3 +518,57 @@ def test_the_kill_after_a_timeout_targets_the_same_daemon(monkeypatch) -> None: 
     kill = next(c for c in calls if "kill" in c)
     assert kill[:3] == ["docker", "--context", "colima-sandbox"]
     assert kill[3] == "kill"
+
+
+def test_a_result_larger_than_the_pipe_buffer_survives_intact() -> None:
+    """A latent truncation that predates the backtester and only bites at scale.
+
+    The image sets `PYTHONUNBUFFERED=1`, so `sys.stdout` writes through to a
+    raw `FileIO`. A `write()` to a pipe returns once it has taken at most the
+    pipe's capacity -- 64 KiB on Linux -- and an unbuffered raw writer does
+    NOT loop on that short return. The remainder is discarded with no error
+    and exit code 0, so the host sees a truncated JSON line and reports "the
+    sandbox produced no structured result": a run that completed perfectly,
+    reported as a crash.
+
+    Nothing smaller than 64 KiB could catch it, which is why it survived
+    until an equity curve of 1,667 daily points crossed the line. Measured
+    directly: our image emits 65,537 of 200,001 bytes; with
+    PYTHONUNBUFFERED cleared it emits all 200,001.
+
+    This asserts the whole round trip, not the write loop, because the write
+    loop is the fix and the round trip is the requirement.
+    """
+    # Under the runtime real runs actually use. This matters: the short
+    # write is gVisor's, not Linux's -- measured, our image emits 200,001 of
+    # 200,001 bytes under runc on both VMs and 65,537 under runsc. Running
+    # this at the default `runtime=None` (runc) would pass while the
+    # configuration every real strategy runs under stays broken.
+    from trading.agent_contract.smoke import _resolve_limits
+
+    limits = _resolve_limits(None)
+    # ~120 KB -- comfortably past one pipe buffer, cheap to produce.
+    result = run_strategy_in_sandbox(
+        strategy_that(
+            """
+            import sys
+            print("z" * 120000, file=sys.stderr)
+            from decimal import Decimal
+            from platform_sdk import DataRequest, InstrumentRef, StrategyManifest
+            self.big = "q" * 120000
+            return StrategyManifest(
+                name=self.big,
+                version="1.0.0",
+                universe=[InstrumentRef(exchange="NSE", segment="CM", symbol="RELIANCE")],
+                data=DataRequest(bars="1m", history_bars=50),
+                capital=Decimal("1000000"),
+                base_currency="INR",
+            )
+            """
+        ),
+        limits,
+    )
+
+    assert result.ok, f"a >64KiB result must not be reported as a crash: {result.error}"
+    assert result.manifest is not None
+    assert len(result.manifest["name"]) == 120000

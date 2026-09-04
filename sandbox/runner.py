@@ -39,8 +39,36 @@ def _emit(result: dict[str, Any]) -> None:
     # A single line on stdout, and nothing else ever written there, so the
     # host can parse the last line without heuristics even if the strategy
     # printed during import.
-    sys.stdout.write("\n__SANDBOX_RESULT__" + json.dumps(result) + "\n")
-    sys.stdout.flush()
+    #
+    # Written through the raw buffer in an explicit loop rather than with
+    # `sys.stdout.write`, because a short write here loses the tail of the
+    # result silently.
+    #
+    # The image sets PYTHONUNBUFFERED=1, which makes `sys.stdout` write
+    # through to a raw `FileIO`. A write() to a pipe returns once it has
+    # accepted at most the pipe's capacity -- 64 KiB -- and a raw writer
+    # does not loop on that short return the way a BufferedWriter would.
+    # Under runc the write completes anyway; under gVisor it does not, and
+    # the remainder is dropped with no error and exit status 0. The host
+    # then sees truncated JSON and reports "the sandbox produced no
+    # structured result": a run that finished perfectly, reported as a
+    # crash. Measured: 65,537 of 200,001 bytes under runsc, all 200,001
+    # under runc.
+    #
+    # It bit the first time a result exceeded 64 KiB, which was an equity
+    # curve of 1,667 daily points -- so it is latent for every large `logs`
+    # payload too, and worse under the isolated runtime than the plain one.
+    data = ("\n__SANDBOX_RESULT__" + json.dumps(result) + "\n").encode("utf-8")
+    stream = sys.stdout.buffer
+    view = memoryview(data)
+    while view:
+        written = stream.write(view)
+        if not written:
+            # A stream accepting nothing would spin forever; stop and let
+            # the host report a truncated result rather than hang.
+            break
+        view = view[written:]
+    stream.flush()
 
 
 def _describe_manifest(manifest: Any) -> dict[str, Any] | None:

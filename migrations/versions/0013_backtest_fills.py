@@ -71,9 +71,7 @@ def upgrade() -> None:
         sa.Column("total_charges", sa.Numeric(18, 4), nullable=False),
         sa.UniqueConstraint("backtest_run_id", "ordinal", name="uq_backtest_fill_ordinal"),
     )
-    op.create_index(
-        "ix_backtest_fills_run", "backtest_fills", ["backtest_run_id", "ordinal"]
-    )
+    op.create_index("ix_backtest_fills_run", "backtest_fills", ["backtest_run_id", "ordinal"])
 
 
 def downgrade() -> None:

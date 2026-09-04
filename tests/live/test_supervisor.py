@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import subprocess
 from unittest.mock import MagicMock
 
@@ -24,6 +25,18 @@ def _run(stdout_lines: list[str]) -> LiveRun:
         runtime="runsc",
         kernel_isolated=True,
     )
+
+
+def _intent() -> dict[str, object]:
+    return {
+        "instrument_id": 1,
+        "side": "BUY",
+        "order_type": "MARKET",
+        "quantity": "1",
+        "limit_price": None,
+        "product": "DELIVERY",
+        "rationale": "test",
+    }
 
 
 def _bar() -> dict[str, object]:
@@ -129,3 +142,54 @@ def test_an_ordinary_bar_keeps_the_run_alive(monkeypatch) -> None:  # noqa: ANN0
 
     assert handle_bar(conn, "http://x", run, _bar()) is True
     assert run.bars_seen == 1
+
+
+def test_a_refused_order_is_recorded_on_the_run(monkeypatch) -> None:  # noqa: ANN001
+    """A run whose every order is refused looks, from `orders_placed`
+    alone, exactly like a run that decided to sit still. The currency
+    gate's own sentence is the answer to "why is nothing happening", so
+    it is kept on the row rather than only in the supervisor's log."""
+    import urllib.error
+    import urllib.request
+
+    from trading.live import supervisor
+
+    detail = (
+        b'{"detail":"portfolio 10 has base_currency=\'INR\'; instrument_id=642283'
+        b" is denominated in 'USDT'\"}"
+    )
+    # `place_order` imports urllib inside the function, so the patch has to
+    # land on the module itself rather than on a supervisor attribute.
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        MagicMock(
+            side_effect=urllib.error.HTTPError(
+                "http://x/orders", 400, "Bad Request", {}, io.BytesIO(detail)
+            )
+        ),
+    )
+    run = _run([])
+
+    assert supervisor.place_order("http://x", run, _intent(), 0) is False
+    assert run.orders_refused == 1
+    assert "base_currency" in (run.last_refusal or "")
+
+
+def test_a_refused_order_reaches_the_row(monkeypatch) -> None:  # noqa: ANN001
+    """The counter is only useful if the bar loop writes it down."""
+    from trading.live import supervisor
+
+    def refuse(api_url: str, run: LiveRun, intent: dict[str, object], seq: int) -> bool:
+        run.orders_refused += 1
+        run.last_refusal = "the currency gate said no"
+        return False
+
+    monkeypatch.setattr(supervisor, "place_order", refuse)
+    run = _run([encode_frame(FRAME_ORDERS, ts="t", orders=[_intent()], alive=True)])
+    conn = MagicMock()
+
+    assert handle_bar(conn, "http://x", run, _bar()) is True
+    assert run.orders_placed == 0
+    written = conn.execute.call_args[0][1]
+    assert 1 in written and "the currency gate said no" in written

@@ -137,6 +137,23 @@ export function formatMoney(value: string): string {
 }
 
 /**
+ * A signed money amount, grouped, minus kept.
+ *
+ * The sibling `formatMoney` drops the sign because prose carries it. A
+ * table column has no prose: a position marked below its average cost is
+ * a loss, and rendering it as a bare magnitude states the opposite of
+ * what the API sent. Use this wherever the number stands on its own.
+ */
+export function formatSignedMoney(value: string): string {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return value;
+  return parsed.toLocaleString("en-IN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+/**
  * What the costs did, in one sentence.
  *
  * Three cases, because one sentence cannot cover them honestly. When the

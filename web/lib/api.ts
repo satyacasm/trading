@@ -557,3 +557,86 @@ export async function runBacktest(
     throw await readError(res, `POST /strategies/${strategyId}/backtests failed: ${res.status}`);
   return res.json();
 }
+
+/** A strategy running forward against live prices. */
+export type LiveRun = {
+  live_run_id: number;
+  strategy_id: number;
+  portfolio_id: number;
+  status: string;
+  stopped_reason: string | null;
+  runtime: string | null;
+  kernel_isolated: boolean | null;
+  bars_seen: number;
+  orders_placed: number;
+  orders_refused: number;
+  last_refusal: string | null;
+  started_at: string;
+  stopped_at: string | null;
+};
+
+export type LivePosition = {
+  instrument_id: number;
+  symbol: string;
+  quantity: string;
+  avg_cost: string;
+  last_price: string | null;
+  market_value: string | null;
+  unrealised_pnl: string | null;
+};
+
+export type LiveFill = {
+  order_id: number;
+  symbol: string;
+  side: string;
+  quantity: string;
+  price: string;
+  total_charges: string;
+  rationale: string;
+  filled_at: string;
+};
+
+export type LiveRunDetail = LiveRun & {
+  strategy_name: string;
+  strategy_version: string;
+  portfolio_name: string;
+  base_currency: string;
+  cash_balance: string;
+  equity: string | null;
+  peak_equity: string | null;
+  drawdown_pct: string | null;
+  positions: LivePosition[];
+  recent_fills: LiveFill[];
+  equity_curve: { ts: string; equity: string }[];
+};
+
+export async function fetchLiveRuns(): Promise<LiveRun[]> {
+  const res = await fetch(`${API_URL}/live`);
+  if (!res.ok) throw await readError(res, `GET /live failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchLiveRun(liveRunId: number): Promise<LiveRunDetail> {
+  const res = await fetch(`${API_URL}/live/${liveRunId}`);
+  if (!res.ok) throw await readError(res, `GET /live/${liveRunId} failed: ${res.status}`);
+  return res.json();
+}
+
+export async function startLiveRun(
+  strategyId: number,
+  portfolioId: number,
+): Promise<LiveRun> {
+  const res = await fetch(`${API_URL}/strategies/${strategyId}/live`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ portfolio_id: portfolioId }),
+  });
+  if (!res.ok) throw await readError(res, `POST /strategies/${strategyId}/live failed`);
+  return res.json();
+}
+
+export async function stopLiveRun(liveRunId: number): Promise<LiveRun> {
+  const res = await fetch(`${API_URL}/live/${liveRunId}/stop`, { method: "POST" });
+  if (!res.ok) throw await readError(res, `POST /live/${liveRunId}/stop failed`);
+  return res.json();
+}

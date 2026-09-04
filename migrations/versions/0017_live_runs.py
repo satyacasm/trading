@@ -55,12 +55,14 @@ def upgrade() -> None:
         sa.Column("kernel_isolated", sa.Boolean, nullable=True),
         sa.Column("bars_seen", sa.Integer, nullable=False, server_default="0"),
         sa.Column("orders_placed", sa.Integer, nullable=False, server_default="0"),
-        sa.Column("started_at", sa.TIMESTAMP(timezone=True), nullable=False,
-                  server_default=sa.text("now()")),
-        sa.Column("stopped_at", sa.TIMESTAMP(timezone=True), nullable=True),
-        sa.CheckConstraint(
-            "status IN ('RUNNING','STOPPED','CRASHED')", name="ck_live_run_status"
+        sa.Column(
+            "started_at",
+            sa.TIMESTAMP(timezone=True),
+            nullable=False,
+            server_default=sa.text("now()"),
         ),
+        sa.Column("stopped_at", sa.TIMESTAMP(timezone=True), nullable=True),
+        sa.CheckConstraint("status IN ('RUNNING','STOPPED','CRASHED')", name="ck_live_run_status"),
     )
     op.create_index("ix_live_runs_strategy", "live_runs", ["strategy_id", "started_at"])
     # Partial unique index: one live run per portfolio at a time. D6's

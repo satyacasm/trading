@@ -1,79 +1,74 @@
 # Where this project stands
 
-**Updated:** 2026-09-04, ~11:50 IST. Keep this file current — it is the
+**Updated:** 2026-09-04, ~15:20 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
 
 ## The one thing to do next
 
-**Phase 3 sub-project 3c — persist backtest runs and their equity curves,
-plus a read API.** 3b returns a result and forgets it; 3c is what every
-later sub-project (3d metrics, 3e report UI, 3f walk-forward) reads from.
-Design it the way 3b was designed, then implement TDD.
+**Phase 3 sub-project 3d — metrics over the stored curve.** Returns,
+Sharpe, max drawdown, exposure, turnover, and the post-tax P&L lens (§8).
+3c stores what 3d needs and computes nothing itself, deliberately: a
+storage layer that also computes is one whose format is decided by today's
+metric.
 
-Two things 3b learned that 3c should carry:
+Two things 3d inherits and should not relearn:
 
-- **The curve's shape is settled and already crosses the wire**: one
-  `{ts, equity, cash}` per dispatched bar, money as strings, `ts` at the
-  session close. ~1,650 points for a 6.6-year daily run.
-- **`bars_daily` ends 2026-08-21** and nothing rolls live bars up to daily,
-  so the newest two weeks cannot be backtested at all. 3b's coverage gate
-  makes that visible instead of silent; it does not fill it.
-
----
-
-## Phase 3b — shipped 2026-09-04 (merged, `07b9c46`)
-
-Backtest runs at scale and the equity curve: seven tasks from the six
-approved decisions plus a window-coverage gate added at approval. Plan and
-outcome at `docs/superpowers/plans/2026-09-04-backtest-runs-at-scale.md`.
-
-Verified against the live stack, not only tests — a real **1,647-session
-daily RELIANCE backtest (2020-01-01 → 2026-08-21) under gVisor, 0.83s**:
-
-```
-sessions 1647 | bar_calls 1647 | fills 1
-window   2019-12-03 -> 2026-08-21   (fetch, 20 warm-up sessions)
-dispatch 2020-01-01                 (run begins here)
-curve    1647 points
-  first {ts: 2020-01-01T10:00:00+00:00, equity: 1000000,      cash: 1000000}
-  last  {ts: 2026-08-21T10:00:00+00:00, equity: 1055886.2400, cash: 924286.24}
-runtime  runsc | kernel_isolated: True
-```
-
-`POST /strategies/{id}/backtests` runs the **registered** source over a
-caller-chosen window. `1m` strategies are refused (`BACKTEST_INTERVAL_
-UNSUPPORTED`) rather than served narrowly from `bars_intraday`.
-
-**Three defects found that no unit test could have caught:**
-
-1. **D3b-1 was not the money bug the design claimed.** It justified itself
-   on DP charges being billed to the wrong scrip-day. `ts + 86400` is
-   injective on dates, so the DP key *count* is invariant, and
-   `compute_charges` takes no date. The prescribed test would have passed
-   before and after. The clock was still wrong — `ctx.now` a full day ahead,
-   every emitted timestamp lagged — and still had to land first.
-2. **A gVisor short write silently truncated any result past 64 KiB**
-   (`22502af`). `PYTHONUNBUFFERED=1` makes stdout a raw `FileIO`; a pipe
-   write returns after at most 64 KiB and a raw writer does not loop on the
-   short return. Measured on our image with `print('x'*200000)`: **200,001
-   bytes under runc on both VMs, 65,537 under runsc.** The isolated runtime
-   truncating where the plain one does not is what hid it. Predates 3b
-   entirely — the equity curve is just the first result big enough to cross
-   the line. Any large `logs` payload was always at risk.
-3. **`sandbox/build.sh` built only the ambient docker context**, while
-   `STRATEGY_SANDBOX_DOCKER_CONTEXT` routes runs to a second Colima VM with
-   its own image store — so the sandbox suite had been passing against a
-   pre-change image, silently, because an older runner ignores JSON fields
-   it does not know. It now builds every context that can run a strategy.
-
-Verification strategy `phase3b-daily-buy-and-hold` 1.0.0 is `strategy_id=17`
-in the live database; `DELETE FROM strategies WHERE name LIKE 'phase3b-%'`
-removes it.
+- **The curve is the breaker's own number**, sampled where `loop.py`
+  already evaluates equity — so a drawdown computed here and a breaker
+  latch in the same run cannot disagree. Do not recompute equity.
+- **Money is 4 dp everywhere**: `numeric(18,4)` in storage, `str` at 4 dp
+  on the wire, and the two now compare byte-for-byte. Never introduce a
+  float.
 
 ---
 
+## Phase 3c — shipped 2026-09-04 (merged, `77a3e2e`)
+
+Backtest runs and their equity curves are persisted and readable.
+Spec at `docs/superpowers/specs/2026-09-04-backtest-persistence-design.md`,
+plan at `docs/superpowers/plans/2026-09-04-backtest-persistence.md`.
+
+**Migration `0012`** adds `backtest_runs` and `backtest_equity_points`.
+The curve is a **table**, not a jsonb column: money belongs in
+`numeric(18,4)` like every other money column here, and a curve in jsonb
+would be a curve of strings — letting a transport constraint (JSON numbers
+are IEEE 754 doubles) reach into storage. `(backtest_run_id, ts)` is the
+primary key rather than a surrogate id, so a doubled point fails loudly
+instead of reaching 3d as a wrong Sharpe.
+
+Only runs that reached the container are stored — **crashes included, with
+their partial curve**, because that artifact says where a run died.
+Pre-flight refusals are returned and never stored.
+
+Two read routes: `GET /strategies/{id}/backtests` (summaries, **no**
+curves) and `GET /backtests/{run_id}` (one run **with** its curve).
+
+**Two things worth not relearning:**
+
+1. **A money guard was vacuous until mutation caught it.** Replacing
+   `Decimal(str(raw))` with `float(raw)` left every persistence test green:
+   psycopg binds the float, Postgres casts to `numeric(18,4)`, and around
+   10^6 with four decimals a float64 is exact enough that the round trip is
+   indistinguishable. Those tests were checking the *column's* behaviour,
+   not the code's. The guard now asserts a value at the column's limit
+   (`12345678901234.5678`, which float renders as `12345678901234.568`).
+2. **`str(Decimal)` preserves scale, so the same run had two string
+   forms.** A run reported `"1000000"` and read back `"1000000.0000"` —
+   numerically identical, but a client caching or diffing them sees changes
+   that never happened. Fixed at the source: `run_loop` now emits the 4 dp
+   scale contract §5 declares, for curve points and `final_cash`/
+   `final_equity` alike. Quantizing only the curve left `RunOutcome`
+   internally inconsistent and 3b's own test caught it.
+
+Verified live: `strategy_id=17` backtested 2020-01-01 → 2026-08-21 stored
+as run 1 and run 2, 1,647 points each, and the POST response now compares
+**byte-for-byte** with `GET /backtests/{id}`.
+
+---
+
+### Task 12 is done except for three things nobody but the operator can do
 ### Task 12 is done except for three things nobody but the operator can do
 ### Task 12 is done except for three things nobody but the operator can do
 
@@ -147,7 +142,7 @@ AC. Anything long-running deserves better than a laptop that sleeps.
 | **Phase 1** — streaming + manual paper trading | **Shipped.** Task 12 executed 2026-09-04, 8/10 steps pass; the three open items are operator actions, not code. |
 | **Phase 2** — Agent Contract + strategy runtime | **Started.** Draft at `docs/agent-contract/STRATEGY_CONTRACT.md`. |
 | **Phase 2.5** — intelligence layer | Not started. Recorders were meant to start in Phase 0 and compound; check whether the news/announcements recorder is actually running. |
-| **Phase 3** — backtesting + metrics | **Sub-project 3a complete, and now visible in the UI.** `smoke_test` reads a strategy's declared `data.bars` and either serves it correctly (`"1m"`, `"1d"`) or rejects it with an honest finding naming the gap (see below); `/strategies` reports which interval a run actually received, and lists what is registered. **3b (backtest runs at scale + the equity curve) shipped and merged 2026-09-04.** 3c–3f (persistence, metrics, report UI, walk-forward, robustness) not started. |
+| **Phase 3** — backtesting + metrics | **Sub-project 3a complete, and now visible in the UI.** `smoke_test` reads a strategy's declared `data.bars` and either serves it correctly (`"1m"`, `"1d"`) or rejects it with an honest finding naming the gap (see below); `/strategies` reports which interval a run actually received, and lists what is registered. **3b and 3c shipped and merged 2026-09-04.** 3d–3f (persistence, metrics, report UI, walk-forward, robustness) not started. |
 
 ---
 

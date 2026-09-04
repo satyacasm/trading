@@ -736,3 +736,62 @@ def test_the_backtest_read_routes_are_not_coroutines() -> None:
 
     assert not inspect.iscoroutinefunction(get_backtest)
     assert not inspect.iscoroutinefunction(list_backtests)
+
+
+def test_the_detail_route_carries_metrics_and_echoes_the_risk_free_rate(
+    client,  # noqa: ANN001
+    db_conn,  # noqa: ANN001
+    local_user_id,  # noqa: ANN001
+) -> None:
+    """The rate is echoed because on an Indian platform assuming 0 is a
+    systematically flattering lie: a 6% strategy reads as respectable and is
+    worse than a G-Sec. A reader who never thought about it must be told
+    what was assumed rather than left to infer zero.
+    """
+    points = [
+        {"ts": "2024-01-08T10:00:00+00:00", "equity": "1000000.0000", "cash": "1000000.0000"},
+        {"ts": "2024-01-09T10:00:00+00:00", "equity": "1010000.0000", "cash": "1010000.0000"},
+        {"ts": "2024-01-10T10:00:00+00:00", "equity": "990000.0000", "cash": "990000.0000"},
+        {"ts": "2024-01-11T10:00:00+00:00", "equity": "1030000.0000", "cash": "1030000.0000"},
+    ]
+    _strategy_id, run_id = _stored_run(db_conn, local_user_id, points=points)
+
+    detail = client.get(f"/backtests/{run_id}")
+    assert detail.status_code == 200
+    metrics = detail.json()["metrics"]
+
+    assert metrics["risk_free"] == "0.065"
+    # Money and ratios cross as strings: JSON has no decimal type.
+    assert isinstance(metrics["total_return"], str)
+    assert metrics["total_return"] == "0.03000000"
+    # 1010000 -> 990000 against a running peak of 1010000 is -1.980198...%,
+    # rendered at the fixed 8 dp every ratio uses.
+    assert metrics["max_drawdown"]["depth"] == "-0.01980198"
+    assert metrics["max_drawdown"]["recovered"] is True
+    assert len(metrics["drawdown_curve"]) == 4
+
+    override = client.get(f"/backtests/{run_id}?risk_free=0")
+    assert override.status_code == 200
+    assert override.json()["metrics"]["risk_free"] == "0"
+    # A different rate must actually move the number it feeds.
+    assert override.json()["metrics"]["sharpe"] != metrics["sharpe"]
+
+
+def test_the_backtest_list_route_still_carries_no_metrics(
+    client,  # noqa: ANN001
+    db_conn,  # noqa: ANN001
+    local_user_id,  # noqa: ANN001
+) -> None:
+    """Computing metrics for 50 runs means loading 50 curves, which is
+    precisely the cost two routes exist to avoid."""
+    strategy_id, _run_id = _stored_run(
+        db_conn,
+        local_user_id,
+        points=[
+            {"ts": "2024-01-08T10:00:00+00:00", "equity": "1000000.0000", "cash": "1000000.0000"},
+            {"ts": "2024-01-09T10:00:00+00:00", "equity": "1010000.0000", "cash": "1010000.0000"},
+        ],
+    )
+    row = client.get(f"/strategies/{strategy_id}/backtests").json()[0]
+    assert "metrics" not in row
+    assert "equity_curve" not in row

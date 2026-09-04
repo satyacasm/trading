@@ -45,7 +45,8 @@ structured report an agent iterates against.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -67,6 +68,7 @@ from trading.agent_contract.smoke import (
     smoke_test,
 )
 from trading.agent_contract.validation import Finding, ValidationReport, validate_strategy
+from trading.metrics.curve import summarize
 from trading.streaming.db import get_db_connection
 
 router = APIRouter()
@@ -409,6 +411,11 @@ class BacktestDetail(BacktestSummary):
     """One stored run WITH its curve, in `ts` order. Money as strings."""
 
     equity_curve: list[dict[str, str]]
+    # Computed on read from the curve, never stored: a stored metric is a
+    # second source of truth that can drift from the series it came from,
+    # and recomputing means a corrected metric applies retroactively to
+    # every run rather than only to runs computed after the fix.
+    metrics: dict[str, Any] | None = None
 
 
 @router.get("/strategies/{strategy_id}/backtests", response_model=list[BacktestSummary])
@@ -425,21 +432,41 @@ def list_backtests(
     return [BacktestSummary(**row) for row in list_backtest_runs(conn, strategy_id)]
 
 
+# 6.5% rather than the conventional 0. On an Indian platform a zero
+# risk-free rate is a systematically flattering lie: a strategy returning 6%
+# a year reads as respectable and is in truth worse than a government bond.
+# The value used is echoed inside `metrics`, so a reader who never
+# considered the question is told what was assumed.
+_DEFAULT_RISK_FREE = Decimal("0.065")
+_RISK_FREE_DESCRIPTION = (
+    "Annual risk-free rate for Sharpe and Sortino. Defaults to 6.5%, reflecting "
+    "Indian G-Sec reality rather than the conventional 0. Echoed inside `metrics`."
+)
+
+
 @router.get("/backtests/{backtest_run_id}", response_model=BacktestDetail)
 def get_backtest(
     backtest_run_id: int,
     conn: Annotated[Connection, Depends(get_db_connection)],
+    risk_free: Annotated[Decimal, Query(description=_RISK_FREE_DESCRIPTION)] = _DEFAULT_RISK_FREE,
 ) -> BacktestDetail:
-    """One stored run, with its equity curve.
+    """One stored run, with its equity curve and metrics computed from it.
 
     Plain `def`, and a GET that never writes.
     """
     try:
-        return BacktestDetail(**get_backtest_run(conn, backtest_run_id))
+        run = get_backtest_run(conn, backtest_run_id)
     except KeyError:
         raise HTTPException(
             status_code=404, detail=f"no backtest run with backtest_run_id={backtest_run_id}"
         ) from None
+
+    points = [
+        (datetime.fromisoformat(p["ts"]), Decimal(p["equity"]), Decimal(p["cash"]))
+        for p in run["equity_curve"]
+    ]
+    run["metrics"] = summarize(points, run["bars"], risk_free) if points else None
+    return BacktestDetail(**run)
 
 
 class ContractBundle(BaseModel):

@@ -179,6 +179,16 @@ def test_a_passing_strategy_is_registered_and_its_run_recorded(client, db_conn) 
     ).fetchone()
     assert stored == ("PASSED", 3, 1)
 
+    # The manifest stage 2 proved must survive stage 3. It was previously
+    # dropped -- `register_strategy` accepts one and this endpoint never
+    # passed it -- so every uploaded strategy stored NULL, discarding the
+    # only record of what the run was actually configured to do.
+    manifest = db_conn.execute(
+        "SELECT manifest FROM strategies WHERE strategy_id = %s", (body["strategy_id"],)
+    ).fetchone()[0]
+    assert manifest is not None, "the manifest configure() returned was discarded at registration"
+    assert manifest["data"]["bars"] == "1m"
+
 
 @pytest.mark.sandbox
 def test_a_strategy_whose_universe_has_no_bars_is_rejected_and_stores_nothing(
@@ -285,6 +295,207 @@ def test_the_response_carries_the_money_as_strings_not_json_numbers(client) -> N
 
     raw = jsonlib.loads(response.text)
     assert "summary" in raw
+
+
+def _passing_verdict(**overrides):  # noqa: ANN003, ANN201
+    """A verdict built the way `build_verdict` builds one, so these tests
+    exercise the real shape rather than a hand-rolled stand-in."""
+    from trading.agent_contract.smoke import build_verdict
+
+    outcome = {
+        "ok": True,
+        "bar_calls": 1875,
+        "orders": [],
+        "fills": 0,
+        "rejections": [],
+        "final_cash": "100000",
+        "final_equity": "100000",
+        "breaker_reason": None,
+        "logs": [],
+        "error": None,
+        "crashed_at": None,
+    }
+    outcome.update(overrides)
+    window = {
+        "start": "2026-08-27T00:00:00+00:00",
+        "end": "2026-09-02T00:00:00+00:00",
+        "sessions": 5,
+        "instruments": {},
+        "bars": "1m",
+        "interval_sec": 60,
+    }
+    return build_verdict(outcome, outcome, window, "runc", False)
+
+
+def test_the_summary_names_why_orders_did_not_fill() -> None:
+    """`orders: 12 · fills: 0` with no reason is the same class of
+    half-truth as serving the wrong bar interval -- it reads as a strategy
+    that chose not to trade when in fact every order bounced. The prose
+    report already names the reason; the structured summary must too, or a
+    client that branches on numbers draws the wrong conclusion.
+    """
+    from trading.agent_contract.api import _summary_of
+
+    verdict = _passing_verdict(
+        orders=[{"order_id": 1, "status": "REJECTED"}],
+        rejections=["insufficient funds"],
+    )
+
+    summary = _summary_of(verdict)
+
+    assert summary is not None
+    assert summary.rejections == 1
+    assert summary.rejection_reasons == ["insufficient funds"]
+
+
+def test_a_tripped_breaker_reaches_the_summary_not_only_the_prose() -> None:
+    from trading.agent_contract.api import _summary_of
+
+    verdict = _passing_verdict(orders=[{"order_id": 1}], breaker_reason="max daily loss exceeded")
+
+    summary = _summary_of(verdict)
+
+    assert summary is not None
+    assert summary.breaker_reason == "max daily loss exceeded"
+
+
+def test_a_clean_run_claims_no_rejections_and_no_breaker() -> None:
+    """The absent case must be empty rather than absent-shaped noise: a
+    clean run reports zero and null, so a client never has to guess
+    whether the field was omitted or the run was fine."""
+    from trading.agent_contract.api import _summary_of
+
+    summary = _summary_of(_passing_verdict(orders=[{"order_id": 1}], fills=1))
+
+    assert summary is not None
+    assert summary.rejections == 0
+    assert summary.rejection_reasons == []
+    assert summary.breaker_reason is None
+
+
+def test_listing_strategies_is_empty_before_anything_is_registered(client) -> None:  # noqa: ANN001
+    response = client.get("/strategies")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == []
+
+
+def test_a_registered_strategy_is_listed_with_the_run_that_justified_it(  # noqa: ANN001
+    client,
+    db_conn,
+    local_user_id,
+) -> None:
+    """Until now the registry was write-only from the app's side: an
+    upload wrote to `strategies` and `strategy_smoke_runs` and nothing
+    could ever read either back. A registered version you cannot see is a
+    version you cannot compare, which is what makes §9's immutability rule
+    invisible in practice.
+    """
+    import json
+
+    from trading.agent_contract.registry import register_strategy
+    from trading.agent_contract.smoke import record_smoke_run
+
+    registered = register_strategy(
+        db_conn,
+        user_id=local_user_id,
+        name="listed-strategy",
+        version="1.0.0",
+        source=_source(
+            """
+            from decimal import Decimal
+
+
+            class MyStrategy(Strategy):
+                def configure(self):
+                    return None
+
+                def on_bar(self, ctx, bars):
+                    ctx.order(1, side="BUY", quantity=Decimal("1"), rationale="demo")
+            """
+        ),
+    )
+    # The manifest is written directly rather than through configure():
+    # this test is about what the listing reports, and the round trip that
+    # populates the column is covered end-to-end by the sandbox test above.
+    db_conn.execute(
+        "UPDATE strategies SET manifest = %s WHERE strategy_id = %s",
+        (json.dumps({"data": {"bars": "1d"}, "base_currency": "INR"}), registered.strategy_id),
+    )
+    record_smoke_run(db_conn, registered.strategy_id, _passing_verdict(fills=2))
+
+    body = client.get("/strategies").json()
+
+    assert len(body) == 1
+    listed = body[0]
+    assert listed["strategy_id"] == registered.strategy_id
+    assert listed["name"] == "listed-strategy"
+    assert listed["version"] == "1.0.0"
+    assert listed["bars"] == "1d"
+    assert listed["latest_run"] is not None
+    assert listed["latest_run"]["verdict"] == "PASSED_WITH_WARNINGS"
+    assert listed["latest_run"]["sessions"] == 5
+    assert listed["latest_run"]["kernel_isolated"] is False
+    assert listed["latest_run"]["final_equity"] == "100000.0000"
+
+
+def test_a_strategy_with_no_recorded_run_still_lists(client, db_conn, local_user_id) -> None:  # noqa: ANN001
+    """`strategy_smoke_runs` is a separate table and a strategy can exist
+    without a row in it. An inner join here would silently hide a
+    registered version, which is worse than showing one with no run."""
+    from trading.agent_contract.registry import register_strategy
+
+    register_strategy(
+        db_conn,
+        user_id=local_user_id,
+        name="runless",
+        version="1.0.0",
+        source=_source(
+            """
+            class MyStrategy(Strategy):
+                def configure(self):
+                    return None
+
+                def on_bar(self, ctx, bars):
+                    pass
+            """
+        ),
+    )
+
+    body = client.get("/strategies").json()
+
+    assert [s["name"] for s in body] == ["runless"]
+    assert body[0]["latest_run"] is None
+    assert body[0]["bars"] is None
+
+
+def test_strategies_are_listed_newest_first(client, db_conn, local_user_id) -> None:  # noqa: ANN001
+    """Newest first for the same reason the blotter is: the version you
+    just uploaded is the one you are looking for."""
+    from trading.agent_contract.registry import register_strategy
+
+    source = _source(
+        """
+        class MyStrategy(Strategy):
+            def configure(self):
+                return None
+
+            def on_bar(self, ctx, bars):
+                pass
+        """
+    )
+    for version in ("1.0.0", "1.1.0", "1.2.0"):
+        register_strategy(
+            db_conn,
+            user_id=local_user_id,
+            name="ordered",
+            version=version,
+            source=source + f"# {version}\n",
+        )
+
+    body = client.get("/strategies").json()
+
+    assert [s["version"] for s in body] == ["1.2.0", "1.1.0", "1.0.0"]
 
 
 def test_a_backtest_for_an_unknown_strategy_is_404(client) -> None:  # noqa: ANN001

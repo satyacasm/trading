@@ -49,7 +49,7 @@ from datetime import date
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from psycopg import Connection
 from pydantic import BaseModel, Field
 
@@ -109,6 +109,14 @@ class RunSummary(BaseModel):
     pnl: str | None
     pnl_pct: str | None
     currency: str
+    # "orders: 12 · fills: 0" with no reason reads as a strategy that chose
+    # not to trade, when in fact every order bounced. rejections/
+    # rejection_reasons/breaker_reason close that gap the same way the
+    # prose report already does, so a client that branches on these
+    # numbers cannot draw the wrong conclusion.
+    rejections: int
+    rejection_reasons: list[str]
+    breaker_reason: str | None
 
 
 class UploadStrategyResponse(BaseModel):
@@ -166,6 +174,10 @@ def _summary_of(verdict: SmokeVerdict) -> RunSummary | None:
     outcome = verdict.outcome
     if outcome is None:
         return None
+    # Mirrors record_smoke_run exactly (count = len(reasons), the reasons
+    # list stored verbatim) so the API response and the stored row can
+    # never disagree about how many orders bounced or why.
+    rejections = list(outcome.get("rejections") or [])
     return RunSummary(
         bar_calls=int(outcome.get("bar_calls", 0)),
         orders=len(outcome.get("orders", [])),
@@ -176,6 +188,9 @@ def _summary_of(verdict: SmokeVerdict) -> RunSummary | None:
         pnl=None if verdict.pnl is None else str(verdict.pnl),
         pnl_pct=None if verdict.pnl_pct is None else str(verdict.pnl_pct),
         currency=verdict.currency,
+        rejections=len(rejections),
+        rejection_reasons=rejections,
+        breaker_reason=outcome.get("breaker_reason"),
     )
 
 
@@ -232,6 +247,7 @@ def upload_strategy(
         name=request.name,
         version=request.version,
         source=request.source,
+        manifest=verdict.manifest,
     )
     record_smoke_run(conn, registered.strategy_id, verdict)
     return _from_verdict(verdict, strategy_id=registered.strategy_id)
@@ -358,9 +374,153 @@ def get_contract() -> ContractBundle:
     )
 
 
+class LatestRun(BaseModel):
+    """The most recent smoke run for one strategy version, as stored by
+    `record_smoke_run` -- not re-derived from a live verdict, so this is
+    exactly what a future reader of the row would see."""
+
+    smoke_run_id: int
+    verdict: str
+    window_start: str | None
+    window_end: str | None
+    sessions: int
+    bar_calls: int
+    orders_placed: int
+    fills: int
+    rejections: int
+    final_equity: str | None
+    breaker_reason: str | None
+    runtime: str
+    kernel_isolated: bool
+    contract_version: str
+    ran_at: str
+
+
+class StrategySummary(BaseModel):
+    """One row of `GET /strategies`: a registered version plus the smoke
+    run that justified it, if one has been recorded."""
+
+    strategy_id: int
+    name: str
+    version: str
+    status: str
+    contract_version: str
+    registered_at: str
+    bars: str | None
+    latest_run: LatestRun | None
+
+
+_LIST_STRATEGIES_SQL = """
+    SELECT
+        s.strategy_id, s.name, s.version, s.status, s.contract_version,
+        s.registered_at, s.manifest -> 'data' ->> 'bars' AS bars,
+        r.smoke_run_id, r.verdict, r.window_start, r.window_end, r.sessions,
+        r.bar_calls, r.orders_placed, r.fills, r.rejections, r.final_equity,
+        r.breaker_reason, r.runtime, r.kernel_isolated, r.contract_version,
+        r.ran_at
+    FROM strategies s
+    LEFT JOIN LATERAL (
+        SELECT *
+        FROM strategy_smoke_runs sr
+        WHERE sr.strategy_id = s.strategy_id
+        ORDER BY sr.ran_at DESC
+        LIMIT 1
+    ) r ON true
+    ORDER BY s.registered_at DESC, s.strategy_id DESC
+    LIMIT %s
+"""
+
+
+def _strategy_summary_from_row(row: tuple[Any, ...]) -> StrategySummary:
+    (
+        strategy_id,
+        name,
+        version,
+        status,
+        contract_version,
+        registered_at,
+        bars,
+        smoke_run_id,
+        verdict,
+        window_start,
+        window_end,
+        sessions,
+        bar_calls,
+        orders_placed,
+        fills,
+        rejections,
+        final_equity,
+        breaker_reason,
+        runtime,
+        kernel_isolated,
+        run_contract_version,
+        ran_at,
+    ) = row
+    # The LEFT JOIN LATERAL leaves every r.* column NULL when a strategy
+    # has no recorded run -- smoke_run_id is the one column that can never
+    # be NULL for a real run (it is the table's primary key), so it is
+    # what decides whether latest_run is None rather than any nullable
+    # field on the run itself (final_equity, breaker_reason, ... are all
+    # legitimately NULL on a real row too).
+    latest_run = (
+        None
+        if smoke_run_id is None
+        else LatestRun(
+            smoke_run_id=smoke_run_id,
+            verdict=verdict,
+            window_start=None if window_start is None else window_start.isoformat(),
+            window_end=None if window_end is None else window_end.isoformat(),
+            sessions=sessions,
+            bar_calls=bar_calls,
+            orders_placed=orders_placed,
+            fills=fills,
+            rejections=rejections,
+            final_equity=None if final_equity is None else str(final_equity),
+            breaker_reason=breaker_reason,
+            runtime=runtime,
+            kernel_isolated=kernel_isolated,
+            contract_version=run_contract_version,
+            ran_at=ran_at.isoformat(),
+        )
+    )
+    return StrategySummary(
+        strategy_id=strategy_id,
+        name=name,
+        version=version,
+        status=status,
+        contract_version=contract_version,
+        registered_at=registered_at.isoformat(),
+        bars=bars,
+        latest_run=latest_run,
+    )
+
+
+@router.get("/strategies", response_model=list[StrategySummary])
+def list_strategies(
+    limit: int = Query(default=50, ge=1, le=200),
+    conn: Connection = Depends(get_db_connection),  # noqa: B008
+) -> list[StrategySummary]:
+    """Every registered strategy, newest first, with its latest smoke run.
+
+    A plain `def`, like every route in this module: psycopg is
+    synchronous, and this is a GET, so it must never write -- it only
+    reads `strategies` and `strategy_smoke_runs`.
+
+    The join to the latest run is a LEFT JOIN LATERAL, not an inner join:
+    a strategy can be registered with zero rows in `strategy_smoke_runs`
+    (see `record_smoke_run`'s module docstring on rejections storing
+    nothing), and an inner join would silently hide that registered
+    version instead of showing it with `latest_run: null`.
+    """
+    rows = conn.execute(_LIST_STRATEGIES_SQL, (limit,)).fetchall()
+    return [_strategy_summary_from_row(row) for row in rows]
+
+
 __all__ = [
     "ContractBundle",
+    "LatestRun",
     "RunSummary",
+    "StrategySummary",
     "Finding",
     "UploadStrategyRequest",
     "UploadStrategyResponse",

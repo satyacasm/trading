@@ -944,6 +944,7 @@ def test_smoke_test_serves_daily_bars_to_a_strategy_that_declares_them(db_conn) 
 
     assert verdict.passed is True, verdict.as_agent_feedback()
     assert verdict.window["sessions"] == 3
+    assert verdict.window["bars"] == "1d", "the window must name the interval it actually served"
     assert verdict.window["instruments"] == {str(instrument_id): {"bars": 3}}
     assert verdict.outcome is not None
     assert verdict.outcome["fills"] == 1
@@ -1018,6 +1019,62 @@ def test_smoke_test_reports_an_invalid_bar_interval_without_running_the_smoke_co
     assert "2m" in verdict.as_agent_feedback()
 
 
+@pytest.mark.db
+def test_select_window_names_the_interval_it_served(db_conn) -> None:  # noqa: ANN001
+    """A window that says "5 sessions" without saying which bars is not
+    interpretable: 5 daily sessions is 5 on_bar calls and 5 intraday
+    sessions is hundreds. The caller knows the interval it asked for, so
+    the window it gets back must carry it -- this is what lets a report
+    (and the UI) state which bars a run actually received.
+    """
+    from datetime import UTC, date, datetime
+
+    from trading.agent_contract.smoke import select_window
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','INTERVALNAMED','INR',"
+        "'ACTIVE','NSE:CM:INTERVALNAMED') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    db_conn.execute(
+        "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+        "volume, source) VALUES (%s,%s,100,101,99,100,10,1)",
+        (instrument_id, date(2024, 1, 8)),
+    )
+    db_conn.execute(
+        "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+        "close, volume, source) VALUES (%s,%s,60,100,101,99,100,10,1)",
+        (instrument_id, datetime(2024, 1, 8, 9, 15, tzinfo=UTC)),
+    )
+
+    daily = select_window(db_conn, [instrument_id], sessions=5, interval_sec=86400)
+    assert daily["bars"] == "1d"
+    assert daily["interval_sec"] == 86400
+
+    intraday = select_window(db_conn, [instrument_id], sessions=5, interval_sec=60)
+    assert intraday["bars"] == "1m"
+    assert intraday["interval_sec"] == 60
+
+
+@pytest.mark.db
+def test_an_empty_window_still_names_the_interval_it_looked_for(db_conn) -> None:  # noqa: ANN001
+    """The no-data path is exactly where the interval matters most: "no
+    bars found" and "no *daily* bars found" send an agent to different
+    fixes, and the early return must not drop the fact on the floor."""
+    from trading.agent_contract.smoke import select_window
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','NOBARSATALL','INR',"
+        "'ACTIVE','NSE:CM:NOBARSATALL') RETURNING instrument_id"
+    ).fetchone()
+
+    window = select_window(db_conn, [row[0]], sessions=5, interval_sec=86400)
+
+    assert window["sessions"] == 0
+    assert window["bars"] == "1d"
+    assert window["interval_sec"] == 86400
 @pytest.mark.db
 def test_daily_fetch_stamps_knowable_at_with_the_session_close(db_conn) -> None:  # noqa: ANN001
     """The link between the `close_ts` fix and production.

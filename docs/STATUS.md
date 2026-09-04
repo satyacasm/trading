@@ -1,62 +1,72 @@
 # Where this project stands
 
-**Updated:** 2026-09-04, ~21:00 IST. Keep this file current — it is the
+**Updated:** 2026-09-04, ~21:25 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
 
 ## The one thing to do next
 
-**The live strategy supervisor** — Phase 2's "forward paper-running of
-strategies with monitoring dashboard" (§254). Design settled at
-`docs/superpowers/specs/2026-09-04-live-strategy-runtime-design.md`; the
-foundations are merged and the supervisor itself is what remains.
+**The live monitoring page.** Strategies now run forward and trade; nothing
+shows it happening. `GET /live` lists runs with `bars_seen`, `orders_placed`
+and `stopped_reason`; the orders are ordinary rows tagged `live_run_id`, so
+equity, P&L and positions all come from the existing portfolio queries.
 
-Built already:
+Then: restart/resume across supervisor death, and tick-level dispatch if
+ever wanted (it would need a contract change).
 
-- **One dispatcher.** `run_loop`'s per-bar body is now a `step(close_ts,
-  indexed) -> bool` the supervisor will drive once per closed bar. §166
-  claims backtest and forward behaviour are "bit-identical by construction";
-  this is the construction. A second loop would drift, invisibly, until a
-  strategy behaved differently in production than in its backtest.
-- **`InMemoryBars.append`**, so a run that has not finished can learn bars
-  one at a time. A late bar is refused rather than reordered — reordering
-  would change history a strategy had already read.
+---
 
-Still to build: the framed-JSON protocol, the runner's live mode, the
-supervisor process, a `live_runs` table, start/stop routes, orders flowing
-into the existing paper order API, and the supervisor-side order-rate limit
-(§166 puts it there). Then the monitoring page.
+## The live strategy runtime — working 2026-09-04
 
-**Most of the live path already exists.** `paper.engine` fills orders from
-live ticks with the real cost model, the circuit breaker watches the
-portfolio, and the outbox alerts. What is missing is only the piece that
-turns `ctx.order()` into a row in `orders`. Crypto bars arrive 24/7, so a
-live run is demonstrable outside NSE hours.
+**A strategy ran forward against live prices and traded.** Verified outside
+NSE hours on crypto: strategy 23 in a gVisor container took one closed
+BTC-USDT bar, placed order 31 tagged `live_run_id=1`, and `paper.engine`
+filled it a second later at 79,549.04 with 0.80 USDT of charges — the same
+path, cost model and blotter a human order takes.
 
-### The transport diverges from §166, and the spike is why
+Run it with:
 
-§166 specifies Unix socket RPC between supervisor and strategy. Measured on
-this machine:
+```bash
+uv run python -m trading.live.supervisor
+curl -X POST localhost:8000/strategies/{id}/live -d '{"portfolio_id":9}'
+curl -X POST localhost:8000/live/{run_id}/stop
+```
 
-| approach | reaches supervisor | reaches internet |
-|---|---|---|
-| `--network none` (today) | no | no |
-| bind-mounted Unix socket | **no — `OSError 95` across the macOS/Lima share** | no |
-| default bridge | yes | **yes** |
-| `--internal` bridge | only containers on it | no |
+### How it works, and why not the way §166 says
 
-Unix domain sockets do not work across the macOS-to-VM filesystem share.
-The internal bridge blocks the internet but cannot reach the host, so the
-supervisor would have to run inside `colima-sandbox` — which holds no
-database, because the VM split deliberately keeps 51M bars and the paper
-ledger out of a container escape's blast radius.
+**One dispatcher.** `run_loop`'s body is a `step` the supervisor drives once
+per closed bar. §166 claims backtest and forward behaviour are
+"bit-identical by construction"; `open_session` is that construction. A
+second loop would drift invisibly until a strategy behaved differently in
+production than in its backtest.
 
-**Framed JSON over stdin/stdout** keeps `--network none`, keeps all fifteen
-containment tests, and keeps the supervisor beside the database. The
-supervisor's role is exactly §166's; only the pipe differs, and it is the
-pipe that already carries the source and the payload. Five minutes of
-spiking; it would have been a week of building the wrong thing.
+**Framed JSON over stdin/stdout, not a Unix socket.** Measured: a
+bind-mounted socket is unreachable from the container (`OSError 95` across
+the macOS/Lima share), the default bridge grants full internet, and the only
+config that blocks the internet cannot reach the host — putting the
+supervisor inside `colima-sandbox`, which holds no database. Pipes keep
+`--network none` and all fifteen containment tests. Five minutes of spiking
+saved a week.
+
+**Orders go over HTTP.** The gateway owns the currency gate, market hours,
+idempotency and the `orders:control` publish. Reaching past it would mean a
+strategy's orders were validated differently from a human's.
+
+**The aggregator now announces closed bars** on `closed_bars:*`. Until now
+only it knew a bar had closed — the row went to the database and was
+published to nobody, so crypto bars were invisible downstream. Separate from
+`bars:*` (Upstox's raw I1 feed) on purpose: a subscriber must be able to
+tell a bar that was *received* from one that was *computed*.
+
+**A crashed strategy is not restarted.** One whose in-memory state vanished
+mid-session is not the same strategy, and its next orders would not follow
+from what it saw. Rate limiting lives in the supervisor per §166 and stops
+the run rather than dropping orders — the breaker's posture toward losses.
+
+**Watch out:** the payload is now length-prefixed, so the sandbox image and
+the host must be deployed together. Rebuilding the image while an older
+gateway was running broke uploads until it was restarted.
 
 ---
 

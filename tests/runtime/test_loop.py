@@ -870,3 +870,94 @@ def test_curve_money_is_emitted_at_the_canonical_four_decimal_scale() -> None:
         assert point["cash"] == str(Decimal(point["cash"]).quantize(Decimal("0.0001")))
     # The case that actually bites: a whole number must not render bare.
     assert outcome.equity_curve[0]["cash"] == "1000000.0000"
+
+
+def test_every_fill_is_recorded_with_its_itemised_charges() -> None:
+    """`ChargeBreakdown`'s own docstring says why the itemisation must
+    survive: "§8's cost-drag report needs the breakdown and it cannot be
+    reconstructed from a lump sum afterwards."
+
+    `run_loop` computed one per fill and kept only `.total`, so nothing
+    downstream could see what a strategy actually paid -- `RunOutcome.fills`
+    was a bare count and `OrderSnapshot` stops at `status`. Trade metrics,
+    the cost-drag report and the post-tax lens are all blocked on this one
+    record existing.
+    """
+
+    class BuyThenSell:
+        def __init__(self) -> None:
+            self.step = 0
+
+        def on_bar(self, ctx, bars) -> None:  # noqa: ANN001, ARG002
+            if self.step == 0:
+                ctx.order(1, side="BUY", quantity=Decimal("10"), rationale="open")
+            elif self.step == 2:
+                ctx.order(1, side="SELL", quantity=Decimal("10"), rationale="close")
+            self.step += 1
+
+    base = datetime(2026, 9, 1, 4, tzinfo=UTC)
+    series = [_bar(1, base + timedelta(minutes=i), "100") for i in range(6)]
+
+    outcome = run_loop(
+        strategy=BuyThenSell(),
+        bars=InMemoryBars({1: series}),
+        schedules=_schedules(),
+        starting_cash=Decimal("100000"),
+        slippage_bps=Decimal("0"),
+    )
+
+    assert outcome.fills == 2
+    assert len(outcome.fill_ledger) == 2
+
+    buy, sell = outcome.fill_ledger
+    assert buy["side"] == "BUY"
+    assert sell["side"] == "SELL"
+    # Every value is a string: the record is dict[str, str], and mixing an
+    # int in would break the type the payload and the store both rely on.
+    assert buy["instrument_id"] == "1"
+    assert buy["quantity"] == "10.00000000"
+    assert buy["price"] == "100.0000"
+    assert buy["product"] == "DELIVERY"
+
+    # Every component, not a total: the total can be re-derived from the
+    # parts, and the parts cannot be recovered from the total.
+    for component in (
+        "brokerage",
+        "stt",
+        "exchange_txn",
+        "sebi_fee",
+        "stamp_duty",
+        "ipft",
+        "gst",
+        "dp_charges",
+        "tds",
+        "total_charges",
+    ):
+        assert component in buy, component
+
+    # The schedule under test is a flat Rs 20 brokerage on both sides.
+    assert buy["brokerage"] == "20.0000"
+    # And the parts must actually sum to the total they are stored beside.
+    parts = sum(
+        Decimal(buy[c])
+        for c in (
+            "brokerage",
+            "stt",
+            "exchange_txn",
+            "sebi_fee",
+            "stamp_duty",
+            "ipft",
+            "gst",
+            "dp_charges",
+            "tds",
+        )
+    )
+    assert parts == Decimal(buy["total_charges"])
+
+
+def test_the_fill_ledger_survives_a_crash_like_the_curve_does() -> None:
+    """A partial ledger says what a run paid before it died, for the same
+    reason a partial curve says where it died."""
+    from trading.runtime.outcome import RunOutcome
+
+    assert "fill_ledger" in RunOutcome.__dataclass_fields__

@@ -73,6 +73,8 @@ __all__ = ["run_loop"]
 
 # Contract §5: cash and equity are 4 dp.
 _MONEY_SCALE = Decimal("0.0001")
+# Quantities are 8 dp -- crypto needs it; equities are whole numbers.
+_QUANTITY_SCALE = Decimal("0.00000001")
 
 _TERMINAL = (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED)
 
@@ -334,6 +336,37 @@ def run_loop(
                         state.cash -= notional + breakdown.total
                     else:
                         state.cash += notional - breakdown.total
+                    # Recorded here, where the breakdown still exists. One
+                    # line later only `breakdown.total` survives, and the
+                    # itemisation cannot be recovered from it.
+                    state.fill_ledger.append(
+                        {
+                            "ts": ts_iso,
+                            "instrument_id": str(order.instrument_id),
+                            "side": order.side.value,
+                            "product": order.product.value,
+                            # Quantized to the scales the columns that will
+                            # store these declare -- quantity 8 dp, money
+                            # 4 dp. `str(Decimal)` preserves whatever scale
+                            # the arithmetic produced, so an unquantized
+                            # value reads "100.00" here and "100.0000" after
+                            # a round trip, and the same fill then has two
+                            # string forms depending on which endpoint is
+                            # asked. The equity curve had exactly this bug.
+                            "quantity": str(decision.quantity.quantize(_QUANTITY_SCALE)),
+                            "price": str(decision.price.quantize(_MONEY_SCALE)),
+                            "brokerage": str(breakdown.brokerage.quantize(_MONEY_SCALE)),
+                            "stt": str(breakdown.stt.quantize(_MONEY_SCALE)),
+                            "exchange_txn": str(breakdown.exchange_txn.quantize(_MONEY_SCALE)),
+                            "sebi_fee": str(breakdown.sebi_fee.quantize(_MONEY_SCALE)),
+                            "stamp_duty": str(breakdown.stamp_duty.quantize(_MONEY_SCALE)),
+                            "ipft": str(breakdown.ipft.quantize(_MONEY_SCALE)),
+                            "gst": str(breakdown.gst.quantize(_MONEY_SCALE)),
+                            "dp_charges": str(breakdown.dp_charges.quantize(_MONEY_SCALE)),
+                            "tds": str(breakdown.tds.quantize(_MONEY_SCALE)),
+                            "total_charges": str(breakdown.total.quantize(_MONEY_SCALE)),
+                        }
+                    )
                     _apply_position(state, order, decision.quantity, decision.price)
                     filled = order.filled_quantity + decision.quantity
                     state.orders[order_id] = order.model_copy(
@@ -430,6 +463,7 @@ def run_loop(
             error=crash.detail,
             crashed_at={"handler": crash.handler, "ts": crash.ts, "bar_calls": state.bar_calls},
             equity_curve=tuple(state.equity_curve),
+            fill_ledger=tuple(state.fill_ledger),
         )
 
     return RunOutcome(
@@ -443,4 +477,5 @@ def run_loop(
         breaker_reason=state.breaker_reason,
         logs=tuple(state.logs),
         equity_curve=tuple(state.equity_curve),
+        fill_ledger=tuple(state.fill_ledger),
     )

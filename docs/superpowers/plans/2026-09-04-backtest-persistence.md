@@ -90,7 +90,7 @@ def test_an_equity_point_cannot_repeat_a_timestamp_within_a_run(db_conn):
     user = db_conn.execute("SELECT user_id FROM users LIMIT 1").fetchone()[0]
     strategy_id = db_conn.execute(
         "INSERT INTO strategies (user_id, name, version, source, source_sha256, "
-        "status, contract_version) VALUES (%s,'dupe-pk','1.0.0','x','y','ACTIVE','0.1') "
+        "status, contract_version) VALUES (%s,'dupe-pk','1.0.0','x','y','REGISTERED','0.1') "
         "RETURNING strategy_id",
         (user,),
     ).fetchone()[0]
@@ -322,7 +322,7 @@ def _strategy(db_conn) -> int:  # noqa: ANN001
     return db_conn.execute(
         "INSERT INTO strategies (user_id, name, version, source, source_sha256, "
         "status, contract_version) VALUES (%s,'persist-fixture','1.0.0','x','y',"
-        "'ACTIVE','0.1') RETURNING strategy_id",
+        "'REGISTERED','0.1') RETURNING strategy_id",
         (user,),
     ).fetchone()[0]
 

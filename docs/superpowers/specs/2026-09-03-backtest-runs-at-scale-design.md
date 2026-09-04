@@ -71,11 +71,36 @@ stored *at* the session close (verified: every row is 10:00 UTC / 15:30
 IST), so today `close_ts` resolves to **the next day's 15:30 IST** — the
 "uniform one-day lag" 3a carried forward, now located precisely.
 
-The consequence is not cosmetic. DP charges are billed per scrip per IST
-day and the key is derived from `close_ts`, so a daily-bar sell is billed
-against the wrong day; two sells on consecutive sessions can key to the
-same day or to two days depending on nothing the strategy did. The
-breaker's `day_open_equity` rolls on the same clock.
+The consequence is not cosmetic, but it is **not** the DP one this
+paragraph originally claimed. **Corrected 2026-09-04, during
+implementation, by probing it before writing the test the design asked
+for:** `ts + 86400` is an *injective* shift on dates, so it maps every
+session to a distinct day and the number of DP scrip-day keys is
+invariant — three sessions give three keys under both clocks, and a
+Friday/Monday pair gives two under both. `compute_charges` is handed
+schedules already filtered by `_charge_key` on the host and takes no
+date, so a day's shift cannot select a different rate either. There is no
+DP mischarge, and a test asserting one would pass before and after the
+fix.
+
+What is actually wrong:
+
+- **`ctx.now` is a full day ahead of reality.** A bar stored at
+  2026-03-02 15:30 IST hands the strategy a clock reading 2026-03-03.
+  Month-end, day-of-week and holiday logic are all simply wrong, and a
+  strategy cannot detect it.
+- **Every timestamp the run emits is a day late** — an order's
+  `submitted_at`, and the equity curve D3b-2 introduces. A run over
+  Jan 1 – Mar 1 reports its last curve point at Mar 2, outside the window
+  that was asked for, and 3d would annualise over a range off by a day.
+
+`day_open_equity` is **unaffected**: with daily bars every bar begins a
+new IST day under either clock, so it rolls identically.
+
+This is still the first thing to land, and for the reason the last
+paragraph of this decision gives — everything below records timestamps
+produced by it — but it is a correctness-of-the-clock fix, not a money
+fix, and it should not be sold internally as the latter.
 
 **Decision: stop deriving it.** `BarRecord` gains an optional explicit
 `knowable_at: datetime | None`; `close_ts` returns it when set and falls

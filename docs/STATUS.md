@@ -1,24 +1,68 @@
 # Where this project stands
 
-**Updated:** 2026-09-04, ~16:10 IST. Keep this file current — it is the
+**Updated:** 2026-09-04, ~16:45 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
 
 ## The one thing to do next
 
-**Phase 3 sub-project 3e — the report UI.** 3d returns every number a
-report needs; nothing draws them. 3e renders a strategy's run history and
-one run's equity path, drawdown curve, monthly returns and rolling Sharpe.
+**A per-fill ledger in `RunOutcome`.** It is now the single highest-value
+change left in Phase 3, and it is a *runtime* change, not a metrics or UI
+one. `OrderSnapshot` stops at `status` and `submitted_at`, and `fills` is a
+bare count, so nothing downstream can see a fill's price, side or charges.
+Emitting one unblocks, in a single change:
 
-Two things 3e inherits:
+- **the cost-drag report** (gross versus net of all Indian charges) — the
+  one §8 calls the most sobering chart we can show a retail options trader;
+- **trade metrics** — win rate, profit factor, average win/loss,
+  expectancy, turnover;
+- **the post-tax P&L lens** (§8), which needs holding periods per fill.
 
-- **`GET /backtests/{id}` carries `metrics`**, with `risk_free` echoed
-  inside it. Show the rate next to the Sharpe — the whole reason it is
-  echoed is that a reader must never have to guess what was assumed.
-- **The list route carries neither curves nor metrics, on purpose.** If the
-  history table needs headline figures, that is the moment to decide on a
-  stored summary — with the requirement in hand, not guessed now.
+3d and 3e are both built to receive it: the metrics module is a pure
+function of what it is given, and the report page already has the panel
+grid to hold it.
+
+After that, **3f** — walk-forward, the 2× cost stress rerun, and the Monte
+Carlo trade-order reshuffle — all of which consume 3d's metrics.
+
+---
+
+## Phase 3e — shipped 2026-09-04 (merged)
+
+The backtest report, and a form to produce one. Spec at
+`docs/superpowers/specs/2026-09-04-report-ui-design.md`.
+
+- `/strategies/[id]` — the strategy, a **Run backtest** form, and its runs
+  newest-first, reading the curve-free list route.
+- `/backtests/[id]` — one report: the hurdle chart, the stat grid, the
+  underwater chart, the monthly heatmap and rolling Sharpe.
+
+**The report leads with the hurdle, not the return.** The equity curve is
+drawn against a risk-free growth line from the same capital, and the page
+says in words whether the strategy cleared it. For the real run it reads
+*"This strategy returned less than a government bond over the same
+period"* — +5.59% over 6.6 years is 0.82% a year against 6.50%.
+
+No new dependencies: `lightweight-charts` already drives the price charts,
+and the heatmap is a CSS grid using the `color-mix` technique
+`globals.css` already uses for flash animations.
+
+Two supporting changes: `GET /strategies/{strategy_id}` (same projection as
+the list row, so the two cannot show different fields), and
+**`CORS_ALLOW_ORIGINS`** is now configurable — the origin was hardcoded to
+`:3000`, so no worktree could verify its own branch on a second port.
+
+**Worth not relearning:** the sentences live in `lib/backtests.ts` and are
+tested against their exact text. The linter caught that `describeHurdle`
+was computed and the same wording then re-typed inline in JSX — the page
+and its passing test would have drifted apart silently. That is the exact
+failure the pure-lib pattern exists to prevent, and only an
+unused-variable warning surfaced it.
+
+Verified in a browser against the real stored run with zero console errors,
+including the refusal path: a window past 2026-08-21 shows
+`BACKTEST_WINDOW_UNCOVERED` and adds no run row.
 
 ---
 
@@ -186,7 +230,7 @@ AC. Anything long-running deserves better than a laptop that sleeps.
 | **Phase 1** — streaming + manual paper trading | **Shipped.** Task 12 executed 2026-09-04, 8/10 steps pass; the three open items are operator actions, not code. |
 | **Phase 2** — Agent Contract + strategy runtime | **Started.** Draft at `docs/agent-contract/STRATEGY_CONTRACT.md`. |
 | **Phase 2.5** — intelligence layer | Not started. Recorders were meant to start in Phase 0 and compound; check whether the news/announcements recorder is actually running. |
-| **Phase 3** — backtesting + metrics | **Sub-project 3a complete, and now visible in the UI.** `smoke_test` reads a strategy's declared `data.bars` and either serves it correctly (`"1m"`, `"1d"`) or rejects it with an honest finding naming the gap (see below); `/strategies` reports which interval a run actually received, and lists what is registered. **3b, 3c and 3d shipped and merged 2026-09-04.** 3e–3f (persistence, metrics, report UI, walk-forward, robustness) not started. |
+| **Phase 3** — backtesting + metrics | **Sub-project 3a complete, and now visible in the UI.** `smoke_test` reads a strategy's declared `data.bars` and either serves it correctly (`"1m"`, `"1d"`) or rejects it with an honest finding naming the gap (see below); `/strategies` reports which interval a run actually received, and lists what is registered. **3b, 3c, 3d and 3e shipped and merged 2026-09-04.** 3f (persistence, metrics, report UI, walk-forward, robustness) not started. |
 
 ---
 

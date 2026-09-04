@@ -1146,3 +1146,109 @@ def test_plan_backtest_reports_a_history_shortfall_rather_than_running_quietly(d
 
     assert plan.history_bars_requested == 200
     assert plan.history_bars_available == 2
+
+
+@pytest.mark.db
+def test_plan_backtest_refuses_an_oversized_run_without_fetching_a_bar(
+    db_conn, monkeypatch
+) -> None:  # noqa: ANN001
+    """The ceiling is decoded container memory, not wire size. Materialising
+    five million rows to learn they do not fit spends exactly the cost this
+    gate exists to avoid -- and an OOM inside the container surfaces as
+    `SMOKE_OOM`, which would tell an operator their strategy crashed when in
+    fact their request was too big.
+
+    A gate that refuses *after* fetching passes a naive assertion on the
+    finding code alone, so this also asserts nothing was fetched.
+    """
+    from datetime import UTC, date, datetime
+
+    from trading.agent_contract import smoke as smoke_mod
+    from trading.agent_contract.sandbox import SandboxLimits
+
+    fetched: list[object] = []
+    monkeypatch.setattr(smoke_mod, "fetch_bars", lambda *a, **k: fetched.append(a) or {})
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','TOOBIG','INR',"
+        "'ACTIVE','NSE:CM:TOOBIG') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for day in range(1, 21):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, datetime(2024, 1, day, 10, 0, tzinfo=UTC)),
+        )
+
+    # A WIDE universe is the realistic oversized case: 200 instruments over
+    # the 20 sessions that exist is ~4,000 decoded BarRecords, against the
+    # 2,000-bar ceiling a 1m run affords. Only one of the ids has bars --
+    # the estimate is over the universe the caller DECLARED, which is the
+    # whole point of estimating rather than discovering.
+    universe = [instrument_id, *range(900_000, 900_199)]
+    plan = smoke_mod.plan_backtest(
+        db_conn,
+        {"data": {"bars": "1d", "history_bars": 0}},
+        universe,
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 20),
+        limits=SandboxLimits(memory="1m"),
+    )
+
+    finding = next(f for f in plan.findings if f.code == "BACKTEST_TOO_LARGE")
+    # Names the estimate, the ceiling, and the two levers -- an agent has to
+    # be able to act on it without reading this source.
+    assert "narrow" in finding.message.lower()
+    assert "shorten" in finding.message.lower()
+    assert fetched == []
+
+
+@pytest.mark.db
+def test_plan_backtest_names_a_window_that_runs_past_the_data(db_conn) -> None:  # noqa: ANN001
+    """`bars_daily` ends 2026-08-21. A backtest asked for a window through
+    "today" would otherwise run on weeks of nothing and report a flat tail as
+    a fact about the market -- the same silent-wrong-data failure 3a exists
+    to eliminate, one layer up.
+    """
+    from datetime import UTC, date, datetime
+
+    from trading.agent_contract.smoke import plan_backtest
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','SHORTDATA','INR',"
+        "'ACTIVE','NSE:CM:SHORTDATA') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for day in (2, 3, 4):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, datetime(2024, 1, day, 10, 0, tzinfo=UTC)),
+        )
+
+    plan = plan_backtest(
+        db_conn,
+        {"data": {"bars": "1d", "history_bars": 0}},
+        [instrument_id],
+        start=date(2024, 1, 2),
+        end=date(2024, 6, 30),
+    )
+
+    finding = next(f for f in plan.findings if f.code == "BACKTEST_WINDOW_UNCOVERED")
+    assert "2024-01-04" in finding.message  # where the data actually ends
+    assert "2024-06-30" in finding.message  # where the caller asked to run to
+    assert plan.data_end == date(2024, 1, 4)
+
+
+@pytest.mark.db
+def test_the_bar_ceiling_moves_with_the_run_memory_it_is_derived_from(db_conn) -> None:  # noqa: ANN001
+    """The ceiling is configuration derived from the run's memory limit, not
+    a literal guessed beside it -- one number moving with the other, so the
+    two cannot drift into disagreeing."""
+    from trading.agent_contract.sandbox import SandboxLimits
+    from trading.agent_contract.smoke import bar_ceiling
+
+    assert bar_ceiling(SandboxLimits(memory="2048m")) > bar_ceiling(SandboxLimits(memory="256m"))

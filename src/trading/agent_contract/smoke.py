@@ -916,6 +916,32 @@ _HISTORY_SESSIONS_SQL = """
 """
 
 
+_WINDOW_COVERAGE_SQL = """
+    SELECT
+        count(DISTINCT ts::date) FILTER (WHERE ts::date BETWEEN %s AND %s) AS sessions,
+        min(ts::date) AS data_start,
+        max(ts::date) AS data_end
+    FROM bars_daily
+    WHERE instrument_id = ANY(%s)
+"""
+
+# Bars per megabyte of decoded container memory. A `BarRecord` of Decimals
+# costs far more than its wire form -- `payload.py` notes ~10:1 on gzipped
+# numeric text -- so this is deliberately conservative and measured against
+# the decoded object, which is what actually has to fit.
+_BARS_PER_MB = 2_000
+
+
+def bar_ceiling(limits: SandboxLimits) -> int:
+    """How many bars fit the run's memory limit.
+
+    Derived from `limits.memory` rather than guessed beside it: a raised
+    backtest profile lifts the ceiling automatically, and the two numbers
+    cannot drift into disagreeing about what fits.
+    """
+    return int(int(limits.memory.rstrip("m")) * _BARS_PER_MB)
+
+
 @dataclass(frozen=True)
 class BacktestPlan:
     """Everything decided about a backtest *before* a single bar is fetched.
@@ -936,6 +962,11 @@ class BacktestPlan:
     dispatch_from: datetime
     history_bars_requested: int
     history_bars_available: int
+    instruments: int = 0
+    sessions: int = 0
+    estimated_bars: int = 0
+    data_start: date | None = None
+    data_end: date | None = None
     findings: tuple[Finding, ...] = ()
 
 
@@ -946,6 +977,7 @@ def plan_backtest(
     *,
     start: date,
     end: date,
+    limits: SandboxLimits | None = None,
 ) -> BacktestPlan:
     """Pre-flight a backtest: widen for warm-up, and report any shortfall.
 
@@ -971,10 +1003,57 @@ def plan_backtest(
         if available_days
         else dispatch_from
     )
+
+    # One query answers both remaining questions: how big the run is, and
+    # whether the window is covered at all. Neither fetches a bar.
+    row = conn.execute(_WINDOW_COVERAGE_SQL, (start, end, list(instrument_ids))).fetchone()
+    sessions = int(row[0] or 0) if row else 0
+    data_start = row[1] if row else None
+    data_end = row[2] if row else None
+
+    instruments = len(set(instrument_ids))
+    estimated = instruments * (sessions + len(available_days))
+    ceiling = bar_ceiling(limits or SandboxLimits())
+
+    findings: list[Finding] = []
+    if estimated > ceiling:
+        findings.append(
+            Finding(
+                code="BACKTEST_TOO_LARGE",
+                message=(
+                    f"{instruments} instruments x {sessions + len(available_days)} sessions "
+                    f"= ~{estimated:,} bars, over the {ceiling:,}-bar ceiling for a "
+                    f"{(limits or SandboxLimits()).memory} run. "
+                    "Narrow the universe, or shorten the window."
+                ),
+                contract_section="§9",
+            )
+        )
+    if data_end is not None and end > data_end:
+        missing = (end - data_end).days
+        findings.append(
+            Finding(
+                code="BACKTEST_WINDOW_UNCOVERED",
+                message=(
+                    f"the window runs to {end.isoformat()} but these instruments have no "
+                    f"bars after {data_end.isoformat()} -- the last {missing} day(s) of the "
+                    "request have no data. Running anyway would report a flat tail as a "
+                    "fact about the market. Shorten the window, or backfill the gap."
+                ),
+                contract_section="§9",
+            )
+        )
+
     return BacktestPlan(
         start=fetch_start,
         end=datetime.combine(end, time.max, tzinfo=UTC),
         dispatch_from=dispatch_from,
         history_bars_requested=requested,
         history_bars_available=len(available_days),
+        instruments=instruments,
+        sessions=sessions,
+        estimated_bars=estimated,
+        data_start=data_start,
+        data_end=data_end,
+        findings=tuple(findings),
     )

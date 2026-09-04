@@ -47,7 +47,7 @@ from __future__ import annotations
 import json
 import subprocess
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from trading.runtime.payload import MODE_CONFIGURE, SmokePayload, encode_payload
@@ -111,6 +111,23 @@ class SandboxLimits:
     # other yields a run that is confined differently than it claims.
     # None uses whatever the ambient DOCKER_CONTEXT/DOCKER_HOST selects.
     docker_context: str | None = None
+
+    @classmethod
+    def for_backtest(cls, base: SandboxLimits | None = None) -> SandboxLimits:
+        """The explicit grant this class's docstring asks for.
+
+        A backtest is the strategy that legitimately needs more, saying so.
+        Raising the shared defaults instead would hand every upload the
+        backtester's headroom, which is precisely what the docstring above
+        refuses -- so the smoke path keeps 256m/30s and this is a separate
+        profile.
+
+        `runtime` and `docker_context` are inherited from `base`, never
+        defaulted here: a backtest must be confined exactly as a smoke run
+        is, and naming one without the other yields a run that is confined
+        differently than it claims.
+        """
+        return replace(base or cls(), memory="2048m", timeout_seconds=600.0)
 
 
 @dataclass(frozen=True)

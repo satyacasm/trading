@@ -518,3 +518,34 @@ def test_the_kill_after_a_timeout_targets_the_same_daemon(monkeypatch) -> None: 
     kill = next(c for c in calls if "kill" in c)
     assert kill[:3] == ["docker", "--context", "colima-sandbox"]
     assert kill[3] == "kill"
+
+
+def test_the_backtest_profile_raises_limits_without_moving_the_smoke_defaults() -> None:
+    """`SandboxLimits`' docstring refuses a raised global default: "A strategy
+    that legitimately needs more should say so and be granted it explicitly,
+    rather than every strategy inheriting the headroom the greediest one
+    needed." A backtest is that explicit grant -- so it gets a profile, and
+    the smoke path keeps today's values untouched.
+    """
+    backtest = SandboxLimits.for_backtest()
+    default = SandboxLimits()
+
+    assert int(backtest.memory.rstrip("m")) > int(default.memory.rstrip("m"))
+    assert backtest.timeout_seconds > default.timeout_seconds
+    # The refusal itself: the greediest run must not set everyone's default.
+    assert default.memory == "256m"
+    assert default.timeout_seconds == 30.0
+
+
+def test_the_backtest_profile_inherits_runtime_and_docker_context() -> None:
+    """A backtest must be confined by gVisor wherever a smoke run is.
+
+    `runtime` and `docker_context` are inherited rather than defaulted here
+    because choosing one without the other yields a run confined differently
+    than it claims -- a daemon with runsc installed still defaults to runc.
+    """
+    base = SandboxLimits(runtime="runsc", docker_context="colima-sandbox")
+    profile = SandboxLimits.for_backtest(base)
+
+    assert profile.runtime == "runsc"
+    assert profile.docker_context == "colima-sandbox"

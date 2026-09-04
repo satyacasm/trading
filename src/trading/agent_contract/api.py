@@ -45,15 +45,22 @@ structured report an agent iterates against.
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from psycopg import Connection
 from pydantic import BaseModel, Field
 
 from trading.agent_contract.registry import CONTRACT_VERSION, register_strategy
-from trading.agent_contract.smoke import SmokeVerdict, record_smoke_run, smoke_test
+from trading.agent_contract.smoke import (
+    BacktestVerdict,
+    SmokeVerdict,
+    backtest,
+    record_smoke_run,
+    smoke_test,
+)
 from trading.agent_contract.validation import Finding, ValidationReport, validate_strategy
 from trading.streaming.db import get_db_connection
 
@@ -228,6 +235,96 @@ def upload_strategy(
     )
     record_smoke_run(conn, registered.strategy_id, verdict)
     return _from_verdict(verdict, strategy_id=registered.strategy_id)
+
+
+class BacktestRequest(BaseModel):
+    """The window is the caller's, not the manifest's.
+
+    Defaulting to all available history is deliberately not offered: over
+    585,266 instruments that is a wildly different run from anything a
+    caller likely meant, and a default that expensive should be typed out.
+    """
+
+    start: date
+    end: date
+
+
+class BacktestResponse(BaseModel):
+    """One backtest, or the reason it was refused.
+
+    `equity_curve` is a list of `{ts, equity, cash}` with money as strings,
+    for the reason `RunSummary` gives: JSON has no decimal type, and a curve
+    of subtly wrong equity is worse than no curve.
+    """
+
+    strategy_id: int
+    status: str
+    bars: str | None = None
+    window_start: str | None = None
+    window_end: str | None = None
+    dispatch_from: str | None = None
+    sessions: int | None = None
+    history_bars_requested: int | None = None
+    history_bars_available: int | None = None
+    bar_calls: int | None = None
+    fills: int | None = None
+    final_cash: str | None = None
+    final_equity: str | None = None
+    breaker_reason: str | None = None
+    equity_curve: list[dict[str, str]] = []
+    findings: list[FindingOut] = []
+    runtime: str | None = None
+    kernel_isolated: bool | None = None
+
+
+def _backtest_response(strategy_id: int, verdict: BacktestVerdict) -> BacktestResponse:
+    outcome = verdict.outcome or {}
+    plan = verdict.plan
+    return BacktestResponse(
+        strategy_id=strategy_id,
+        status="PASSED" if verdict.passed else "REFUSED",
+        bars=verdict.bars,
+        window_start=plan.start.isoformat() if plan else None,
+        window_end=plan.end.isoformat() if plan else None,
+        dispatch_from=plan.dispatch_from.isoformat() if plan else None,
+        sessions=plan.sessions if plan else None,
+        history_bars_requested=plan.history_bars_requested if plan else None,
+        history_bars_available=plan.history_bars_available if plan else None,
+        bar_calls=outcome.get("bar_calls"),
+        fills=outcome.get("fills"),
+        final_cash=_as_str(outcome.get("final_cash")),
+        final_equity=_as_str(outcome.get("final_equity")),
+        breaker_reason=outcome.get("breaker_reason"),
+        equity_curve=list(outcome.get("equity_curve") or []),
+        findings=_findings_of(verdict.report),
+        runtime=verdict.runtime,
+        kernel_isolated=verdict.kernel_isolated,
+    )
+
+
+@router.post("/strategies/{strategy_id}/backtests", response_model=BacktestResponse)
+def run_backtest(
+    strategy_id: int,
+    request: BacktestRequest,
+    conn: Annotated[Connection, Depends(get_db_connection)],
+) -> BacktestResponse:
+    """Run a registered version over an operator-chosen window.
+
+    Blocks for the whole run, matching `POST /strategies`. Measured compute
+    is ~2,600 dispatches for a daily decade against a loop that does
+    ~481,000 bars/sec, so the honest expectation is seconds; this module
+    already documents why that is right for one operator and wrong for a
+    queue, and a job queue is not built for a wait that does not exist.
+
+    Plain `def`: psycopg is synchronous, and this shells out to Docker.
+    """
+    try:
+        verdict = backtest(conn, strategy_id, start=request.start, end=request.end)
+    except KeyError:
+        raise HTTPException(
+            status_code=404, detail=f"no strategy with strategy_id={strategy_id}"
+        ) from None
+    return _backtest_response(strategy_id, verdict)
 
 
 class ContractBundle(BaseModel):

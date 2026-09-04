@@ -322,13 +322,32 @@ backtest and sizing every F&O order wrong.
 | Field | Type | Notes |
 |---|---|---|
 | `instrument_id` | int | |
-| `ts` | datetime | UTC. Marks the **start** of the interval |
+| `ts` | datetime | UTC. Marks the **start** of the interval — except for `1d`, see below |
 | `interval_sec` | int | 60, 300, 900, 3600, 86400 |
 | `open`/`high`/`low`/`close` | Decimal | |
 | `volume` | Decimal \| None | |
 | `trades` | int \| None | Trade count in the interval |
 | `open_interest`, `oi_change` | int \| None | F&O |
 | `delivery_qty`, `delivery_pct` | — | Equities, EOD only |
+
+**Exception — `1d` bars carry the session close, not the interval start.**
+
+For every intraday interval (`1m`, `5m`, `15m`, `1h`) `ts` is the start of the
+interval, and the bar becomes knowable one interval later. A daily bar does not
+work that way. It records a whole trading session, and an NSE session is 6h15m
+of market time sitting inside a 24-hour calendar day — so there is no
+interval-start timestamp that adding one day would turn into the close. The
+platform therefore stamps a `1d` bar's `ts` with the **session close**, because
+that is the instant the bar became knowable.
+
+What this means when you write a daily strategy:
+
+- During `on_bar`, `ctx.now` **equals** that bar's `ts` — 15:30 IST on the
+  session the bar describes. It is not the next day, and not the session open.
+- `ts` is still the right thing to key on, compare, and log. The change is what
+  it means, not how you use it.
+- Day-of-week, month-end and holiday logic all read correctly from `ts`
+  directly. You do not need to subtract anything.
 
 ### Tick
 

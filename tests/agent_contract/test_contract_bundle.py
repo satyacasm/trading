@@ -312,3 +312,65 @@ def test_the_documented_OrderUpdate_matches_the_object_strategies_receive() -> N
 
     delivered = _Update(order="sentinel", previous_status="OPEN")  # type: ignore[arg-type]
     assert set(vars(delivered)) == documented
+
+
+def _section_body(section: str) -> str:
+    """The raw prose under a `### <section>` heading, up to the next one."""
+    import trading.agent_contract as pkg
+
+    text = (
+        Path(pkg.__file__).resolve().parents[3] / "docs" / "agent-contract" / "STRATEGY_CONTRACT.md"
+    ).read_text()
+    return text.split(f"### {section}", 1)[1].split("\n### ", 1)[0]
+
+
+def test_the_documented_meaning_of_ts_matches_what_a_daily_run_actually_does() -> None:
+    """Third defect of the shape dogfooding keeps surfacing: prose that is
+    internally coherent and disagrees with the code.
+
+    §5 documented `ts` as the START of the interval, unqualified. For `1d`
+    that is false -- `bars_daily` stamps the row AT the session close (all
+    51,081,227 rows are 10:00 UTC / 15:30 IST) and the runtime deliberately
+    treats it that way, because an NSE session is 6h15m of market time
+    inside a 24-hour calendar interval and no arithmetic on `ts` and
+    `interval_sec` can produce the close.
+
+    A reader following the unqualified rule would place every daily bar
+    6h15m early and mis-time every decision in a daily strategy. The prose
+    is corrected to match the runtime, and this test holds the two together
+    so they cannot drift apart silently again.
+    """
+    from datetime import UTC, datetime
+
+    from trading.runtime.provider import BarRecord
+
+    body = _section_body("Bar")
+    assert "session close" in body.lower(), "§5 must state what ts means for a daily bar"
+    assert "1d" in body or "86400" in body, "§5 must say which interval the exception applies to"
+
+    # The runtime half: a daily bar built the way `_fetch_daily_bars` builds
+    # one reports the session close as its clock, not the next day's.
+    session_close = datetime(2026, 3, 2, 10, 0, tzinfo=UTC)
+    daily = BarRecord(
+        instrument_id=1,
+        ts=session_close,
+        interval_sec=86400,
+        open=Decimal("1"),
+        high=Decimal("1"),
+        low=Decimal("1"),
+        close=Decimal("1"),
+        knowable_at=session_close,
+    )
+    assert daily.close_ts == session_close
+
+    # And the rule the document still states for every other interval.
+    intraday = BarRecord(
+        instrument_id=1,
+        ts=session_close,
+        interval_sec=60,
+        open=Decimal("1"),
+        high=Decimal("1"),
+        low=Decimal("1"),
+        close=Decimal("1"),
+    )
+    assert intraday.close_ts == datetime(2026, 3, 2, 10, 1, tzinfo=UTC)

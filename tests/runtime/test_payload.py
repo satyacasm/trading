@@ -122,3 +122,69 @@ def test_the_payload_default_matches_the_registry_contract_version() -> None:
     from trading.agent_contract.registry import CONTRACT_VERSION
 
     assert SmokePayload(mode="smoke", source="x").contract_version == CONTRACT_VERSION
+
+
+def test_knowable_at_survives_the_payload_round_trip() -> None:
+    """The strategy runs INSIDE the container, rebuilt by `decode_payload`.
+
+    A `knowable_at` that the codec drops leaves the container deriving
+    `ts + 86400` again -- so the daily-clock fix would pass every host-side
+    test while being absent from the only process that computes charges and
+    dispatches `on_bar`. That is the failure mode this test exists for, and
+    it is invisible to any test that does not cross the wire.
+    """
+    ts = datetime(2026, 3, 2, 10, 0, tzinfo=UTC)
+    daily = BarRecord(
+        instrument_id=1,
+        ts=ts,
+        interval_sec=86400,
+        open=Decimal("100"),
+        high=Decimal("101"),
+        low=Decimal("99"),
+        close=Decimal("100.5"),
+        knowable_at=ts,
+    )
+    intraday = BarRecord(
+        instrument_id=2,
+        ts=ts,
+        interval_sec=60,
+        open=Decimal("10"),
+        high=Decimal("10"),
+        low=Decimal("10"),
+        close=Decimal("10"),
+    )
+
+    decoded = decode_payload(
+        encode_payload(SmokePayload(mode="smoke", source="x", bars={1: (daily,), 2: (intraday,)}))
+    )
+
+    assert decoded.bars[1][0].knowable_at == ts
+    assert decoded.bars[1][0].close_ts == ts
+    # An intraday bar sets nothing and keeps the arithmetic it always had.
+    assert decoded.bars[2][0].knowable_at is None
+    assert decoded.bars[2][0].close_ts == datetime(2026, 3, 2, 10, 1, tzinfo=UTC)
+
+
+def test_dispatch_from_survives_the_payload_round_trip() -> None:
+    """Warm-up is decided on the host and executed in the container, so
+    `dispatch_from` has to cross the envelope like the bars do.
+
+    Third boundary this sub-project crosses, and the second that is
+    hand-written: `asdict` carries new RunOutcome fields OUT of the container
+    for free, but everything going IN is encoded field by field. A
+    `dispatch_from` that stops at the host leaves the container dispatching
+    every warm-up bar as a real event -- the run silently starts earlier than
+    the caller asked, with no error anywhere.
+    """
+    ts = datetime(2026, 3, 5, 10, 0, tzinfo=UTC)
+    decoded = decode_payload(
+        encode_payload(SmokePayload(mode="smoke", source="x", dispatch_from=ts))
+    )
+    assert decoded.dispatch_from == ts
+
+
+def test_dispatch_from_defaults_to_none_for_a_payload_that_omits_it() -> None:
+    """Warm-up is opt-in: an envelope without it must dispatch everything,
+    exactly as every payload did before this field existed."""
+    decoded = decode_payload(encode_payload(SmokePayload(mode="smoke", source="x")))
+    assert decoded.dispatch_from is None

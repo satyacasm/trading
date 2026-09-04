@@ -37,15 +37,31 @@ class BarRecord:
     trades: int | None = None
     open_interest: int | None = None
     oi_change: int | None = None
+    # Set only where the interval's arithmetic cannot produce the answer.
+    # A daily bar's row is stamped AT the session close, and an NSE session
+    # is 6h15m of market time inside a 24-hour calendar interval, so
+    # `ts + 86400` never lands on the close for any choice of `ts`.
+    knowable_at: datetime | None = None
 
     @property
     def close_ts(self) -> datetime:
         """When this bar's values became knowable.
 
-        `ts` marks the START of the interval (contract §5), so a clock set
-        to `ts` while reading `close` would be reading the future. The loop
+        For an intraday bar `ts` marks the START of the interval (contract
+        §5), so a clock set to `ts` while reading `close` would be reading
+        the future, and `ts + interval_sec` is exactly right. The loop
         advances to `close_ts` instead.
+
+        A daily bar is not an interval in that sense. Its row is stamped at
+        the session close and the session is shorter than the calendar day
+        containing it, so no arithmetic on `ts` and `interval_sec` yields
+        the close -- the fetch path states it via `knowable_at`. Deriving
+        it there instead put the clock a full day ahead: a strategy reading
+        `ctx.now` saw tomorrow's date, and every timestamp the run emitted
+        (an order's `submitted_at`, the equity curve) carried the same lag.
         """
+        if self.knowable_at is not None:
+            return self.knowable_at
         return self.ts + timedelta(seconds=self.interval_sec)
 
 

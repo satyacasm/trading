@@ -26,6 +26,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from tests.agent_contract.conftest import VALID_SOURCE
 from trading.agent_contract.api import router
 from trading.streaming.db import get_db_connection
 
@@ -284,3 +285,96 @@ def test_the_response_carries_the_money_as_strings_not_json_numbers(client) -> N
 
     raw = jsonlib.loads(response.text)
     assert "summary" in raw
+
+
+def test_a_backtest_for_an_unknown_strategy_is_404(client) -> None:  # noqa: ANN001
+    """`get_strategy` raises KeyError for a missing row -- "a caller bug, not
+    an empty result". The route has to turn that into a 404 rather than a
+    500, because asking to backtest a strategy that was never registered is
+    a perfectly ordinary client mistake."""
+    response = client.post(
+        "/strategies/99999999/backtests", json={"start": "2024-01-01", "end": "2024-03-01"}
+    )
+    assert response.status_code == 404
+    # Not the vacuous 404 an unrouted path returns: the handler ran, looked,
+    # and is naming what it could not find. Without this assertion the test
+    # passes before the route exists at all.
+    assert "99999999" in response.json()["detail"]
+
+
+def test_a_backtest_refuses_an_uncovered_window_before_running_anything(
+    client,  # noqa: ANN001
+    db_conn,  # noqa: ANN001
+    local_user_id,  # noqa: ANN001
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    """The pre-flight gate has to bite at the route, not just in isolation.
+
+    The strategy is registered WITH a manifest on purpose. Registered
+    without one, `backtest` falls back to running `configure()` in a
+    container and refuses with MANIFEST_UNRESOLVABLE long before the gate --
+    so a test asserting only that *some* finding came back would pass
+    without the coverage check ever running. Assert the code.
+    """
+    from datetime import UTC, datetime
+
+    from trading.agent_contract import smoke as smoke_mod
+    from trading.agent_contract.registry import register_strategy
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','ROUTEGATE','INR',"
+        "'ACTIVE','NSE:CM:ROUTEGATE') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for day in (2, 3, 4):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, datetime(2024, 1, day, 10, 0, tzinfo=UTC)),
+        )
+
+    registered = register_strategy(
+        db_conn,
+        user_id=local_user_id,
+        name="route-gate-fixture",
+        version="1.0.0",
+        source=VALID_SOURCE,
+        manifest={
+            "name": "route-gate-fixture",
+            "version": "1.0.0",
+            "capital": "100000",
+            "base_currency": "INR",
+            "universe": [{"exchange": "NSE", "segment": "CM", "symbol": "ROUTEGATE"}],
+            "data": {"bars": "1d", "history_bars": 0},
+        },
+    )
+
+    started: list[object] = []
+    monkeypatch.setattr(smoke_mod, "run_smoke_in_sandbox", lambda *a, **k: started.append(a))
+
+    response = client.post(
+        f"/strategies/{registered.strategy_id}/backtests",
+        json={"start": "2024-01-02", "end": "2026-12-31"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "REFUSED"
+    codes = [f["code"] for f in body["findings"]]
+    assert "BACKTEST_WINDOW_UNCOVERED" in codes, codes
+    # The refusal names both ends, so the caller can act without reading source.
+    message = next(
+        f["message"] for f in body["findings"] if f["code"] == "BACKTEST_WINDOW_UNCOVERED"
+    )
+    assert "2024-01-04" in message and "2026-12-31" in message
+    assert started == [], "nothing may be executed once the run is refused"
+
+
+def test_the_backtest_route_is_not_a_coroutine() -> None:
+    """C2: psycopg is synchronous and an async route running a blocking DB
+    call on the event loop deadlocked this gateway permanently once already.
+    This route also shells out to Docker for seconds at a time."""
+    from trading.agent_contract.api import run_backtest
+
+    assert not inspect.iscoroutinefunction(run_backtest)

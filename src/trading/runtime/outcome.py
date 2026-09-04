@@ -45,3 +45,6 @@ class RunOutcome:
     logs: tuple[dict[str, Any], ...] = ()
     error: str | None = None
     crashed_at: dict[str, Any] | None = None
+    # One point per dispatched bar. Present on the crash path too: a
+    # partial curve is evidence about where a run died, not noise.
+    equity_curve: tuple[dict[str, str], ...] = ()

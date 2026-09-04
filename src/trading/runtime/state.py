@@ -42,3 +42,9 @@ class RunState:
     day_open_equity: Decimal | None = None
     peak_equity: Decimal | None = None
     breaker_reason: str | None = None
+    # One (ts, equity, cash) triple per dispatched bar, appended where the
+    # breaker already evaluates equity so the two can never disagree.
+    # Money as strings for the reason outcome.py gives: JSON numbers are
+    # IEEE 754 doubles, and a curve of subtly wrong equity is worse than
+    # no curve.
+    equity_curve: list[dict[str, str]] = field(default_factory=list)

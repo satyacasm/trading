@@ -1,5 +1,6 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from trading.paper.breaker import REASON_MAX_DAILY_LOSS
 from trading.paper.enums import (
@@ -331,6 +332,59 @@ def test_a_position_reversal_reprices_avg_cost_at_the_new_fill_not_the_old_one()
     assert position.quantity == Decimal("0")
     assert position.avg_cost == Decimal("0")
     assert position.realised_pnl == Decimal("200")
+
+
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _daily_bar(instrument_id: int, ts: datetime, price: str) -> BarRecord:
+    """A `bars_daily` row exactly as stored: `ts` IS the session close.
+
+    Verified against the table -- every row is 10:00 UTC / 15:30 IST. The
+    interval is a calendar day but an NSE session is 6h15m inside it, so no
+    arithmetic on `ts` and `interval_sec` can produce the close; the fetch
+    path states it via `knowable_at` instead.
+    """
+    return BarRecord(
+        instrument_id=instrument_id,
+        ts=ts,
+        interval_sec=86400,
+        open=Decimal(price),
+        high=Decimal(price),
+        low=Decimal(price),
+        close=Decimal(price),
+        volume=Decimal("100"),
+        knowable_at=ts,
+    )
+
+
+def test_a_daily_bar_gives_the_strategy_the_session_close_as_its_clock() -> None:
+    """Deriving `close_ts` as `ts + 86400` hands a daily strategy a clock
+    reading the NEXT day, so month-end, day-of-week and holiday logic are all
+    wrong and the strategy cannot tell it. Every timestamp the run emits --
+    an order's `submitted_at`, and the equity curve -- inherits the same lag.
+
+    Not a DP charge bug: `ts + 86400` is injective on dates, so the count of
+    scrip-day keys is unchanged. Probed before this test was written.
+    """
+    session_close = datetime(2026, 3, 2, 10, 0, tzinfo=UTC)  # 15:30 IST
+    seen: list[datetime] = []
+
+    class RecordsClock:
+        def on_bar(self, ctx, bars) -> None:  # noqa: ANN001, ARG002
+            seen.append(ctx.now)
+
+    outcome = run_loop(
+        strategy=RecordsClock(),
+        bars=InMemoryBars({1: (_daily_bar(1, session_close, "100"),)}),
+        schedules=(),
+        starting_cash=Decimal("100000"),
+        slippage_bps=Decimal("0"),
+    )
+
+    assert outcome.ok, outcome.error
+    assert seen == [session_close]
+    assert seen[0].astimezone(_IST).date() == date(2026, 3, 2)
 
 
 def _bar(instrument_id: int, ts: datetime, price: str) -> BarRecord:
@@ -671,3 +725,122 @@ def test_dp_charge_is_suppressed_on_a_second_same_day_sell() -> None:
     assert outcome.fills == 3
     assert outcome.final_cash == "99910.00"
     assert outcome.final_equity == "99910.00"
+
+
+def test_the_curve_records_the_same_equity_the_breaker_latched_on() -> None:
+    """D3b-2's claim is that a drawdown drawn from the curve and a breaker
+    latch recorded in the same run *cannot* disagree, because they are one
+    number read once rather than two mark-to-market implementations. That is
+    only enforceable if something asserts the equality, so this does.
+
+    Reconstructing the curve outside the loop -- from returned fills, say --
+    is the alternative that makes this test impossible to write honestly: a
+    second implementation can drift from the one that actually stopped the
+    run, in a platform whose headline feature is an honest cost model.
+    """
+
+    class BuyAndHold:
+        def __init__(self) -> None:
+            self.done = False
+
+        def on_bar(self, ctx, bars) -> None:  # noqa: ANN001
+            if not self.done:
+                self.done = True
+                ctx.order(1, side="BUY", quantity=Decimal("100"), rationale="entry")
+
+    outcome = run_loop(
+        strategy=BuyAndHold(),
+        bars=InMemoryBars({1: _series(1, ["100", "100", "10"])}),
+        schedules=_schedules(),
+        starting_cash=Decimal("100000"),
+        slippage_bps=Decimal("0"),
+        max_daily_loss=Decimal("1000"),
+    )
+
+    assert outcome.breaker_reason is not None
+    assert outcome.equity_curve, "a run that dispatched bars must have a curve"
+    # One point per dispatched bar, and the last one is the equity the
+    # breaker stopped on -- the same read, not a recomputation.
+    assert len(outcome.equity_curve) == outcome.bar_calls
+    assert outcome.equity_curve[-1]["equity"] == outcome.final_equity
+    # Money as strings, like every other monetary field in RunOutcome:
+    # JSON numbers are IEEE 754 doubles and a curve of subtly wrong equity
+    # is worse than no curve at all.
+    assert all(isinstance(point["equity"], str) for point in outcome.equity_curve)
+    assert all(isinstance(point["cash"], str) for point in outcome.equity_curve)
+
+
+def test_the_curve_carries_the_loop_clock_so_a_daily_run_is_dated_by_session() -> None:
+    """The curve's `ts` is the loop's clock, which after the daily-clock fix
+    is the session close. A curve stamped `ts + 86400` would place every
+    point a day after the session it describes, and 3c persists these.
+    """
+    closes = [
+        datetime(2026, 3, 2, 10, 0, tzinfo=UTC),
+        datetime(2026, 3, 3, 10, 0, tzinfo=UTC),
+    ]
+    outcome = run_loop(
+        strategy=_Recorder(),
+        bars=InMemoryBars({1: tuple(_daily_bar(1, ts, "100") for ts in closes)}),
+        schedules=(),
+        starting_cash=Decimal("100000"),
+        slippage_bps=Decimal("0"),
+    )
+    assert [point["ts"] for point in outcome.equity_curve] == [ts.isoformat() for ts in closes]
+
+
+def test_warm_up_populates_history_without_dispatching_early() -> None:
+    """`DataRequest.history_bars` is declared in `platform_sdk.py`,
+    constrained in `schema.json`, documented in the contract -- and read by
+    no code. A strategy declaring `history_bars=200` and calling
+    `ctx.data.bars(id, count=200)` in its first `on_bar` got whatever
+    happened to exist, which for a run starting at the window's first bar is
+    nothing.
+
+    Warm-up does not mean dispatching `on_bar` early. It means the lookback
+    API is already populated when the first `on_bar` fires. Both halves are
+    asserted here because either one passing alone while the other breaks is
+    the failure mode: history without a moved start looks identical to a
+    correct run until you check `bar_calls`.
+    """
+    first = datetime(2026, 3, 2, 10, 0, tzinfo=UTC)
+    warm = [_daily_bar(1, first + timedelta(days=i), "100") for i in range(10)]
+    live = [_daily_bar(1, first + timedelta(days=10 + i), "101") for i in range(3)]
+
+    class RecordsFirstDispatch:
+        def __init__(self) -> None:
+            self.first_ts: datetime | None = None
+            self.history_len: int | None = None
+
+        def on_bar(self, ctx, bars) -> None:  # noqa: ANN001, ARG002
+            if self.first_ts is None:
+                self.first_ts = ctx.now
+                self.history_len = len(ctx.data.bars(1, count=50))
+
+    strategy = RecordsFirstDispatch()
+    outcome = run_loop(
+        strategy=strategy,
+        bars=InMemoryBars({1: tuple(warm + live)}),
+        schedules=(),
+        starting_cash=Decimal("100000"),
+        slippage_bps=Decimal("0"),
+        dispatch_from=live[0].close_ts,
+    )
+
+    assert outcome.ok, outcome.error
+    # Dispatch began at the requested start, not 10 bars earlier.
+    assert strategy.first_ts == live[0].close_ts
+    assert outcome.bar_calls == 3
+    # ...and the warm-up bars were already closed history at that first call.
+    assert strategy.history_len == 10
+    # The curve describes the dispatched run only -- warm-up is not the
+    # experiment, and equity before the run started is not a data point.
+    assert len(outcome.equity_curve) == 3
+
+
+def test_without_dispatch_from_every_bar_is_dispatched_as_before() -> None:
+    """The vacuity guard: `dispatch_from=None` must leave every existing run
+    behaving exactly as it did, warm-up being opt-in."""
+    outcome = _run(_Recorder(), InMemoryBars({1: _series(1, ["10", "11", "12"])}))
+    assert outcome.bar_calls == 3
+    assert len(outcome.equity_curve) == 3

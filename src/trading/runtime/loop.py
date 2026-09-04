@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import traceback
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -197,6 +197,7 @@ def run_loop(
     slippage_bps: Decimal,
     max_daily_loss: Decimal | None = None,
     max_drawdown_pct: Decimal | None = None,
+    dispatch_from: datetime | None = None,
 ) -> RunOutcome:
     state = RunState(
         now=None,  # type: ignore[arg-type]  # set before any handler runs
@@ -232,16 +233,44 @@ def run_loop(
             reported[order_id] = order.status
 
     try:
-        first_ts = next(iter(bars.groups()), None)
-        if first_ts is None:
+        # The first timestamp the strategy will actually experience. With
+        # warm-up in play that is not the first bar in the payload: the
+        # earlier ones are history it may read, not events it lives through,
+        # and calling `initialize` at a warm-up timestamp would start the
+        # clock before the run the caller asked for.
+        first_dispatched = next(
+            (
+                group_ts
+                for group_ts, _ in bars.groups()
+                if dispatch_from is None or group_ts >= dispatch_from
+            ),
+            None,
+        )
+        if first_dispatched is None:
             raise _Crash("initialize", "", "no bars were provided to the run")
-        state.now = first_ts[0]
+        state.now = first_dispatched
         _call(strategy, "initialize", state.now.isoformat(), ctx)
 
         current_ist_day: date | None = None
         for close_ts, indexed in bars.indexed_groups():
             state.now = close_ts
             ts_iso = close_ts.isoformat()
+
+            if dispatch_from is not None and close_ts < dispatch_from:
+                # Warm-up. This bar is history the strategy may read, not an
+                # event it experiences: no handler is called, no resting
+                # order is priced against it (there are none, and inventing
+                # them would be the lookahead the cursor exists to prevent),
+                # no day rolls, and no curve point is recorded -- equity
+                # before the run began is not a data point about the run.
+                # The cursor still advances, which is precisely what makes
+                # these bars readable through `ctx.data.bars()` at the first
+                # real dispatch.
+                for warm_bar, _index in indexed:
+                    state.marks[warm_bar.instrument_id] = warm_bar.close
+                for warm_bar, index in indexed:
+                    state.cursor[warm_bar.instrument_id] = index + 1
+                continue
 
             # Roll day_open_equity at the IST calendar boundary -- see
             # the module docstring. Read equity *before* this bar's own
@@ -338,6 +367,14 @@ def run_loop(
             # as unset by a truthy-style fallback (see the module's
             # calling brief; both are always Decimal by this point).
             equity = ctx.portfolio.equity
+            # The breaker's own number, recorded rather than recomputed. A
+            # second mark-to-market outside this loop could drift from the
+            # one that actually stopped the run, so a drawdown drawn from
+            # this curve and a breaker latch in the same run are the same
+            # read by construction, not by agreement.
+            state.equity_curve.append(
+                {"ts": ts_iso, "equity": str(equity), "cash": str(state.cash)}
+            )
             peak_equity = equity if state.peak_equity is None else max(state.peak_equity, equity)
             state.peak_equity = peak_equity
             if state.day_open_equity is None:
@@ -376,6 +413,7 @@ def run_loop(
             logs=tuple(state.logs),
             error=crash.detail,
             crashed_at={"handler": crash.handler, "ts": crash.ts, "bar_calls": state.bar_calls},
+            equity_curve=tuple(state.equity_curve),
         )
 
     return RunOutcome(
@@ -388,4 +426,5 @@ def run_loop(
         final_equity=str(ctx.portfolio.equity),
         breaker_reason=state.breaker_reason,
         logs=tuple(state.logs),
+        equity_curve=tuple(state.equity_curve),
     )

@@ -1016,3 +1016,308 @@ def test_smoke_test_reports_an_invalid_bar_interval_without_running_the_smoke_co
     assert verdict.passed is False
     assert [f.code for f in verdict.report.findings] == ["MANIFEST_UNRESOLVABLE"]
     assert "2m" in verdict.as_agent_feedback()
+
+
+@pytest.mark.db
+def test_daily_fetch_stamps_knowable_at_with_the_session_close(db_conn) -> None:  # noqa: ANN001
+    """The link between the `close_ts` fix and production.
+
+    `BarRecord.close_ts` stops deriving only when `knowable_at` is set, and
+    `_fetch_daily_bars` is the one place that sets it for real data. Drop
+    that single keyword and every runtime test still passes while every real
+    daily backtest silently runs a day ahead again -- so it is asserted here,
+    against a row seeded the way production actually stores one.
+
+    Note the timestamp: all 51,081,227 `bars_daily` rows are at 10:00 UTC
+    (15:30 IST), without exception. Seeding a bare `date` -- as the older
+    fixtures in this file do -- yields midnight UTC, which is 05:30 IST,
+    before the session opens. Production has never held such a row.
+    """
+    from datetime import UTC, datetime
+
+    from trading.agent_contract.smoke import fetch_bars
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','DAILYCLOCK','INR',"
+        "'ACTIVE','NSE:CM:DAILYCLOCK') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    closes = [
+        datetime(2024, 1, 8, 10, 0, tzinfo=UTC),
+        datetime(2024, 1, 9, 10, 0, tzinfo=UTC),
+    ]
+    for session_close in closes:
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, session_close),
+        )
+
+    window = {
+        "start": "2024-01-08T00:00:00+00:00",
+        "end": "2024-01-09T23:59:59.999999+00:00",
+        "sessions": 2,
+        "instruments": {},
+    }
+    bars = fetch_bars(db_conn, [instrument_id], window, interval_sec=86400)
+
+    fetched = bars[instrument_id]
+    assert [b.knowable_at for b in fetched] == closes
+    # The clock the strategy actually runs on: the session close itself,
+    # never ts + 86400 (which would be the NEXT session's close).
+    assert [b.close_ts for b in fetched] == closes
+
+
+@pytest.mark.db
+def test_plan_backtest_widens_the_window_by_the_history_the_manifest_asked_for(db_conn) -> None:  # noqa: ANN001
+    """`history_bars` was declared in `platform_sdk.py`, constrained in
+    `schema.json`, documented in the contract -- and read by no code. A
+    strategy asking for 200 bars of warm-up got whatever happened to exist,
+    which at a window's first bar is nothing.
+
+    Warm-up is served by widening the *fetch* while leaving dispatch at the
+    caller's `start`, so the plan carries both: the widened `start` the bars
+    come from, and the `dispatch_from` the run actually begins at.
+    """
+    from datetime import UTC, date, datetime
+
+    from trading.agent_contract.smoke import plan_backtest
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','WARMUP','INR',"
+        "'ACTIVE','NSE:CM:WARMUP') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    # 6 sessions before the requested start, 3 within it.
+    for day in range(1, 10):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, datetime(2024, 1, day, 10, 0, tzinfo=UTC)),
+        )
+
+    plan = plan_backtest(
+        db_conn,
+        {"data": {"bars": "1d", "history_bars": 4}},
+        [instrument_id],
+        start=date(2024, 1, 7),
+        end=date(2024, 1, 9),
+    )
+
+    # Dispatch begins where the caller asked, never at the widened start.
+    assert plan.dispatch_from.date() == date(2024, 1, 7)
+    # ...and the fetch reaches back the requested number of SESSIONS.
+    assert plan.start.date() == date(2024, 1, 3)
+    assert plan.history_bars_requested == 4
+    assert plan.history_bars_available == 4
+
+
+@pytest.mark.db
+def test_plan_backtest_reports_a_history_shortfall_rather_than_running_quietly(db_conn) -> None:  # noqa: ANN001
+    """A strategy warmed on 2 of the 200 bars it asked for is a different
+    experiment from the one requested, and must not be reported as the one
+    requested."""
+    from datetime import UTC, date, datetime
+
+    from trading.agent_contract.smoke import plan_backtest
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','SHORTHIST','INR',"
+        "'ACTIVE','NSE:CM:SHORTHIST') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for day in (5, 6, 7, 8):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, datetime(2024, 1, day, 10, 0, tzinfo=UTC)),
+        )
+
+    plan = plan_backtest(
+        db_conn,
+        {"data": {"bars": "1d", "history_bars": 200}},
+        [instrument_id],
+        start=date(2024, 1, 7),
+        end=date(2024, 1, 8),
+    )
+
+    assert plan.history_bars_requested == 200
+    assert plan.history_bars_available == 2
+
+
+@pytest.mark.db
+def test_plan_backtest_refuses_an_oversized_run_without_fetching_a_bar(
+    db_conn, monkeypatch
+) -> None:  # noqa: ANN001
+    """The ceiling is decoded container memory, not wire size. Materialising
+    five million rows to learn they do not fit spends exactly the cost this
+    gate exists to avoid -- and an OOM inside the container surfaces as
+    `SMOKE_OOM`, which would tell an operator their strategy crashed when in
+    fact their request was too big.
+
+    A gate that refuses *after* fetching passes a naive assertion on the
+    finding code alone, so this also asserts nothing was fetched.
+    """
+    from datetime import UTC, date, datetime
+
+    from trading.agent_contract import smoke as smoke_mod
+    from trading.agent_contract.sandbox import SandboxLimits
+
+    fetched: list[object] = []
+    monkeypatch.setattr(smoke_mod, "fetch_bars", lambda *a, **k: fetched.append(a) or {})
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','TOOBIG','INR',"
+        "'ACTIVE','NSE:CM:TOOBIG') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for day in range(1, 21):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, datetime(2024, 1, day, 10, 0, tzinfo=UTC)),
+        )
+
+    # A WIDE universe is the realistic oversized case: 200 instruments over
+    # the 20 sessions that exist is ~4,000 decoded BarRecords, against the
+    # 2,000-bar ceiling a 1m run affords. Only one of the ids has bars --
+    # the estimate is over the universe the caller DECLARED, which is the
+    # whole point of estimating rather than discovering.
+    universe = [instrument_id, *range(900_000, 900_199)]
+    plan = smoke_mod.plan_backtest(
+        db_conn,
+        {"data": {"bars": "1d", "history_bars": 0}},
+        universe,
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 20),
+        limits=SandboxLimits(memory="1m"),
+    )
+
+    finding = next(f for f in plan.findings if f.code == "BACKTEST_TOO_LARGE")
+    # Names the estimate, the ceiling, and the two levers -- an agent has to
+    # be able to act on it without reading this source.
+    assert "narrow" in finding.message.lower()
+    assert "shorten" in finding.message.lower()
+    assert fetched == []
+
+
+@pytest.mark.db
+def test_plan_backtest_names_a_window_that_runs_past_the_data(db_conn) -> None:  # noqa: ANN001
+    """`bars_daily` ends 2026-08-21. A backtest asked for a window through
+    "today" would otherwise run on weeks of nothing and report a flat tail as
+    a fact about the market -- the same silent-wrong-data failure 3a exists
+    to eliminate, one layer up.
+    """
+    from datetime import UTC, date, datetime
+
+    from trading.agent_contract.smoke import plan_backtest
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','SHORTDATA','INR',"
+        "'ACTIVE','NSE:CM:SHORTDATA') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for day in (2, 3, 4):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, datetime(2024, 1, day, 10, 0, tzinfo=UTC)),
+        )
+
+    plan = plan_backtest(
+        db_conn,
+        {"data": {"bars": "1d", "history_bars": 0}},
+        [instrument_id],
+        start=date(2024, 1, 2),
+        end=date(2024, 6, 30),
+    )
+
+    finding = next(f for f in plan.findings if f.code == "BACKTEST_WINDOW_UNCOVERED")
+    assert "2024-01-04" in finding.message  # where the data actually ends
+    assert "2024-06-30" in finding.message  # where the caller asked to run to
+    assert plan.data_end == date(2024, 1, 4)
+
+
+@pytest.mark.db
+def test_the_bar_ceiling_moves_with_the_run_memory_it_is_derived_from(db_conn) -> None:  # noqa: ANN001
+    """The ceiling is configuration derived from the run's memory limit, not
+    a literal guessed beside it -- one number moving with the other, so the
+    two cannot drift into disagreeing."""
+    from trading.agent_contract.sandbox import SandboxLimits
+    from trading.agent_contract.smoke import bar_ceiling
+
+    assert bar_ceiling(SandboxLimits(memory="2048m")) > bar_ceiling(SandboxLimits(memory="256m"))
+
+
+@pytest.mark.db
+def test_a_backtest_whose_run_fails_says_why(db_conn, local_user_id, monkeypatch) -> None:  # noqa: ANN001
+    """A crashed run must carry a reason the caller can act on.
+
+    Found live: a 1,647-session backtest came back `REFUSED` with an empty
+    `findings` list and no message anywhere, because the failure lived in
+    `outcome["error"]` and nothing lifted it out. "Refused, no reason" is
+    the least actionable thing this platform can say, and it is exactly what
+    an operator sees the first time a real run dies.
+    """
+    from datetime import UTC, date, datetime
+
+    from tests.agent_contract.conftest import VALID_SOURCE
+    from trading.agent_contract import smoke as smoke_mod
+    from trading.agent_contract.registry import register_strategy
+    from trading.agent_contract.sandbox import SandboxResult
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','RUNFAIL','INR',"
+        "'ACTIVE','NSE:CM:RUNFAIL') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for day in (2, 3, 4):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, datetime(2024, 1, day, 10, 0, tzinfo=UTC)),
+        )
+
+    registered = register_strategy(
+        db_conn,
+        user_id=local_user_id,
+        name="run-fail-fixture",
+        version="1.0.0",
+        source=VALID_SOURCE,
+        manifest={
+            "name": "run-fail-fixture",
+            "version": "1.0.0",
+            "capital": "100000",
+            "base_currency": "INR",
+            "universe": [{"exchange": "NSE", "segment": "CM", "symbol": "RUNFAIL"}],
+            "data": {"bars": "1d", "history_bars": 0},
+        },
+    )
+
+    monkeypatch.setattr(
+        smoke_mod,
+        "run_smoke_in_sandbox",
+        lambda *a, **k: SandboxResult(
+            ok=False,
+            stage="killed",
+            runtime="runsc",
+            kernel_isolated=True,
+            error="container was OOM-killed",
+        ),
+    )
+
+    verdict = smoke_mod.backtest(
+        db_conn, registered.strategy_id, start=date(2024, 1, 2), end=date(2024, 1, 4)
+    )
+
+    assert verdict.passed is False
+    codes = [f.code for f in verdict.report.findings]
+    assert "BACKTEST_RUN_FAILED" in codes, codes
+    message = next(f.message for f in verdict.report.findings if f.code == "BACKTEST_RUN_FAILED")
+    assert "OOM" in message or "SMOKE_OOM" in message

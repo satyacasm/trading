@@ -37,7 +37,7 @@ from typing import Any
 
 from psycopg import Connection
 
-from trading.agent_contract.registry import CONTRACT_VERSION
+from trading.agent_contract.registry import CONTRACT_VERSION, get_strategy
 from trading.agent_contract.sandbox import (
     SandboxLimits,
     SandboxResult,
@@ -408,6 +408,11 @@ def _fetch_daily_bars(
                     low=row["low"],
                     close=row["close"],
                     volume=None if row["volume"] is None else Decimal(row["volume"]),
+                    # bars_daily.ts IS the session close -- verified against
+                    # the table, every row is 10:00 UTC / 15:30 IST. That is a
+                    # fact about the session, not an arithmetic consequence of
+                    # the interval, so it is stated rather than derived.
+                    knowable_at=row["ts"],
                 )
             )
     window["instruments"] = {str(k): {"bars": len(v)} for k, v in series.items()}
@@ -900,3 +905,343 @@ def record_smoke_run(conn: Connection, strategy_id: int, verdict: SmokeVerdict) 
     if row is None:  # pragma: no cover - RETURNING on INSERT always yields a row
         raise RuntimeError("the smoke run insert returned no row")
     return int(row[0])
+
+
+_HISTORY_SESSIONS_SQL = """
+    SELECT DISTINCT ts::date AS session_date
+    FROM bars_daily
+    WHERE instrument_id = ANY(%s) AND ts::date < %s
+    ORDER BY session_date DESC
+    LIMIT %s
+"""
+
+
+_WINDOW_COVERAGE_SQL = """
+    SELECT
+        count(DISTINCT ts::date) FILTER (WHERE ts::date BETWEEN %s AND %s) AS sessions,
+        min(ts::date) AS data_start,
+        max(ts::date) AS data_end
+    FROM bars_daily
+    WHERE instrument_id = ANY(%s)
+"""
+
+# Bars per megabyte of decoded container memory. A `BarRecord` of Decimals
+# costs far more than its wire form -- `payload.py` notes ~10:1 on gzipped
+# numeric text -- so this is deliberately conservative and measured against
+# the decoded object, which is what actually has to fit.
+_BARS_PER_MB = 2_000
+
+
+def bar_ceiling(limits: SandboxLimits) -> int:
+    """How many bars fit the run's memory limit.
+
+    Derived from `limits.memory` rather than guessed beside it: a raised
+    backtest profile lifts the ceiling automatically, and the two numbers
+    cannot drift into disagreeing about what fits.
+    """
+    return int(int(limits.memory.rstrip("m")) * _BARS_PER_MB)
+
+
+@dataclass(frozen=True)
+class BacktestPlan:
+    """Everything decided about a backtest *before* a single bar is fetched.
+
+    One object rather than three functions because widening for warm-up,
+    estimating size, and checking coverage are all facts about the same
+    request, established by queries over the same window -- three callers
+    would each re-ask it.
+
+    `start` is where bars are fetched from; `dispatch_from` is where the run
+    begins. They differ by exactly the warm-up the manifest asked for, which
+    is the whole of D3b-3: warm-up populates the lookback, it does not move
+    the experiment.
+    """
+
+    start: datetime
+    end: datetime
+    dispatch_from: datetime
+    history_bars_requested: int
+    history_bars_available: int
+    instruments: int = 0
+    sessions: int = 0
+    estimated_bars: int = 0
+    data_start: date | None = None
+    data_end: date | None = None
+    findings: tuple[Finding, ...] = ()
+
+
+def plan_backtest(
+    conn: Connection,
+    manifest: dict[str, Any],
+    instrument_ids: Sequence[int],
+    *,
+    start: date,
+    end: date,
+    limits: SandboxLimits | None = None,
+) -> BacktestPlan:
+    """Pre-flight a backtest: widen for warm-up, and report any shortfall.
+
+    `history_bars` is counted in **sessions**, not calendar days -- a
+    strategy asking for 200 bars wants 200 prints, and subtracting 200 days
+    would hand it roughly 138 over a weekend-bearing window.
+
+    A shortfall is reported rather than silently accepted: a strategy warmed
+    on 40 of the 200 bars it asked for is a different experiment from the one
+    requested, and reporting it as the requested one is the same class of
+    silent-wrong-data failure that 3a exists to eliminate.
+    """
+    data = manifest.get("data")
+    requested = data.get("history_bars", 100) if isinstance(data, dict) else 100
+    requested = int(requested)
+
+    rows = conn.execute(_HISTORY_SESSIONS_SQL, (list(instrument_ids), start, requested)).fetchall()
+    available_days = sorted(row[0] for row in rows)
+
+    dispatch_from = datetime.combine(start, time.min, tzinfo=UTC)
+    fetch_start = (
+        datetime.combine(available_days[0], time.min, tzinfo=UTC)
+        if available_days
+        else dispatch_from
+    )
+
+    # One query answers both remaining questions: how big the run is, and
+    # whether the window is covered at all. Neither fetches a bar.
+    row = conn.execute(_WINDOW_COVERAGE_SQL, (start, end, list(instrument_ids))).fetchone()
+    sessions = int(row[0] or 0) if row else 0
+    data_start = row[1] if row else None
+    data_end = row[2] if row else None
+
+    instruments = len(set(instrument_ids))
+    estimated = instruments * (sessions + len(available_days))
+    ceiling = bar_ceiling(limits or SandboxLimits())
+
+    findings: list[Finding] = []
+    if estimated > ceiling:
+        findings.append(
+            Finding(
+                code="BACKTEST_TOO_LARGE",
+                message=(
+                    f"{instruments} instruments x {sessions + len(available_days)} sessions "
+                    f"= ~{estimated:,} bars, over the {ceiling:,}-bar ceiling for a "
+                    f"{(limits or SandboxLimits()).memory} run. "
+                    "Narrow the universe, or shorten the window."
+                ),
+                contract_section="§9",
+            )
+        )
+    if data_end is not None and end > data_end:
+        missing = (end - data_end).days
+        findings.append(
+            Finding(
+                code="BACKTEST_WINDOW_UNCOVERED",
+                message=(
+                    f"the window runs to {end.isoformat()} but these instruments have no "
+                    f"bars after {data_end.isoformat()} -- the last {missing} day(s) of the "
+                    "request have no data. Running anyway would report a flat tail as a "
+                    "fact about the market. Shorten the window, or backfill the gap."
+                ),
+                contract_section="§9",
+            )
+        )
+
+    return BacktestPlan(
+        start=fetch_start,
+        end=datetime.combine(end, time.max, tzinfo=UTC),
+        dispatch_from=dispatch_from,
+        history_bars_requested=requested,
+        history_bars_available=len(available_days),
+        instruments=instruments,
+        sessions=sessions,
+        estimated_bars=estimated,
+        data_start=data_start,
+        data_end=data_end,
+        findings=tuple(findings),
+    )
+
+
+@dataclass(frozen=True)
+class BacktestVerdict:
+    """What one backtest produced, or why it was refused."""
+
+    passed: bool
+    report: ValidationReport
+    plan: BacktestPlan | None
+    bars: str | None
+    outcome: dict[str, Any] | None
+    runtime: str | None = None
+    kernel_isolated: bool = False
+
+
+def _refused(*findings: Finding, plan: BacktestPlan | None = None) -> BacktestVerdict:
+    return BacktestVerdict(
+        passed=False,
+        report=ValidationReport(findings=findings),
+        plan=plan,
+        bars=None,
+        outcome=None,
+    )
+
+
+def backtest(
+    conn: Connection,
+    strategy_id: int,
+    *,
+    start: date,
+    end: date,
+    limits: SandboxLimits | None = None,
+) -> BacktestVerdict:
+    """Run a registered strategy over an operator-chosen window.
+
+    Runs the **registered source**, read from the row, rather than anything
+    the caller supplied: the registry's rule is that a version is immutable
+    "because results already attributed to that version must keep describing
+    the code that produced them", and a backtest result is exactly such an
+    attribution. A backtest therefore cannot execute code that never passed
+    stage 1.
+
+    The window is the caller's, not the manifest's -- a strategy declares
+    what data it needs, an operator decides what period to ask about.
+
+    Raises `KeyError` if `strategy_id` does not exist; the route turns that
+    into a 404.
+    """
+    record = get_strategy(conn, strategy_id)
+    resolved = SandboxLimits.for_backtest(_resolve_limits(limits))
+
+    manifest = record.manifest
+    if manifest is None:
+        # Registered before the manifest was persisted. Recover it the only
+        # honest way -- by asking the strategy, in the sandbox -- rather than
+        # assuming a default universe on its behalf.
+        configured = run_strategy_in_sandbox(record.source, resolved)
+        if not configured.ok or configured.manifest is None:
+            return _refused(
+                Finding(
+                    code="MANIFEST_UNRESOLVABLE",
+                    message=(
+                        "this version stores no manifest and configure() did not return "
+                        f"a usable one: {(configured.error or 'no manifest').strip()[:400]}"
+                    ),
+                    contract_section="§3",
+                )
+            )
+        manifest = configured.manifest
+
+    try:
+        interval_sec = resolve_bar_interval(manifest)
+    except _InvalidBarInterval as invalid:
+        return _refused(
+            Finding(code="MANIFEST_UNRESOLVABLE", message=str(invalid), contract_section="§3")
+        )
+
+    if interval_sec != 86400:
+        # Scope, stated rather than approximated. `bars_daily` holds 51M rows
+        # across 585,266 instruments; `bars_intraday` holds 2.2M across 30.
+        # A backtest at scale is a daily one, and serving this request from
+        # the intraday table would silently be a different, far narrower
+        # experiment than the caller asked for.
+        return _refused(
+            Finding(
+                code="BACKTEST_INTERVAL_UNSUPPORTED",
+                message=(
+                    f"this strategy declares data.bars={manifest.get('data', {}).get('bars')!r}; "
+                    'backtests currently run on daily bars only ("1d"). Multi-year intraday '
+                    "does not fit one payload and chunked delivery is not built yet."
+                ),
+                contract_section="§3",
+            )
+        )
+
+    try:
+        # `as_of` is the window's END, matching D3a-2's fixed factor set: one
+        # point-in-time universe for the whole run, not one that drifts.
+        instrument_ids = resolve_universe(conn, manifest, end)
+    except _UnresolvedUniverse as unresolved:
+        return _refused(
+            Finding(code="MANIFEST_UNRESOLVABLE", message=str(unresolved), contract_section="§3")
+        )
+
+    plan = plan_backtest(conn, manifest, instrument_ids, start=start, end=end, limits=resolved)
+    if plan.findings:
+        # Refused on the estimate, before a single bar was materialised.
+        return _refused(*plan.findings, plan=plan)
+
+    window: dict[str, Any] = {
+        "start": plan.start.isoformat(),
+        "end": plan.end.isoformat(),
+        "sessions": plan.sessions,
+        "bars": "1d",
+        "interval_sec": interval_sec,
+        "instruments": {},
+    }
+    bars = (
+        fetch_bars(conn, instrument_ids, window, interval_sec=interval_sec)
+        if instrument_ids
+        else {}
+    )
+    if not bars:
+        return _refused(
+            Finding(
+                code="NO_DATA",
+                message=(
+                    f"the manifest's universe resolved to {len(instrument_ids)} instrument(s) "
+                    f"and no daily bars exist between {start.isoformat()} and {end.isoformat()}."
+                ),
+                contract_section="§3",
+            ),
+            plan=plan,
+        )
+
+    try:
+        broker, exchange, asset_class = _charge_key(conn, instrument_ids)
+    except _MixedUniverse as mixed:
+        return _refused(
+            Finding(code="MANIFEST_UNRESOLVABLE", message=str(mixed), contract_section="§3"),
+            plan=plan,
+        )
+
+    schedules = load_schedules(conn, broker, exchange, asset_class, Product.DELIVERY, end)
+    payload = SmokePayload(
+        mode=MODE_SMOKE,
+        source=record.source,
+        contract_version=CONTRACT_VERSION,
+        window=window,
+        bars=bars,
+        charge_schedules=tuple(schedules),
+        starting_cash=Decimal(str(manifest.get("capital", "0"))),
+        slippage_bps=Decimal("0"),
+        # Warm-up bars were fetched above; dispatch still begins where the
+        # caller asked.
+        dispatch_from=plan.dispatch_from,
+    )
+    # Once, not twice: determinism was proved at upload by stage 2's
+    # double run, and re-proving it here would double the cost of every
+    # backtest to re-answer a settled question about the same source.
+    result = run_smoke_in_sandbox(payload, resolved)
+    outcome = _outcome_of(result)
+    passed = bool(outcome.get("ok"))
+    # A crashed run has to carry a reason. The failure lives in
+    # `outcome["error"]`, and leaving it there produced the least
+    # actionable thing this platform can say -- "refused", with an empty
+    # findings list and no message anywhere -- which is exactly what an
+    # operator saw the first time a real 1,647-session run died.
+    findings: tuple[Finding, ...] = ()
+    if not passed:
+        findings = (
+            Finding(
+                code="BACKTEST_RUN_FAILED",
+                message=str(
+                    outcome.get("error") or "the run did not complete and reported no reason"
+                )[:1000],
+                contract_section="§9",
+            ),
+        )
+    return BacktestVerdict(
+        passed=passed,
+        report=ValidationReport(findings=findings),
+        plan=plan,
+        bars="1d",
+        outcome=outcome,
+        runtime=result.runtime,
+        kernel_isolated=result.kernel_isolated,
+    )

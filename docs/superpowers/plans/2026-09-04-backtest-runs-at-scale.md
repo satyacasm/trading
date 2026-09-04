@@ -852,3 +852,92 @@ git commit -m "feat(agent-contract): POST /strategies/{id}/backtests, against a 
       the pattern 3a established, which is what caught the `"5m"` gap
 - [ ] `docs/STATUS.md` updated: 3b state, and whether D3b-1's clock change
       alters any figure previously recorded from a `1d` run
+
+---
+
+## Outcome — all seven tasks complete, 2026-09-04
+
+Verified end to end against the live stack, not only tests: a real
+**1,647-session daily backtest of RELIANCE (2020-01-01 → 2026-08-21)**
+under gVisor returned
+
+```
+sessions 1647 | bar_calls 1647 | fills 1
+window   2019-12-03 -> 2026-08-21   (fetch)
+dispatch 2020-01-01                 (run begins here)
+history  20 requested / 20 available
+curve    1647 points
+  first {ts: 2020-01-01T10:00:00+00:00, equity: 1000000,      cash: 1000000}
+  last  {ts: 2026-08-21T10:00:00+00:00, equity: 1055886.2400, cash: 924286.24}
+runtime  runsc | kernel_isolated: True | 0.83s
+```
+
+Every decision is legible in that one result: timestamps at 10:00 UTC =
+15:30 IST session close (D3b-1, *inside the container*), a fetch window
+reaching 20 sessions earlier than dispatch (D3b-3), one curve point per
+dispatch (D3b-2), gVisor confinement (D3b-5). The arithmetic closes:
+`924,286.24 + 100 x 1,316.00 = 1,055,886.24`. The coverage gate refuses a
+window through 2026-09-04, naming both dates and the 14-day gap.
+
+993 tests pass (fast + sandbox); ruff, ruff format and mypy clean.
+
+### What the plan got wrong, and what only a real run could find
+
+**1. D3b-1 was not a money bug.** The design justified it on DP charges
+being billed against the wrong scrip-day. Probing first -- as C6 requires
+-- showed `ts + 86400` is injective on dates, so the DP key *count* is
+invariant under both clocks, and `compute_charges` takes no date. The
+prescribed test would have passed before and after the fix. The clock was
+still wrong (`ctx.now` a full day ahead, every emitted timestamp lagged)
+and still had to land first. Design corrected in place.
+
+**2. Three boundaries, not one.** `knowable_at` and `dispatch_from` are
+decided on the host and consumed in the container, so each needed the
+payload codec AND (for `dispatch_from`) the runner's `run_loop` call.
+`asdict` carries new `RunOutcome` fields OUT for free; everything going IN
+is hand-encoded. A fix that stops at the dataclass is green everywhere and
+absent where it matters.
+
+**3. A fourth boundary: the image.** `sandbox/build.sh` built only the
+ambient docker context, while `STRATEGY_SANDBOX_DOCKER_CONTEXT` routes
+runs to a second Colima VM with its own image store. The sandbox suite
+passed against an image built before any of this work -- silently, because
+the envelope is JSON and an older runner ignores fields it does not know.
+`build.sh` now builds every context that might run a strategy.
+
+**4. The curve did not fit through the pipe (`22502af`).** The design said
+~2,600 points needs no downsampling. True of memory, false of transport.
+`PYTHONUNBUFFERED=1` makes stdout a raw `FileIO`; a pipe write returns
+after at most 64 KiB and a raw writer does not loop on the short return.
+Under runc the write completes; **under gVisor it does not**, and the tail
+is dropped with no error and exit status 0 -- so a perfect run is reported
+as "the sandbox produced no structured result". Latent long before this
+sub-project; the curve is simply the first result big enough to cross
+64 KiB. The isolated runtime failing where the plain one does not is the
+part that makes it hard to find.
+
+**5. "Refused" with no reason (`52ebce4`).** A failed run returned an empty
+findings list because the reason sat in `outcome["error"]`. Now
+`BACKTEST_RUN_FAILED`.
+
+### Two tests that first passed for the wrong reason
+
+Both were rewritten, and both are the same mistake in different costumes:
+an assertion loose enough to be satisfied by a different code path. The
+404 test was satisfied by the 404 an *unrouted* path returns; the coverage
+gate test was satisfied by `MANIFEST_UNRESOLVABLE` from a fixture storing
+no manifest, never reaching the gate. When a test asserts "something went
+wrong", it will happily pass on the wrong thing going wrong.
+
+### Carried forward
+
+- `POST /strategies` on `main` still does not persist the manifest -- that
+  is on the unmerged `strategies-ui-3a` branch -- so every backtest of a
+  strategy registered on `main` pays an extra container run to recover it
+  via `configure()`. Merging that branch removes the cost.
+- Verification strategy `phase3b-daily-buy-and-hold` 1.0.0 is
+  `strategy_id=17` in the live database. Remove with
+  `DELETE FROM strategies WHERE name LIKE 'phase3b-%'`.
+- `bars_daily` ends **2026-08-21** and nothing rolls live bars up to daily,
+  so the newest two weeks are unbacktestable. The coverage gate makes that
+  visible rather than silent, but it does not fill the gap.

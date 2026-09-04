@@ -1252,3 +1252,72 @@ def test_the_bar_ceiling_moves_with_the_run_memory_it_is_derived_from(db_conn) -
     from trading.agent_contract.smoke import bar_ceiling
 
     assert bar_ceiling(SandboxLimits(memory="2048m")) > bar_ceiling(SandboxLimits(memory="256m"))
+
+
+@pytest.mark.db
+def test_a_backtest_whose_run_fails_says_why(db_conn, local_user_id, monkeypatch) -> None:  # noqa: ANN001
+    """A crashed run must carry a reason the caller can act on.
+
+    Found live: a 1,647-session backtest came back `REFUSED` with an empty
+    `findings` list and no message anywhere, because the failure lived in
+    `outcome["error"]` and nothing lifted it out. "Refused, no reason" is
+    the least actionable thing this platform can say, and it is exactly what
+    an operator sees the first time a real run dies.
+    """
+    from datetime import UTC, date, datetime
+
+    from tests.agent_contract.conftest import VALID_SOURCE
+    from trading.agent_contract import smoke as smoke_mod
+    from trading.agent_contract.registry import register_strategy
+    from trading.agent_contract.sandbox import SandboxResult
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','RUNFAIL','INR',"
+        "'ACTIVE','NSE:CM:RUNFAIL') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for day in (2, 3, 4):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, datetime(2024, 1, day, 10, 0, tzinfo=UTC)),
+        )
+
+    registered = register_strategy(
+        db_conn,
+        user_id=local_user_id,
+        name="run-fail-fixture",
+        version="1.0.0",
+        source=VALID_SOURCE,
+        manifest={
+            "name": "run-fail-fixture",
+            "version": "1.0.0",
+            "capital": "100000",
+            "base_currency": "INR",
+            "universe": [{"exchange": "NSE", "segment": "CM", "symbol": "RUNFAIL"}],
+            "data": {"bars": "1d", "history_bars": 0},
+        },
+    )
+
+    monkeypatch.setattr(
+        smoke_mod,
+        "run_smoke_in_sandbox",
+        lambda *a, **k: SandboxResult(
+            ok=False,
+            stage="killed",
+            runtime="runsc",
+            kernel_isolated=True,
+            error="container was OOM-killed",
+        ),
+    )
+
+    verdict = smoke_mod.backtest(
+        db_conn, registered.strategy_id, start=date(2024, 1, 2), end=date(2024, 1, 4)
+    )
+
+    assert verdict.passed is False
+    codes = [f.code for f in verdict.report.findings]
+    assert "BACKTEST_RUN_FAILED" in codes, codes
+    message = next(f.message for f in verdict.report.findings if f.code == "BACKTEST_RUN_FAILED")
+    assert "OOM" in message or "SMOKE_OOM" in message

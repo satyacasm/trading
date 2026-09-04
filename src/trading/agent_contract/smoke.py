@@ -1219,9 +1219,26 @@ def backtest(
     # backtest to re-answer a settled question about the same source.
     result = run_smoke_in_sandbox(payload, resolved)
     outcome = _outcome_of(result)
+    passed = bool(outcome.get("ok"))
+    # A crashed run has to carry a reason. The failure lives in
+    # `outcome["error"]`, and leaving it there produced the least
+    # actionable thing this platform can say -- "refused", with an empty
+    # findings list and no message anywhere -- which is exactly what an
+    # operator saw the first time a real 1,647-session run died.
+    findings: tuple[Finding, ...] = ()
+    if not passed:
+        findings = (
+            Finding(
+                code="BACKTEST_RUN_FAILED",
+                message=str(
+                    outcome.get("error") or "the run did not complete and reported no reason"
+                )[:1000],
+                contract_section="§9",
+            ),
+        )
     return BacktestVerdict(
-        passed=bool(outcome.get("ok")),
-        report=ValidationReport(findings=()),
+        passed=passed,
+        report=ValidationReport(findings=findings),
         plan=plan,
         bars="1d",
         outcome=outcome,

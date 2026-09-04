@@ -291,8 +291,8 @@ def test_golden_sma_crossover_trades_exactly_where_expected() -> None:
         ("SELL", "10", "FILLED"),
     ]
     assert outcome.fills == 2
-    assert outcome.final_cash == "99920.00"
-    assert outcome.final_equity == "99920.00"
+    assert outcome.final_cash == "99920.0000"
+    assert outcome.final_equity == "99920.0000"
 
 
 def _order(order_id: int, side: str, quantity: str) -> Order:
@@ -445,7 +445,7 @@ def test_day_open_equity_rolls_over_at_the_ist_calendar_boundary() -> None:
     )
     assert outcome.breaker_reason is not None
     assert outcome.breaker_reason.startswith(REASON_MAX_DAILY_LOSS)
-    assert outcome.final_equity == "100500.00"
+    assert outcome.final_equity == "100500.0000"
     # The run as a whole is still up on starting cash -- a run-scoped
     # (never-rolled) day_open_equity would have seen a gain, not a loss,
     # against day 2's ending equity and would never have breached.
@@ -616,8 +616,8 @@ def test_dp_charge_is_never_wrongly_suppressed_across_a_buy_sell_buy_sequence() 
     )
 
     assert outcome.fills == 3
-    assert outcome.final_cash == "99095.00"
-    assert outcome.final_equity == "99995.00"
+    assert outcome.final_cash == "99095.0000"
+    assert outcome.final_equity == "99995.0000"
 
 
 def test_dp_charge_is_suppressed_on_a_second_same_day_sell() -> None:
@@ -723,8 +723,8 @@ def test_dp_charge_is_suppressed_on_a_second_same_day_sell() -> None:
     )
 
     assert outcome.fills == 3
-    assert outcome.final_cash == "99910.00"
-    assert outcome.final_equity == "99910.00"
+    assert outcome.final_cash == "99910.0000"
+    assert outcome.final_equity == "99910.0000"
 
 
 def test_the_curve_records_the_same_equity_the_breaker_latched_on() -> None:
@@ -844,3 +844,29 @@ def test_without_dispatch_from_every_bar_is_dispatched_as_before() -> None:
     outcome = _run(_Recorder(), InMemoryBars({1: _series(1, ["10", "11", "12"])}))
     assert outcome.bar_calls == 3
     assert len(outcome.equity_curve) == 3
+
+
+def test_curve_money_is_emitted_at_the_canonical_four_decimal_scale() -> None:
+    """`str(Decimal)` preserves whatever scale the arithmetic produced, so a
+    curve point could read "1000000" here and "1000000.0000" after a round
+    trip through `numeric(18,4)`.
+
+    Numerically identical, but the same run then has two string forms
+    depending on which endpoint you ask, and a client that caches or diffs
+    them sees changes that did not happen. Contract §5 already declares 4 dp
+    as the scale for cash and equity, so the run emits it that way.
+    """
+    outcome = run_loop(
+        strategy=_Recorder(),
+        bars=InMemoryBars({1: _series(1, ["10", "11"])}),
+        schedules=(),
+        starting_cash=Decimal("1000000"),
+        slippage_bps=Decimal("0"),
+    )
+
+    assert outcome.equity_curve
+    for point in outcome.equity_curve:
+        assert point["equity"] == str(Decimal(point["equity"]).quantize(Decimal("0.0001")))
+        assert point["cash"] == str(Decimal(point["cash"]).quantize(Decimal("0.0001")))
+    # The case that actually bites: a whole number must not render bare.
+    assert outcome.equity_curve[0]["cash"] == "1000000.0000"

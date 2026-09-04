@@ -1,26 +1,70 @@
 # Where this project stands
 
-**Updated:** 2026-09-04, ~15:20 IST. Keep this file current — it is the
+**Updated:** 2026-09-04, ~16:10 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
 
 ## The one thing to do next
 
-**Phase 3 sub-project 3d — metrics over the stored curve.** Returns,
-Sharpe, max drawdown, exposure, turnover, and the post-tax P&L lens (§8).
-3c stores what 3d needs and computes nothing itself, deliberately: a
-storage layer that also computes is one whose format is decided by today's
-metric.
+**Phase 3 sub-project 3e — the report UI.** 3d returns every number a
+report needs; nothing draws them. 3e renders a strategy's run history and
+one run's equity path, drawdown curve, monthly returns and rolling Sharpe.
 
-Two things 3d inherits and should not relearn:
+Two things 3e inherits:
 
-- **The curve is the breaker's own number**, sampled where `loop.py`
-  already evaluates equity — so a drawdown computed here and a breaker
-  latch in the same run cannot disagree. Do not recompute equity.
-- **Money is 4 dp everywhere**: `numeric(18,4)` in storage, `str` at 4 dp
-  on the wire, and the two now compare byte-for-byte. Never introduce a
-  float.
+- **`GET /backtests/{id}` carries `metrics`**, with `risk_free` echoed
+  inside it. Show the rate next to the Sharpe — the whole reason it is
+  echoed is that a reader must never have to guess what was assumed.
+- **The list route carries neither curves nor metrics, on purpose.** If the
+  history table needs headline figures, that is the moment to decide on a
+  stored summary — with the requirement in hand, not guessed now.
+
+---
+
+## Phase 3d — shipped 2026-09-04 (merged)
+
+Metrics over the stored curve, computed on read. Spec at
+`docs/superpowers/specs/2026-09-04-backtest-metrics-design.md`.
+
+`trading.metrics.curve` is a pure stdlib module: total return, CAGR,
+volatility, Sharpe, Sortino, Calmar, max drawdown **depth and duration**,
+VaR(95), worst period, drawdown curve, monthly returns, rolling 6-month
+Sharpe. `GET /backtests/{id}` folds them in; the list route is unchanged.
+
+**Scope was set by what the data supports, not by the plan's wish list.**
+§178's trade metrics — win rate, profit factor, expectancy, turnover — and
+the **cost-drag report** §8 calls the most sobering chart for a retail
+options trader all need a per-fill ledger `run_loop` never emits:
+`OrderSnapshot` stops at `status` and `submitted_at`, and `fills` is a bare
+count. Alpha/beta need a benchmark series; `instruments` holds **zero index
+rows**. Both are blocked on other work, not on metrics. **A per-fill ledger
+in `RunOutcome` is the highest-value next increment after 3e** — it
+unblocks the trade metrics, the cost-drag report and the post-tax lens in
+one change.
+
+**Three things worth not relearning:**
+
+1. **`rf = 0` is a lie on this platform, and the numbers prove it.** The
+   real 1,647-session RELIANCE buy-and-hold returned +5.59% over 6.6 years
+   — a CAGR of 0.82%. At `rf = 0` its Sharpe is **+0.30** and it reads as a
+   positive strategy; at the default 6.5% it is **−1.95** and correctly
+   reads as worse than a government bond. Same curve. The rate is echoed in
+   every response so nobody has to guess which one they are looking at.
+2. **No float anywhere, including the statistics.** `Decimal.sqrt()` exists
+   and `cagr` compounds through `ln`/`exp` because `Decimal.__pow__`
+   refuses a non-integer exponent. Returns are money-derived; a carve-out
+   for "statistics" is a boundary held by attention rather than by rule.
+3. **Ratios cross the wire at a fixed 8 dp.** Full `Decimal` precision
+   leaked the 28-digit context onto the wire, where it is unstable —
+   reordering two mathematically identical operations shifts the last
+   digits and every client sees a change that did not happen.
+
+An undefined metric is `None`, never `0`: Sharpe on a flat curve, CAGR over
+a zero-day window, a drawdown that never happened. And a drawdown still
+open at the last point reports `recovered: false` rather than pretending it
+closed — the real run's 526-session drawdown from 2024-07-08 never
+recovered, and says so.
 
 ---
 
@@ -142,7 +186,7 @@ AC. Anything long-running deserves better than a laptop that sleeps.
 | **Phase 1** — streaming + manual paper trading | **Shipped.** Task 12 executed 2026-09-04, 8/10 steps pass; the three open items are operator actions, not code. |
 | **Phase 2** — Agent Contract + strategy runtime | **Started.** Draft at `docs/agent-contract/STRATEGY_CONTRACT.md`. |
 | **Phase 2.5** — intelligence layer | Not started. Recorders were meant to start in Phase 0 and compound; check whether the news/announcements recorder is actually running. |
-| **Phase 3** — backtesting + metrics | **Sub-project 3a complete, and now visible in the UI.** `smoke_test` reads a strategy's declared `data.bars` and either serves it correctly (`"1m"`, `"1d"`) or rejects it with an honest finding naming the gap (see below); `/strategies` reports which interval a run actually received, and lists what is registered. **3b and 3c shipped and merged 2026-09-04.** 3d–3f (persistence, metrics, report UI, walk-forward, robustness) not started. |
+| **Phase 3** — backtesting + metrics | **Sub-project 3a complete, and now visible in the UI.** `smoke_test` reads a strategy's declared `data.bars` and either serves it correctly (`"1m"`, `"1d"`) or rejects it with an honest finding naming the gap (see below); `/strategies` reports which interval a run actually received, and lists what is registered. **3b, 3c and 3d shipped and merged 2026-09-04.** 3e–3f (persistence, metrics, report UI, walk-forward, robustness) not started. |
 
 ---
 

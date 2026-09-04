@@ -795,3 +795,43 @@ def test_the_backtest_list_route_still_carries_no_metrics(
     row = client.get(f"/strategies/{strategy_id}/backtests").json()[0]
     assert "metrics" not in row
     assert "equity_curve" not in row
+
+
+def test_a_single_strategy_can_be_read_by_id(client, db_conn, local_user_id) -> None:  # noqa: ANN001
+    """The report UI's strategy page needs a name and version. Fetching the
+    whole list and filtering client-side transfers every strategy to render
+    one."""
+    from trading.agent_contract.registry import register_strategy
+
+    registered = register_strategy(
+        db_conn,
+        user_id=local_user_id,
+        name="read-one-fixture",
+        version="2.1.0",
+        source=VALID_SOURCE,
+    )
+
+    response = client.get(f"/strategies/{registered.strategy_id}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strategy_id"] == registered.strategy_id
+    assert body["name"] == "read-one-fixture"
+    assert body["version"] == "2.1.0"
+
+
+def test_an_unknown_strategy_id_is_404(client) -> None:  # noqa: ANN001
+    response = client.get("/strategies/99999999")
+    assert response.status_code == 404
+    # Not the vacuous 404 an unrouted path returns.
+    assert "99999999" in response.json()["detail"]
+
+
+def test_the_contract_route_is_not_swallowed_by_the_strategy_id_route(client) -> None:  # noqa: ANN001
+    """`/strategies/contract` and `/strategies/{strategy_id}` share a prefix,
+    and FastAPI matches in registration order. Registering the parameterised
+    route first would make "contract" parse as an int, turning a working
+    endpoint into a 422 -- silently, because nothing else exercises both.
+    """
+    response = client.get("/strategies/contract")
+    assert response.status_code == 200
+    assert "contract" in response.json()

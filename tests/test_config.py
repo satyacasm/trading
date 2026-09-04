@@ -89,3 +89,27 @@ def test_telegram_settings_are_tunable_via_env(monkeypatch, tmp_path):
 
     assert s.telegram_bot_token == "123456:test-token"
     assert s.telegram_chat_id == "987654"
+
+
+def test_cors_origins_default_to_the_web_apps_port(monkeypatch) -> None:  # noqa: ANN001
+    """Unset, the gateway answers exactly the one origin the web app runs on
+    -- the behaviour before it was configurable."""
+    from trading.config import Settings
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
+    monkeypatch.setenv("REDIS_URL", "redis://x")
+    assert Settings().cors_allow_origins == "http://localhost:3000"
+
+
+def test_cors_origins_accept_a_comma_separated_list(monkeypatch) -> None:  # noqa: ANN001
+    """So a second dev server -- a worktree verifying its own branch -- can be
+    allowed without editing code."""
+    from trading.config import Settings
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
+    monkeypatch.setenv("REDIS_URL", "redis://x")
+    monkeypatch.setenv("CORS_ALLOW_ORIGINS", "http://localhost:3000,http://localhost:3001")
+    assert Settings().cors_allow_origins.split(",") == [
+        "http://localhost:3000",
+        "http://localhost:3001",
+    ]

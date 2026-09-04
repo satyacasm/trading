@@ -1,5 +1,6 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from trading.paper.breaker import REASON_MAX_DAILY_LOSS
 from trading.paper.enums import (
@@ -331,6 +332,59 @@ def test_a_position_reversal_reprices_avg_cost_at_the_new_fill_not_the_old_one()
     assert position.quantity == Decimal("0")
     assert position.avg_cost == Decimal("0")
     assert position.realised_pnl == Decimal("200")
+
+
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _daily_bar(instrument_id: int, ts: datetime, price: str) -> BarRecord:
+    """A `bars_daily` row exactly as stored: `ts` IS the session close.
+
+    Verified against the table -- every row is 10:00 UTC / 15:30 IST. The
+    interval is a calendar day but an NSE session is 6h15m inside it, so no
+    arithmetic on `ts` and `interval_sec` can produce the close; the fetch
+    path states it via `knowable_at` instead.
+    """
+    return BarRecord(
+        instrument_id=instrument_id,
+        ts=ts,
+        interval_sec=86400,
+        open=Decimal(price),
+        high=Decimal(price),
+        low=Decimal(price),
+        close=Decimal(price),
+        volume=Decimal("100"),
+        knowable_at=ts,
+    )
+
+
+def test_a_daily_bar_gives_the_strategy_the_session_close_as_its_clock() -> None:
+    """Deriving `close_ts` as `ts + 86400` hands a daily strategy a clock
+    reading the NEXT day, so month-end, day-of-week and holiday logic are all
+    wrong and the strategy cannot tell it. Every timestamp the run emits --
+    an order's `submitted_at`, and the equity curve -- inherits the same lag.
+
+    Not a DP charge bug: `ts + 86400` is injective on dates, so the count of
+    scrip-day keys is unchanged. Probed before this test was written.
+    """
+    session_close = datetime(2026, 3, 2, 10, 0, tzinfo=UTC)  # 15:30 IST
+    seen: list[datetime] = []
+
+    class RecordsClock:
+        def on_bar(self, ctx, bars) -> None:  # noqa: ANN001, ARG002
+            seen.append(ctx.now)
+
+    outcome = run_loop(
+        strategy=RecordsClock(),
+        bars=InMemoryBars({1: (_daily_bar(1, session_close, "100"),)}),
+        schedules=(),
+        starting_cash=Decimal("100000"),
+        slippage_bps=Decimal("0"),
+    )
+
+    assert outcome.ok, outcome.error
+    assert seen == [session_close]
+    assert seen[0].astimezone(_IST).date() == date(2026, 3, 2)
 
 
 def _bar(instrument_id: int, ts: datetime, price: str) -> BarRecord:

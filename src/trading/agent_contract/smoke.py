@@ -408,6 +408,11 @@ def _fetch_daily_bars(
                     low=row["low"],
                     close=row["close"],
                     volume=None if row["volume"] is None else Decimal(row["volume"]),
+                    # bars_daily.ts IS the session close -- verified against
+                    # the table, every row is 10:00 UTC / 15:30 IST. That is a
+                    # fact about the session, not an arithmetic consequence of
+                    # the interval, so it is stated rather than derived.
+                    knowable_at=row["ts"],
                 )
             )
     window["instruments"] = {str(k): {"bars": len(v)} for k, v in series.items()}

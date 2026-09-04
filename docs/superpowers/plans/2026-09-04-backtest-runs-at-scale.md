@@ -93,38 +93,41 @@ derivation, while every host-side test passes. Step 5 exists for exactly this.
   `BarRecord.close_ts -> datetime` returns `knowable_at` when set.
   Tasks 3, 4, 5, 7 all record timestamps produced by this and must land after it.
 
-- [ ] **Step 1: Write the failing test — two daily sells, two DP days**
+- [ ] **Step 1: Write the failing test — the strategy's clock is the session close**
 
-Add to `tests/runtime/test_loop.py`. Assert the *charge outcome*, not the
-timestamp, so it fails for the reason that matters:
+**Corrected 2026-09-04.** The design asked for a DP scrip-day test. Probing it
+first (as C6 requires) showed the claim is false: `ts + 86400` is an injective
+shift on dates, so three sessions give three distinct DP keys under both
+clocks, and `compute_charges` takes no date. A DP test would pass before and
+after the fix. The real defect is that `ctx.now` — and therefore every
+timestamp the run emits, including D3b-2's curve — is a full day late.
 
 ```python
-def test_daily_bar_sells_on_consecutive_sessions_are_billed_two_dp_days() -> None:
-    """DP is once per scrip per IST day. Two daily bars are two sessions, so
-    two delivery sells owe DP twice. Deriving close_ts as ts + 86400 pushes
-    each bar's clock onto the next calendar day; whether two sells land on
-    one key or two then depends on the calendar, not on what the strategy did.
+def test_a_daily_bar_gives_the_strategy_the_session_close_as_its_clock() -> None:
+    """bars_daily stores ts AT the session close (every row is 10:00 UTC /
+    15:30 IST). Deriving close_ts as ts + 86400 hands the strategy a clock
+    reading the NEXT day, so month-end, day-of-week and holiday logic are all
+    wrong and the strategy cannot tell. Every timestamp the run emits -- an
+    order's submitted_at, and the equity curve -- inherits the same lag.
     """
-    day1 = datetime(2026, 3, 2, 10, 0, tzinfo=UTC)   # 15:30 IST, as stored
-    day2 = datetime(2026, 3, 3, 10, 0, tzinfo=UTC)
-    bars = InMemoryBars({
-        1: (
-            _daily_bar(1, day1, "100"),
-            _daily_bar(1, day2, "100"),
-        )
-    })
-    strategy = _SellEverySessionStrategy(instrument_id=1)
+    session_close = datetime(2026, 3, 2, 10, 0, tzinfo=UTC)  # 15:30 IST
+    seen: list[datetime] = []
+
+    class RecordsClock:
+        def on_bar(self, ctx, bars) -> None:  # noqa: ANN001
+            seen.append(ctx.now)
+
     outcome = run_loop(
-        strategy,
-        bars,
-        _schedules_with_dp(Decimal("20")),
+        strategy=RecordsClock(),
+        bars=InMemoryBars({1: (_daily_bar(1, session_close, "100"),)}),
+        schedules=(),
         starting_cash=Decimal("100000"),
         slippage_bps=Decimal("0"),
     )
+
     assert outcome.ok, outcome.error
-    assert outcome.fills == 2
-    # Two sessions => DP billed twice, not deduplicated into one scrip-day.
-    assert _total_dp_charged(outcome) == Decimal("40")
+    assert seen == [session_close]
+    assert seen[0].astimezone(_IST).date() == date(2026, 3, 2)
 ```
 
 Add the helpers beside `_bar` in that file:

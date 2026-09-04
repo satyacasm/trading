@@ -66,6 +66,11 @@ def _encode_series(series: Sequence[BarRecord]) -> dict[str, Any]:
         "t": [bar.trades for bar in series],
         "oi": [bar.open_interest for bar in series],
         "oic": [bar.oi_change for bar in series],
+        # None for intraday, where `ts + interval_sec` is already right; an
+        # ISO string for daily, where it is not. Per bar rather than per
+        # series: nothing but convention guarantees a series is homogeneous,
+        # and the strategy is rebuilt from this on the far side of the wire.
+        "k": [None if bar.knowable_at is None else bar.knowable_at.isoformat() for bar in series],
     }
 
 
@@ -84,8 +89,9 @@ def _decode_series(instrument_id: int, column: Mapping[str, Any]) -> tuple[BarRe
             trades=t,
             open_interest=oi,
             oi_change=oic,
+            knowable_at=None if k is None else datetime.fromisoformat(k),
         )
-        for ts, o, h, low, c, v, t, oi, oic in zip(
+        for ts, o, h, low, c, v, t, oi, oic, k in zip(
             column["ts"],
             column["o"],
             column["h"],
@@ -95,6 +101,7 @@ def _decode_series(instrument_id: int, column: Mapping[str, Any]) -> tuple[BarRe
             column["t"],
             column["oi"],
             column["oic"],
+            column["k"],
             strict=True,
         )
     )

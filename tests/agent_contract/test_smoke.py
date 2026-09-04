@@ -1016,3 +1016,54 @@ def test_smoke_test_reports_an_invalid_bar_interval_without_running_the_smoke_co
     assert verdict.passed is False
     assert [f.code for f in verdict.report.findings] == ["MANIFEST_UNRESOLVABLE"]
     assert "2m" in verdict.as_agent_feedback()
+
+
+@pytest.mark.db
+def test_daily_fetch_stamps_knowable_at_with_the_session_close(db_conn) -> None:  # noqa: ANN001
+    """The link between the `close_ts` fix and production.
+
+    `BarRecord.close_ts` stops deriving only when `knowable_at` is set, and
+    `_fetch_daily_bars` is the one place that sets it for real data. Drop
+    that single keyword and every runtime test still passes while every real
+    daily backtest silently runs a day ahead again -- so it is asserted here,
+    against a row seeded the way production actually stores one.
+
+    Note the timestamp: all 51,081,227 `bars_daily` rows are at 10:00 UTC
+    (15:30 IST), without exception. Seeding a bare `date` -- as the older
+    fixtures in this file do -- yields midnight UTC, which is 05:30 IST,
+    before the session opens. Production has never held such a row.
+    """
+    from datetime import UTC, datetime
+
+    from trading.agent_contract.smoke import fetch_bars
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','DAILYCLOCK','INR',"
+        "'ACTIVE','NSE:CM:DAILYCLOCK') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    closes = [
+        datetime(2024, 1, 8, 10, 0, tzinfo=UTC),
+        datetime(2024, 1, 9, 10, 0, tzinfo=UTC),
+    ]
+    for session_close in closes:
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, session_close),
+        )
+
+    window = {
+        "start": "2024-01-08T00:00:00+00:00",
+        "end": "2024-01-09T23:59:59.999999+00:00",
+        "sessions": 2,
+        "instruments": {},
+    }
+    bars = fetch_bars(db_conn, [instrument_id], window, interval_sec=86400)
+
+    fetched = bars[instrument_id]
+    assert [b.knowable_at for b in fetched] == closes
+    # The clock the strategy actually runs on: the session close itself,
+    # never ts + 86400 (which would be the NEXT session's close).
+    assert [b.close_ts for b in fetched] == closes

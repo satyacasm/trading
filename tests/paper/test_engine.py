@@ -144,6 +144,20 @@ def _make_crypto_instrument(conn: Connection) -> int:
     return int(row[0])
 
 
+def _mark_market_day(conn: Connection, day: date, session_close: str) -> None:
+    """Mark an arbitrary date as a TEST-NSE trading day. `_mark_market_open_today`
+    is the today-only special case; a DAY order that outlives its own session
+    needs a *past* day on the calendar as well as the current one."""
+    conn.execute(
+        "INSERT INTO trading_calendar"
+        " (exchange, segment, session_date, is_trading_day, session_open, session_close)"
+        " VALUES ('TEST-NSE', 'CM', %s, true, '09:15', %s)"
+        " ON CONFLICT (exchange, segment, session_date)"
+        " DO UPDATE SET is_trading_day = true, session_close = EXCLUDED.session_close",
+        (day, session_close),
+    )
+
+
 def _mark_market_open_today(conn: Connection, session_close: str = "15:30") -> None:
     conn.execute(
         "INSERT INTO trading_calendar"
@@ -616,6 +630,51 @@ def test_sweep_leaves_day_order_open_before_session_close(setup_conn) -> None:
         assert swept == []
         assert iid in book.open_orders
     finally:
+        _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
+
+
+def test_sweep_expires_day_order_submitted_in_an_earlier_session(setup_conn) -> None:
+    """A DAY order that outlived its own session close must be expired even
+    while *today's* session is still open.
+
+    This is the engine-was-down case: nothing swept the order at its own
+    session close, so it is still resting the next morning. If the sweep
+    asks only whether the current session has closed, the order survives
+    and stays fillable -- silently becoming a GTC order and filling at a
+    later session's prices.
+    """
+    pid = make_portfolio(setup_conn, cash=Decimal("100000"))
+    iid = _make_equity_instrument(setup_conn)
+    yesterday = date.today() - timedelta(days=1)
+    # Today's session is still open (23:59); yesterday's closed at 15:30.
+    _mark_market_open_today(setup_conn, session_close="23:59")
+    _mark_market_day(setup_conn, yesterday, session_close="15:30")
+    order = make_order(
+        setup_conn,
+        pid,
+        side=Side.BUY,
+        quantity=Decimal("5"),
+        instrument_id=iid,
+        status=OrderStatus.OPEN,
+        time_in_force=TimeInForce.DAY,
+        submitted_at=datetime.now(UTC) - timedelta(days=1),
+    )
+    try:
+        book = OpenOrderBook()
+        book.add(order, meta=("EQUITY", "TEST-NSE", "CM"))
+        swept = sweep_expired_day_orders(setup_conn, book, datetime.now(UTC))
+        assert swept == [order.order_id]
+        assert iid not in book.open_orders
+
+        status = setup_conn.execute(
+            "SELECT status FROM orders WHERE order_id=%s", (order.order_id,)
+        ).fetchone()
+        assert status == ("EXPIRED",)
+    finally:
+        setup_conn.execute(
+            "DELETE FROM trading_calendar WHERE exchange='TEST-NSE' AND session_date=%s",
+            (yesterday,),
+        )
         _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid])
 
 

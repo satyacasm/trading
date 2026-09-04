@@ -466,9 +466,28 @@ export type BacktestSummary = {
   ran_at: string;
 };
 
+export type Percentiles = { p5: string; p50: string; p95: string };
+
+export type Reshuffle = {
+  iterations: number;
+  terminal_equity: Percentiles;
+  max_drawdown: Percentiles;
+};
+
+export type Stress = {
+  multiplier: string;
+  ok: boolean;
+  fills: number | null;
+  final_equity: string | null;
+  breaker_reason: string | null;
+  error: string | null;
+};
+
 export type BacktestDetail = BacktestSummary & {
   equity_curve: EquityPoint[];
   fills_ledger: Fill[];
+  stress: Stress | null;
+  reshuffle: Reshuffle | null;
   metrics: BacktestMetrics | null;
 };
 

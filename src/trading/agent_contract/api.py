@@ -425,6 +425,13 @@ class BacktestDetail(BacktestSummary):
     # and recomputing means a corrected metric applies retroactively to
     # every run rather than only to runs computed after the fix.
     metrics: dict[str, Any] | None = None
+    # The 2x cost-and-slippage rerun, as executed and stored. An
+    # observation: doubling slippage changes which fills happen, so it
+    # cannot be re-derived from this run's output.
+    stress: dict[str, Any] | None = None
+    # The trade-order reshuffle, computed on read from `fills_ledger` --
+    # arithmetic over stored data, so improving it applies retroactively.
+    reshuffle: dict[str, Any] | None = None
 
 
 @router.get("/strategies/{strategy_id}/backtests", response_model=list[BacktestSummary])

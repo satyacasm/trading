@@ -193,3 +193,56 @@ def test_calmar_is_cagr_over_the_drawdown_depth() -> None:
     got = calmar(points)
     assert got is not None
     assert got == c / abs(dd.depth)
+
+
+def test_the_drawdown_curve_is_the_decline_from_the_running_peak() -> None:
+    from trading.metrics.curve import drawdown_curve
+
+    got = drawdown_curve(_curve(["100", "80", "100", "120"]))
+    assert [d for _, d in got] == [
+        Decimal("0"),
+        Decimal("-0.2"),
+        Decimal("0"),
+        Decimal("0"),
+    ]
+
+
+def test_monthly_returns_compound_within_each_ist_calendar_month() -> None:
+    """IST, not UTC -- the same convention the DP scrip-day key and the
+    breaker's day rollover already use.
+
+    The third point sits at 19:00 UTC on 31 January, which is 00:30 IST on
+    1 February, so it belongs to February. Grouping by UTC would put it in
+    January and silently move a day's P&L between months.
+    """
+    from trading.metrics.curve import monthly_returns
+
+    points = [
+        (datetime(2024, 1, 15, 10, 0, tzinfo=UTC), Decimal("100"), Decimal("100")),
+        (datetime(2024, 1, 30, 10, 0, tzinfo=UTC), Decimal("110"), Decimal("110")),
+        (datetime(2024, 1, 31, 19, 0, tzinfo=UTC), Decimal("121"), Decimal("121")),
+    ]
+    got = dict(monthly_returns(points))
+    assert set(got) == {"2024-01", "2024-02"}
+    assert got["2024-01"] == Decimal("0.1")
+    assert got["2024-02"].quantize(Decimal("0.0001")) == Decimal("0.1000")
+
+
+def test_rolling_sharpe_emits_nothing_until_its_window_is_full() -> None:
+    """A Sharpe over eleven points is noise wearing the same name, so the
+    series starts where the window does rather than being padded."""
+    from trading.metrics.curve import rolling_sharpe
+
+    points = _curve([str(100 + i) for i in range(10)])
+    assert rolling_sharpe(points, "1d", Decimal("0"), window=126) == []
+    got = rolling_sharpe(points, "1d", Decimal("0"), window=5)
+    # 9 returns, window 5 -> 5 windows.
+    assert len(got) == 5
+
+
+def test_rolling_sharpe_is_undefined_without_a_known_interval() -> None:
+    """Annualizing by a guessed factor produces a number that looks like a
+    Sharpe and is not one."""
+    from trading.metrics.curve import rolling_sharpe
+
+    assert rolling_sharpe(_curve(["100", "110", "120"]), None, Decimal("0"), window=2) == []

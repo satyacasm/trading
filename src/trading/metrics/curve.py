@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 __all__ = [
     "CurvePoint",
@@ -31,6 +32,9 @@ __all__ = [
     "cagr",
     "calmar",
     "drawdown",
+    "drawdown_curve",
+    "monthly_returns",
+    "rolling_sharpe",
     "period_returns",
     "periods_per_year",
     "sharpe",
@@ -47,6 +51,12 @@ CurvePoint = tuple[datetime, Decimal, Decimal]
 _PERIODS_PER_YEAR: dict[str, int] = {"1d": 252}
 
 _DAYS_PER_YEAR = Decimal("365")
+
+# Months are IST calendar months -- the same convention the DP scrip-day key
+# (`loop.py`) and the breaker's day rollover already use. Grouping by UTC
+# would put a 19:00 UTC print into the previous month and silently move a
+# day's P&L across a month boundary.
+_IST = ZoneInfo("Asia/Kolkata")
 
 
 def periods_per_year(bars: str | None) -> int | None:
@@ -261,3 +271,71 @@ def calmar(points: list[CurvePoint]) -> Decimal | None:
     if growth is None or dd is None or dd.depth == 0:
         return None
     return growth / abs(dd.depth)
+
+
+def drawdown_curve(points: list[CurvePoint]) -> list[tuple[datetime, Decimal]]:
+    """The decline from the running peak at every point, so 3e can draw the
+    underwater chart without recomputing it."""
+    out: list[tuple[datetime, Decimal]] = []
+    peak = None
+    for ts, equity, _cash in points:
+        peak = equity if peak is None or equity > peak else peak
+        out.append((ts, Decimal(0) if peak == 0 else equity / peak - 1))
+    return out
+
+
+def monthly_returns(points: list[CurvePoint]) -> list[tuple[str, Decimal]]:
+    """Compounded return within each IST calendar month, oldest first.
+
+    Each month's return runs from the last equity of the previous month to
+    the last equity of this one, so the months chain into the total rather
+    than each measuring from its own first print and leaving the gaps
+    between months unattributed.
+    """
+    if len(points) < 2:
+        return []
+    last_by_month: list[tuple[str, Decimal]] = []
+    for ts, equity, _cash in points:
+        key = ts.astimezone(_IST).strftime("%Y-%m")
+        if last_by_month and last_by_month[-1][0] == key:
+            last_by_month[-1] = (key, equity)
+        else:
+            last_by_month.append((key, equity))
+
+    out: list[tuple[str, Decimal]] = []
+    previous = points[0][1]
+    for key, closing in last_by_month:
+        if previous != 0:
+            out.append((key, closing / previous - 1))
+        previous = closing
+    return out
+
+
+def rolling_sharpe(
+    points: list[CurvePoint],
+    bars: str | None,
+    risk_free: Decimal,
+    *,
+    window: int = 126,
+) -> list[tuple[datetime, Decimal]]:
+    """Sharpe over a trailing window of `window` returns, six months by default.
+
+    Emits nothing until the window is full rather than padding it: a Sharpe
+    over eleven points is noise wearing the same name. Returns nothing at
+    all when the interval is unknown, because annualizing by a guessed
+    factor produces a number that looks like a Sharpe and is not one.
+    """
+    periods = periods_per_year(bars)
+    if periods is None:
+        return []
+    returns = period_returns(points)
+    if len(returns) < window:
+        return []
+    out: list[tuple[datetime, Decimal]] = []
+    for end in range(window, len(returns) + 1):
+        value = sharpe(returns[end - window : end], periods, risk_free)
+        if value is not None:
+            # `returns[i]` ends at `points[i + 1]`, so the window ending at
+            # index `end - 1` is stamped with that point's timestamp.
+            out.append((points[end][0], value))
+    return out

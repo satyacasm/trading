@@ -188,3 +188,32 @@ def test_dispatch_from_defaults_to_none_for_a_payload_that_omits_it() -> None:
     exactly as every payload did before this field existed."""
     decoded = decode_payload(encode_payload(SmokePayload(mode="smoke", source="x")))
     assert decoded.dispatch_from is None
+
+
+def test_risk_limit_overrides_survive_the_payload_round_trip() -> None:
+    """Risk limits are decided on the host and applied inside the container,
+    so they cross the same hand-written boundary `knowable_at` and
+    `dispatch_from` do -- and that boundary has silently dropped a field
+    twice already.
+
+    `None` must stay `None` rather than becoming zero: a limit of zero halts
+    on the first loss, which is the opposite of "no limit".
+    """
+    from decimal import Decimal as D
+
+    both = decode_payload(
+        encode_payload(
+            SmokePayload(
+                mode="smoke",
+                source="x",
+                max_daily_loss=D("40000"),
+                max_drawdown_pct=D("15"),
+            )
+        )
+    )
+    assert both.max_daily_loss == D("40000")
+    assert both.max_drawdown_pct == D("15")
+
+    neither = decode_payload(encode_payload(SmokePayload(mode="smoke", source="x")))
+    assert neither.max_daily_loss is None
+    assert neither.max_drawdown_pct is None

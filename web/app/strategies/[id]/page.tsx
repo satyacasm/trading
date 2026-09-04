@@ -25,6 +25,8 @@ export default function StrategyPage() {
   const [start, setStart] = useState("2020-01-01");
   const [end, setEnd] = useState("2026-08-21");
   const [capital, setCapital] = useState("");
+  const [dailyLoss, setDailyLoss] = useState("");
+  const [drawdownPct, setDrawdownPct] = useState("");
   const [running, setRunning] = useState(false);
   const [refusal, setRefusal] = useState<StrategyFinding[]>([]);
 
@@ -49,6 +51,8 @@ export default function StrategyPage() {
         // Blank means "use what the strategy declared" -- an empty field is
         // not a request for zero capital.
         ...(capital.trim() === "" ? {} : { starting_cash: capital.trim() }),
+        ...(dailyLoss.trim() === "" ? {} : { max_daily_loss: dailyLoss.trim() }),
+        ...(drawdownPct.trim() === "" ? {} : { max_drawdown_pct: drawdownPct.trim() }),
       });
       if (result.backtest_run_id !== null) {
         router.push(`/backtests/${result.backtest_run_id}`);
@@ -93,7 +97,9 @@ export default function StrategyPage() {
           <p className="text-muted text-xs">
             Daily bars only. Data runs to 2026-08-21; a window past that is refused rather
             than run on nothing. Leave starting equity blank to use what the strategy
-            declared.
+            declared, and the same for the risk limits. A run that stops early was
+            halted by whichever limit applied — widening it here beats re-uploading the
+            strategy under a new version.
           </p>
         )}
         <form onSubmit={onRun} className="flex flex-wrap items-end gap-3">
@@ -124,6 +130,28 @@ export default function StrategyPage() {
               placeholder="as declared"
               onChange={(e) => setCapital(e.target.value)}
               className="border-line bg-raised num w-36 rounded border px-2 py-1 text-sm"
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-muted text-xs tracking-wide uppercase">Max daily loss</span>
+            <input
+              type="text"
+              inputMode="decimal"
+              value={dailyLoss}
+              placeholder="as declared"
+              onChange={(e) => setDailyLoss(e.target.value)}
+              className="border-line bg-raised num w-32 rounded border px-2 py-1 text-sm"
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-muted text-xs tracking-wide uppercase">Max drawdown %</span>
+            <input
+              type="text"
+              inputMode="decimal"
+              value={drawdownPct}
+              placeholder="as declared"
+              onChange={(e) => setDrawdownPct(e.target.value)}
+              className="border-line bg-raised num w-32 rounded border px-2 py-1 text-sm"
             />
           </label>
           <button

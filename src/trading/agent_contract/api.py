@@ -280,6 +280,11 @@ class BacktestRequest(BaseModel):
     # here rather than editing the strategy keeps that from creating a new
     # version whose results are attributed separately.
     starting_cash: Decimal | None = None
+    # Risk limits for this run only. `None` uses the strategy's own -- a
+    # run halted early is only explicable next to the limit it hit, so
+    # whichever applied is recorded on the result.
+    max_daily_loss: Decimal | None = None
+    max_drawdown_pct: Decimal | None = None
 
 
 class BacktestResponse(BaseModel):
@@ -372,6 +377,8 @@ def run_backtest(
             start=request.start,
             end=request.end,
             starting_cash=request.starting_cash,
+            max_daily_loss=request.max_daily_loss,
+            max_drawdown_pct=request.max_drawdown_pct,
         )
     except KeyError:
         raise HTTPException(
@@ -429,6 +436,10 @@ class BacktestSummary(BaseModel):
     kernel_isolated: bool
     contract_version: str
     ran_at: str
+    # The limits this run was constrained by, when the caller chose them.
+    # None means the strategy's own applied.
+    max_daily_loss: str | None = None
+    max_drawdown_pct: str | None = None
 
 
 class BacktestDetail(BacktestSummary):

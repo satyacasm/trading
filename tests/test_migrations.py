@@ -231,3 +231,50 @@ def test_bars_intraday_accepts_a_fractional_volume(db_conn):
         "SELECT volume FROM bars_intraday WHERE instrument_id = %s", (iid,)
     ).fetchone()
     assert row[0] == Decimal("0.01000000")
+
+
+def test_backtest_tables_exist(db_conn):
+    rows = db_conn.execute(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
+    ).fetchall()
+    assert {"backtest_runs", "backtest_equity_points"} <= {r[0] for r in rows}
+
+
+def test_an_equity_point_cannot_repeat_a_timestamp_within_a_run(db_conn):
+    """`run_loop` emits one point per dispatched bar and bars are grouped by
+    close_ts, so timestamps within a run are unique by construction. The
+    composite primary key makes the database refuse to let that break: a
+    doubled point would otherwise reach 3d as a wrong Sharpe and 3e as a
+    real feature of the equity path, with nothing anywhere raising.
+    """
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    import psycopg
+
+    user = db_conn.execute("SELECT user_id FROM users LIMIT 1").fetchone()[0]
+    strategy_id = db_conn.execute(
+        "INSERT INTO strategies (user_id, name, version, source, source_sha256, "
+        "status, contract_version) VALUES (%s,'dupe-pk','1.0.0','x','y','REGISTERED','0.1') "
+        "RETURNING strategy_id",
+        (user,),
+    ).fetchone()[0]
+    run_id = db_conn.execute(
+        "INSERT INTO backtest_runs (strategy_id, status, requested_start, requested_end, "
+        "fetch_start, dispatch_from, runtime, kernel_isolated, contract_version) "
+        "VALUES (%s,'PASSED','2024-01-01','2024-01-02',now(),now(),'runc',false,'0.1') "
+        "RETURNING backtest_run_id",
+        (strategy_id,),
+    ).fetchone()[0]
+    ts = datetime(2024, 1, 2, 10, 0, tzinfo=UTC)
+    db_conn.execute(
+        "INSERT INTO backtest_equity_points (backtest_run_id, ts, equity, cash) "
+        "VALUES (%s,%s,%s,%s)",
+        (run_id, ts, Decimal("1"), Decimal("1")),
+    )
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        db_conn.execute(
+            "INSERT INTO backtest_equity_points (backtest_run_id, ts, equity, cash) "
+            "VALUES (%s,%s,%s,%s)",
+            (run_id, ts, Decimal("2"), Decimal("2")),
+        )

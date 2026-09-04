@@ -1075,6 +1075,8 @@ def test_an_empty_window_still_names_the_interval_it_looked_for(db_conn) -> None
     assert window["sessions"] == 0
     assert window["bars"] == "1d"
     assert window["interval_sec"] == 86400
+
+
 @pytest.mark.db
 def test_daily_fetch_stamps_knowable_at_with_the_session_close(db_conn) -> None:  # noqa: ANN001
     """The link between the `close_ts` fix and production.

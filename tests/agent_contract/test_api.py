@@ -589,3 +589,150 @@ def test_the_backtest_route_is_not_a_coroutine() -> None:
     from trading.agent_contract.api import run_backtest
 
     assert not inspect.iscoroutinefunction(run_backtest)
+
+
+def _registered_with_daily_bars(db_conn, local_user_id, *, symbol, last_day):  # noqa: ANN001, ANN201
+    """A strategy registered WITH a manifest, over an instrument whose daily
+    bars stop at `last_day` of 2024-01.
+
+    The manifest matters: registered without one, `backtest` falls back to
+    recovering it by running `configure()` in a container and refuses on
+    MANIFEST_UNRESOLVABLE long before any gate -- so a test asserting only
+    that a refusal happened would pass without the path under test running.
+    """
+    from datetime import UTC, datetime
+
+    from trading.agent_contract.registry import register_strategy
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM',%s,'INR','ACTIVE',%s) "
+        "RETURNING instrument_id",
+        (symbol, f"NSE:CM:{symbol}"),
+    ).fetchone()
+    instrument_id = row[0]
+    for day in range(2, last_day + 1):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, datetime(2024, 1, day, 10, 0, tzinfo=UTC)),
+        )
+    registered = register_strategy(
+        db_conn,
+        user_id=local_user_id,
+        name=f"persist-{symbol.lower()}",
+        version="1.0.0",
+        source=VALID_SOURCE,
+        manifest={
+            "name": f"persist-{symbol.lower()}",
+            "version": "1.0.0",
+            "capital": "100000",
+            "base_currency": "INR",
+            "universe": [{"exchange": "NSE", "segment": "CM", "symbol": symbol}],
+            "data": {"bars": "1d", "history_bars": 0},
+        },
+    )
+    return registered.strategy_id
+
+
+def test_a_refused_backtest_stores_no_run(client, db_conn, local_user_id) -> None:  # noqa: ANN001
+    """Assert zero rows, not a status field.
+
+    A gate that refuses and writes anyway would pass an assertion on the
+    response alone, and the row would then claim a run happened -- which is
+    exactly what "only executed runs are stored" exists to prevent.
+    """
+    strategy_id = _registered_with_daily_bars(
+        db_conn, local_user_id, symbol="PERSISTREFUSE", last_day=4
+    )
+    before = db_conn.execute("SELECT count(*) FROM backtest_runs").fetchone()[0]
+
+    response = client.post(
+        f"/strategies/{strategy_id}/backtests",
+        json={"start": "2024-01-02", "end": "2026-12-31"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "REFUSED"
+    assert "BACKTEST_WINDOW_UNCOVERED" in [f["code"] for f in body["findings"]]
+    assert body["backtest_run_id"] is None
+    after = db_conn.execute("SELECT count(*) FROM backtest_runs").fetchone()[0]
+    assert after == before
+
+
+def _stored_run(db_conn, local_user_id, *, points):  # noqa: ANN001, ANN201
+    """A stored run, written through the real write path rather than by
+    hand, so these read tests cannot drift from what the writer produces."""
+    from datetime import date
+
+    from tests.agent_contract.test_backtest_persistence import _verdict
+    from trading.agent_contract.persistence import record_backtest_run
+    from trading.agent_contract.registry import register_strategy
+
+    registered = register_strategy(
+        db_conn,
+        user_id=local_user_id,
+        name="read-fixture",
+        version="1.0.0",
+        source=VALID_SOURCE,
+    )
+    run_id = record_backtest_run(
+        db_conn,
+        registered.strategy_id,
+        _verdict(points),
+        requested_start=date(2024, 1, 8),
+        requested_end=date(2024, 1, 10),
+        instrument_ids=[58607],
+    )
+    return registered.strategy_id, run_id
+
+
+def test_the_list_route_omits_curves_and_the_detail_route_includes_them(
+    client,  # noqa: ANN001
+    db_conn,  # noqa: ANN001
+    local_user_id,  # noqa: ANN001
+) -> None:
+    """The cheap list is the entire reason there are two routes, and nothing
+    else enforces it: a list that embedded curves would transfer every point
+    of every run to render a table of dates and final equities.
+    """
+    points = [
+        {"ts": "2024-01-08T10:00:00+00:00", "equity": "1000000.0000", "cash": "1000000.0000"},
+        {"ts": "2024-01-09T10:00:00+00:00", "equity": "1000123.4567", "cash": "924286.2400"},
+        {"ts": "2024-01-10T10:00:00+00:00", "equity": "999876.5433", "cash": "924286.2400"},
+    ]
+    strategy_id, run_id = _stored_run(db_conn, local_user_id, points=points)
+
+    listed = client.get(f"/strategies/{strategy_id}/backtests")
+    assert listed.status_code == 200
+    rows = listed.json()
+    assert [r["backtest_run_id"] for r in rows] == [run_id]
+    assert "equity_curve" not in rows[0]
+    assert rows[0]["status"] == "PASSED"
+
+    detail = client.get(f"/backtests/{run_id}")
+    assert detail.status_code == 200
+    curve = detail.json()["equity_curve"]
+    assert [p["ts"] for p in curve] == [p["ts"] for p in points]
+    # Money as strings on the wire, for the reason RunSummary gives: JSON
+    # numbers are IEEE 754 doubles.
+    assert all(isinstance(p["equity"], str) for p in curve)
+    assert curve[1]["equity"] == "1000123.4567"
+
+
+def test_an_unknown_backtest_run_is_404(client) -> None:  # noqa: ANN001
+    response = client.get("/backtests/99999999")
+    assert response.status_code == 404
+    # Not the vacuous 404 an unrouted path returns: the handler ran, looked,
+    # and is naming what it could not find.
+    assert "99999999" in response.json()["detail"]
+
+
+def test_the_backtest_read_routes_are_not_coroutines() -> None:
+    """psycopg is synchronous and an async route running a blocking DB call
+    on the event loop deadlocked this gateway permanently once already."""
+    from trading.agent_contract.api import get_backtest, list_backtests
+
+    assert not inspect.iscoroutinefunction(get_backtest)
+    assert not inspect.iscoroutinefunction(list_backtests)

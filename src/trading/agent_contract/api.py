@@ -53,6 +53,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from psycopg import Connection
 from pydantic import BaseModel, Field
 
+from trading.agent_contract.persistence import (
+    get_backtest_run,
+    list_backtest_runs,
+    record_backtest_run,
+)
 from trading.agent_contract.registry import CONTRACT_VERSION, register_strategy
 from trading.agent_contract.smoke import (
     BacktestVerdict,
@@ -275,6 +280,9 @@ class BacktestResponse(BaseModel):
 
     strategy_id: int
     status: str
+    # None when the run was refused before it reached the container: a
+    # refusal is not a run and is deliberately not stored.
+    backtest_run_id: int | None = None
     bars: str | None = None
     window_start: str | None = None
     window_end: str | None = None
@@ -293,12 +301,15 @@ class BacktestResponse(BaseModel):
     kernel_isolated: bool | None = None
 
 
-def _backtest_response(strategy_id: int, verdict: BacktestVerdict) -> BacktestResponse:
+def _backtest_response(
+    strategy_id: int, verdict: BacktestVerdict, run_id: int | None = None
+) -> BacktestResponse:
     outcome = verdict.outcome or {}
     plan = verdict.plan
     return BacktestResponse(
         strategy_id=strategy_id,
         status="PASSED" if verdict.passed else "REFUSED",
+        backtest_run_id=run_id,
         bars=verdict.bars,
         window_start=plan.start.isoformat() if plan else None,
         window_end=plan.end.isoformat() if plan else None,
@@ -340,7 +351,95 @@ def run_backtest(
         raise HTTPException(
             status_code=404, detail=f"no strategy with strategy_id={strategy_id}"
         ) from None
-    return _backtest_response(strategy_id, verdict)
+
+    run_id: int | None = None
+    if verdict.plan is not None and verdict.outcome is not None:
+        # It reached the container, so it is a run: PASSED or FAILED, both
+        # stored, a crash with its partial curve. A pre-flight refusal has
+        # no outcome and is deliberately not recorded -- it is a
+        # deterministic function of the request, costs a COUNT to
+        # re-derive, and a row would imply to a later reader that a run
+        # happened.
+        run_id = record_backtest_run(
+            conn,
+            strategy_id,
+            verdict,
+            requested_start=request.start,
+            requested_end=request.end,
+            instrument_ids=verdict.instrument_ids,
+        )
+    return _backtest_response(strategy_id, verdict, run_id)
+
+
+class BacktestSummary(BaseModel):
+    """One stored run, WITHOUT its curve.
+
+    The omission is the whole reason there are two read routes: a history
+    view that embedded curves would transfer every point of every run to
+    render a table of dates and final equities.
+    """
+
+    backtest_run_id: int
+    strategy_id: int
+    status: str
+    requested_start: str
+    requested_end: str
+    fetch_start: str
+    dispatch_from: str
+    sessions: int
+    instruments: list[int]
+    history_bars_requested: int
+    history_bars_available: int
+    bars: str | None
+    bar_calls: int
+    orders_placed: int
+    fills: int
+    final_cash: str | None
+    final_equity: str | None
+    breaker_reason: str | None
+    error: str | None
+    findings: list[dict[str, Any]]
+    runtime: str
+    kernel_isolated: bool
+    contract_version: str
+    ran_at: str
+
+
+class BacktestDetail(BacktestSummary):
+    """One stored run WITH its curve, in `ts` order. Money as strings."""
+
+    equity_curve: list[dict[str, str]]
+
+
+@router.get("/strategies/{strategy_id}/backtests", response_model=list[BacktestSummary])
+def list_backtests(
+    strategy_id: int,
+    conn: Annotated[Connection, Depends(get_db_connection)],
+) -> list[BacktestSummary]:
+    """A strategy's run history, newest first, without curves.
+
+    Plain `def`, and a GET that never writes. Not scoped by `user_id`,
+    matching `GET /strategies` -- harmless with one seeded user and no auth,
+    and the same single line to change when auth lands.
+    """
+    return [BacktestSummary(**row) for row in list_backtest_runs(conn, strategy_id)]
+
+
+@router.get("/backtests/{backtest_run_id}", response_model=BacktestDetail)
+def get_backtest(
+    backtest_run_id: int,
+    conn: Annotated[Connection, Depends(get_db_connection)],
+) -> BacktestDetail:
+    """One stored run, with its equity curve.
+
+    Plain `def`, and a GET that never writes.
+    """
+    try:
+        return BacktestDetail(**get_backtest_run(conn, backtest_run_id))
+    except KeyError:
+        raise HTTPException(
+            status_code=404, detail=f"no backtest run with backtest_run_id={backtest_run_id}"
+        ) from None
 
 
 class ContractBundle(BaseModel):

@@ -70,6 +70,10 @@ from trading.runtime.state import RunState
 
 __all__ = ["run_loop"]
 
+
+# Contract §5: cash and equity are 4 dp.
+_MONEY_SCALE = Decimal("0.0001")
+
 _TERMINAL = (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED)
 
 # DP charges (FLAT_PER_SCRIP_PER_DAY) are an Indian broker-day
@@ -372,8 +376,20 @@ def run_loop(
             # one that actually stopped the run, so a drawdown drawn from
             # this curve and a breaker latch in the same run are the same
             # read by construction, not by agreement.
+            # Quantized to the 4 dp scale contract §5 declares for cash and
+            # equity, not left at whatever scale the arithmetic produced.
+            # `str(Decimal)` preserves scale, so an unquantized point reads
+            # "1000000" here and "1000000.0000" after a round trip through
+            # numeric(18,4) -- numerically identical, but the same run then
+            # has two string forms depending on which endpoint is asked, and
+            # a client that caches or diffs them sees changes that did not
+            # happen.
             state.equity_curve.append(
-                {"ts": ts_iso, "equity": str(equity), "cash": str(state.cash)}
+                {
+                    "ts": ts_iso,
+                    "equity": str(equity.quantize(_MONEY_SCALE)),
+                    "cash": str(state.cash.quantize(_MONEY_SCALE)),
+                }
             )
             peak_equity = equity if state.peak_equity is None else max(state.peak_equity, equity)
             state.peak_equity = peak_equity
@@ -407,8 +423,8 @@ def run_loop(
             orders=_snapshots(state),
             fills=fills,
             rejections=tuple(rejections),
-            final_cash=str(state.cash),
-            final_equity=str(ctx.portfolio.equity),
+            final_cash=str(state.cash.quantize(_MONEY_SCALE)),
+            final_equity=str(ctx.portfolio.equity.quantize(_MONEY_SCALE)),
             breaker_reason=state.breaker_reason,
             logs=tuple(state.logs),
             error=crash.detail,
@@ -422,8 +438,8 @@ def run_loop(
         orders=_snapshots(state),
         fills=fills,
         rejections=tuple(rejections),
-        final_cash=str(state.cash),
-        final_equity=str(ctx.portfolio.equity),
+        final_cash=str(state.cash.quantize(_MONEY_SCALE)),
+        final_equity=str(ctx.portfolio.equity.quantize(_MONEY_SCALE)),
         breaker_reason=state.breaker_reason,
         logs=tuple(state.logs),
         equity_curve=tuple(state.equity_curve),

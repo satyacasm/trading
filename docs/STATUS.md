@@ -1,39 +1,81 @@
 # Where this project stands
 
-**Updated:** 2026-09-03, ~23:15 IST. Keep this file current — it is the
+**Updated:** 2026-09-04, ~11:00 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
 
 ## The one thing to do next
 
-**Task 12: live end-to-end verification of paper trading.** It needs an open
-NSE session — **09:15–15:30 IST**. Runbook: `docs/paper-trading-live-verification.md`
-(untracked; decide whether to commit it with results filled in).
+**Phase 3 sub-project 3b — backtest runs at scale, and the equity curve.**
+Design approved 2026-09-04 at
+`docs/superpowers/specs/2026-09-03-backtest-runs-at-scale-design.md`, plus one
+addition agreed at approval: the D3b-4 sizing gate must also report when the
+requested window extends past available data (`bars_daily` ends
+**2026-08-21**), so a backtest through "today" cannot silently run on two
+weeks of nothing. Start with **D3b-1**, the `close_ts` money bug.
 
-It is the last item on the 12-task paper-trading plan, and two of its steps
-matter more than the rest:
+### Task 12 is done except for three things nobody but the operator can do
 
-- **Step 3 — the charge comparison.** Compare a real fill's itemised charges
-  against Upstox's brokerage calculator, line by line. This is the *only*
-  external grading the cost model gets. `replay_portfolio` re-derives cash from
-  the **stored** `fills.total_charges`, so it proves ledger/cache consistency,
-  not charge correctness — a fill written with a wrong charge replays to the
-  same wrong balance and the invariant still passes. Write the recorded figures
-  into `tests/paper/test_charges_golden.py`, which is currently failing on its
-  `REPLACE ME` guard (8 tests, excluded by default via `-m 'not golden'`) and is
-  exactly what those figures unblock.
-- **Step 9 — watch for `paper_engine.reconcile_adopted`.** If it fires during
-  normal operation, the `orders:control` publish/commit race is real at
-  production tick rates and **FU-1 is promoted from follow-up to blocker**.
-  Evidence so far: it did **not** fire across the seven orders placed on the
-  night of 2026-09-02 (`grep -c reconcile_adopted` on the engine log: 0). Weak (low tick rate, crypto only), but pointing toward FU-1 staying a
-  follow-up.
+Executed 2026-09-04 against an open NSE session. **8 of 10 steps pass.** Full
+evidence in `docs/paper-trading-live-verification.md`.
 
-Note the UI now covers most of the runbook — create the INR portfolio from
-`/portfolio`, place the RELIANCE order from the chart page, read the fill in
-the blotter. Equity orders are refused before 09:15 by the market-hours check;
-that is correct behaviour and the ticket will say so.
+- **Step 3 — the charge comparison.** Still the only external grading the cost
+  model gets, and still ungraded. Figures are recorded and waiting; three lines
+  disagree with standard NSE rates and should be checked first:
+  **IPFT is ₹0.0000 on every fill** (₹10/crore should give ₹0.1328 on a
+  ₹132,766 turnover — the rate behaves like `1e-9`, 1000× low); **GST excludes
+  the SEBI turnover fee from its base** (4.33 vs 4.36); and **exchange txn
+  implies 0.00307%** where NSE's current cash rate may be 0.00297%. These
+  figures are what unblocks `tests/paper/test_charges_golden.py`'s
+  `REPLACE ME` guard.
+- **Step 5 — the session sweep.** Order **30** (limit BUY 10 RELIANCE @ ₹1200)
+  is resting `OPEN` and must go `EXPIRED` at 15:30 IST. The engine was
+  restarted 10:54 on the fixed sweep, so this now verifies corrected code.
+- **Step 6 — the circuit breaker.** Blocked: `TELEGRAM_BOT_TOKEN` and
+  `TELEGRAM_CHAT_ID` are unset, so `run_alert_worker` idles and no alert can
+  reach a phone.
+
+**Step 9 answered in FU-1's favour:** `paper_engine.reconcile_adopted` fired
+**0 times** across the 5 orders placed through the API this session, on top of
+the 7 from 2026-09-02. FU-1 stays a follow-up.
+
+### Two things Task 12 found that the test suite could not
+
+**1. A `DAY` order silently became GTC across engine downtime. Fixed and
+merged (`b59f98c`).** Order 24 (`RELIANCE BUY 2 MARKET DELIVERY`) was
+submitted 2026-09-03 07:12 UTC and filled 2026-09-04 04:48 UTC — one second
+after the engine was restarted, ~21 hours late, at a price ~₹26 from where it
+was placed. `sweep_expired_day_orders` derived the session date from `now`
+instead of from the order, so it asked "is *today's* session closed?" — which
+at 10:18 IST it was not. The order therefore survived every sweep, including
+the `startup_sweep` that exists precisely to catch orders orphaned by
+downtime. A continuously-running engine hides this completely, which is why
+every existing sweep test missed it: they submit and sweep inside one
+simulated session.
+
+**2. Live bar capture is only ~20–30% complete, and it is not a code bug.**
+The machine had been on battery, deep-sleeping on a ~15-minute cycle with
+41-second DarkWake windows; the ingestors only run while it is awake. Both
+feeds gapping at *identical* minutes — despite two independent ingestor
+processes and two unrelated venues — is what ruled out `bar_aggregator` and
+pointed outside the codebase.
+
+| | affected? |
+|---|---|
+| `bars_daily` (51M rows, 585,266 instruments, → 2026-08-21) | **No** — entirely Phase 0 backfill |
+| `bars_intraday` backfill (`source=7`, → 2026-08-26) | No |
+| `bars_intraday` live capture (`source` 6/8, last 11 days) | **Yes — 4%–48% per day, mostly 10–30%** |
+
+3b's scope decision (daily bars) therefore sidesteps this entirely — but note
+the corroboration: the passing dogfood example recorded "491 `on_bar` calls
+over 5 sessions" against 5 × 375 = 1,875 expected, i.e. ~26%, squarely in this
+band. **That example was already running on a quarter of reality and nothing
+said so.** NSE holes are repairable with the existing
+`upstox_intraday_backfill`; crypto has no REST backfill path in the repo.
+
+Mitigation for a working session: `caffeinate -dimsu`, and keep the machine on
+AC. Anything long-running deserves better than a laptop that sleeps.
 
 ---
 
@@ -42,10 +84,10 @@ that is correct behaviour and the ticket will say so.
 | Phase | State |
 |---|---|
 | **Phase 0** — foundations | Complete 2026-08-24. 51M bars, 44,341 corporate actions, `docs/phase-0-closeout.md`. |
-| **Phase 1** — streaming + manual paper trading | Shipped, bar Task 12. Crypto streaming, bar aggregation, Upstox WS, charts/watchlist UI, paper-trading core, and the trading UI are all merged to `main`. |
+| **Phase 1** — streaming + manual paper trading | **Shipped.** Task 12 executed 2026-09-04, 8/10 steps pass; the three open items are operator actions, not code. |
 | **Phase 2** — Agent Contract + strategy runtime | **Started.** Draft at `docs/agent-contract/STRATEGY_CONTRACT.md`. |
 | **Phase 2.5** — intelligence layer | Not started. Recorders were meant to start in Phase 0 and compound; check whether the news/announcements recorder is actually running. |
-| **Phase 3** — backtesting + metrics | **Sub-project 3a complete, and now visible in the UI.** `smoke_test` reads a strategy's declared `data.bars` and either serves it correctly (`"1m"`, `"1d"`) or rejects it with an honest finding naming the gap (see below); `/strategies` reports which interval a run actually received, and lists what is registered. 3b (backtest runs at scale + persistence), 3c–3e (metrics, report UI, walk-forward, robustness) not started. |
+| **Phase 3** — backtesting + metrics | **Sub-project 3a complete, and now visible in the UI.** `smoke_test` reads a strategy's declared `data.bars` and either serves it correctly (`"1m"`, `"1d"`) or rejects it with an honest finding naming the gap (see below); `/strategies` reports which interval a run actually received, and lists what is registered. **3b (backtest runs at scale + the equity curve) approved and in progress.** 3c–3f (persistence, metrics, report UI, walk-forward, robustness) not started. |
 
 ---
 
@@ -336,6 +378,10 @@ well-understood engineering; the contract is the bet.
 | **FU-1** | After-commit callback registry on `get_db_connection`, so the `orders:control` `"new"` publish happens after the commit. The documented FastAPI fix does **not** exist in 0.141.1 — verified empirically, background tasks run before yield-dependency teardown. A 5s reconciliation sweep is the shipped backstop. | Task 12 Step 9 decides promotion. |
 | **FU-2** | The paper engine is single-process **by design**, and DP-charge dedup correctness now depends on it. A second engine process on the same instrument would race the dedup SELECT and double-charge. | Gate any horizontal scaling on making that race-safe. |
 | **FU-3** | No CHECK constraint ties `charge_schedules.basis` to `.charge_type`. `InvalidChargeSchedule` catches a malformed row at fill time; a constraint would refuse it at write time. | Open. |
+| **FU-4** | Live bar capture is ~20–30% complete because the host sleeps. NSE holes are repairable via `upstox_intraday_backfill`; crypto needs a Binance REST klines backfill that does not exist. Anything reading live `bars_intraday` as if it were continuous is wrong. | Open. Does not block 3b (daily bars). |
+| **FU-5** | Three suspected charge-model errors awaiting the Step 3 external grading: IPFT reads ₹0.0000 (rate behaves like `1e-9`; ₹10/crore implies `1e-6`), GST's base excludes the SEBI turnover fee, and exchange txn implies 0.00307%. | Blocked on Step 3. |
+| **FU-6** | Three `RELIANCE` CM instrument rows exist — `58607` (NSE, Upstox-bound, the live one), `108061` (NSE, no binding, no bars), `101629` (BSE). Picking the wrong id yields an instrument that never ticks. | Open. |
+| **FU-7** | `paper_engine` logs races, rejections and sweeps but **never a successful fill**, so the engine log cannot be used to follow trading activity. | Open; made Step 9 harder to trust. |
 | — | Migrations `0007`, `0008`, `0009` reference `.superpowers/sdd/` paths in their docstrings — dangling once that scratch directory is deleted. Same class as the M-a fix, in three committed files. | Cosmetic. |
 
 ---

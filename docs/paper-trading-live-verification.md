@@ -1,7 +1,11 @@
 # Paper trading core — live end-to-end verification
 
-**Status:** runbook prepared 2026-09-02 evening; execution pending an open NSE
-session (09:15–15:30 IST). Results are recorded in place, below each step.
+**Status:** runbook prepared 2026-09-02 evening; **executed 2026-09-04 against
+an open NSE session.** Results are in the Results section at the bottom.
+8 of 10 steps pass. Step 3 (the charge comparison) awaits an external grading
+against Upstox's calculator; Step 6 is blocked on Telegram credentials; Step 5
+is confirmed resting and awaits the 15:30 sweep. Two live defects found, one
+fixed (`403f823`).
 
 This is Task 12 of the paper-trading-core plan. It runs the shipped stack
 against real market data and records evidence, matching the evidentiary
@@ -38,7 +42,7 @@ uv run python -m trading.paper.alerts                   # see note
 > database and never sent, which reads as a failure of the circuit breaker when
 > it is really just a worker that was never started.
 
-Confirm `alembic current` shows `0009`. Migration `0009` adds `fills.tds`; a
+Confirm `alembic current` shows at least `0009` (the stack is now at `0011`). Migration `0009` adds `fills.tds`; a
 stack running an older schema will fail every fill insert.
 
 ## Step 1 — create a portfolio
@@ -148,4 +152,198 @@ if small, or filed as a new discovered-live task.
 
 ## Results
 
-_To be filled in during the session._
+**Executed 2026-09-04, 10:12–10:35 IST. NSE CM open (`trading_calendar`
+confirms `is_trading_day = true`, 09:15–15:30).** Stack at migration `0011`.
+
+### Step 0 — stack up
+
+`paper.engine` and `paper.alerts` were **both not running** when the session
+started; everything else (gateway, three ingestors, web) had been up for days.
+Started both, logging to `logs/`.
+
+**Discovered here, and it invalidates any read of "the data looks thin":** the
+machine had been on battery, deep-sleeping on a ~15-minute cycle with
+41-second DarkWake windows. The ingestors only run while it is awake, so the
+capture is not continuous. `pmset -g log` for the morning:
+
+```
+09:15:01  Sleep          <- market opens, machine asleep
+09:30:25  DarkWake (41 secs)
+09:31:07  Sleep
+09:42:15  DarkWake (46 secs)
+09:43:01  Sleep
+10:00:22  DarkWake (41 secs)
+10:01:03  Sleep
+10:09:55  Wake ... lid ... HID Activity
+```
+
+Both feeds gap at identical minutes despite coming from two independent
+ingestor processes and two unrelated venues -- which is what ruled out the
+shared consumer (`bar_aggregator`) and pointed outside the codebase. Measured
+completeness of *live-captured* bars, 2026-08-24 to 2026-09-04:
+
+| | instruments | avg bars/day | of expected |
+|---|---|---|---|
+| NSE live (`source=8`) | 5 | 20–310 | **5%–83%**, mostly 10–30% |
+| Crypto live (`source=6`) | 25 | 57–684 | **4%–48%**, mostly 10–35% |
+
+`bars_daily` is unaffected (entirely Phase 0 backfill, `source` 1–5), though
+it ends 2026-08-21 -- nothing rolls live bars up to daily. `bars_intraday`
+`source=7` (the historical Upstox backfill) is complete through 2026-08-26,
+so only the ~11 days of live capture are holed. NSE holes are repairable with
+the existing `upstox_intraday_backfill`; crypto has no REST backfill path in
+the repo today.
+
+Mitigated for the session with `caffeinate -dimsu`; the machine is on AC.
+
+### Step 1 — portfolio
+
+`portfolio_id = 11`, "Task12 Live Verify 2026-09-04", INR, ₹1,000,000.00.
+
+### Step 2 — market buy, 100 RELIANCE, DELIVERY
+
+Order **26**, instrument 58607 (the Upstox-bound NSE RELIANCE; note 108061
+and 101629 are duplicate RELIANCE CM rows carrying no live data).
+
+- Submitted 10:20:40 IST, **filled 1.4s later** at **₹1327.66**, tick
+  `2026-09-04 04:50:41+00`.
+- Cash 1,000,000.00 → 867,052.55. Notional 132,766.00 **+ charges 181.45**
+  = 132,947.45. Cash moved by notional *plus* charges. ✓
+
+### Step 3 — the charge comparison
+
+**Not yet externally graded — this remains the one open step.** Figures
+recorded for comparison against Upstox's calculator:
+
+| Charge | Buy 100 @ 1327.66 | Sell 100 @ 1326.54 | Buy 50 @ 1327.26 | Sell 50 @ 1325.64 |
+|---|---|---|---|---|
+| Brokerage | 20.00 | 20.00 | 20.00 | 20.00 |
+| STT | 133.00 | 133.00 | 66.00 | 66.00 |
+| Exchange txn | 4.08 | 4.07 | 2.04 | 2.03 |
+| SEBI fee | 0.13 | 0.13 | 0.07 | 0.07 |
+| Stamp duty | 19.91 | 0.00 | 9.95 | 0.00 |
+| IPFT | 0.00 | 0.00 | 0.00 | 0.00 |
+| GST | 4.33 | 7.93 | 3.97 | 3.97 |
+| DP charges | 0.00 | 20.00 | 0.00 | 0.00 |
+| **Total** | **181.45** | **185.13** | **102.03** | **92.07** |
+
+Three lines disagree with standard NSE rates and should be checked first:
+
+1. **IPFT is ₹0.0000** on every fill. At ₹10/crore (rate `1e-6`) a ₹132,766
+   turnover owes ₹0.1328. The stored rate behaves like `1e-9` -- 1000× low.
+   Note migration history records an IPFT rate change `1e-7` → `1e-9`.
+2. **GST excludes the SEBI turnover fee from its base.** Ours is
+   0.18 × (brokerage + exchange txn) = 0.18 × 24.08 = 4.33. Including the
+   SEBI fee gives 0.18 × 24.21 = 4.36. DP *is* correctly in the base
+   (sell 1: 0.18 × (20 + 4.07 + 20) = 7.93 ✓).
+3. **Exchange txn implies 0.00307%** (0.0000307 × 132,766 = 4.08). If NSE's
+   current cash-market rate is 0.00297%, the correct figure is 3.94.
+
+Brokerage, STT (rounded to the rupee), stamp duty (buy side only) and DP all
+match expectation.
+
+### Step 4 — sell side, and the DP rule ✓
+
+Order **27**, sell 100 @ ₹1326.54. **STT ₹133.00 charged on the delivery sell
+too** ✓. Stamp duty ₹0.00 on the sell ✓ (buy-side only). DP ₹20.00 ✓.
+
+The per-scrip-per-day check the whole-branch review added — second same-day
+round trip, orders **28**/**29**:
+
+| | Sell 1 (100) | Sell 2 (50, same day) |
+|---|---|---|
+| DP | ₹20.00 | **₹0.00** ✓ |
+| GST | 7.93 = 0.18×(20+4.07+**20**) | 3.97 = 0.18×(20+2.03) ✓ |
+
+DP charged **once**, on the first sell only, and GST falls with it. The two
+fixes have **not** come apart. First contact with real data; passes.
+
+### Step 5 — resting limit order and the session sweep
+
+Order **30**, limit BUY 10 @ ₹1200 (market ~₹1326). Rests as `OPEN` ✓, does
+not fill ✓. **Sweep to `EXPIRED` at 15:30 IST still to be confirmed.**
+
+### Step 6 — circuit breaker
+
+**Blocked:** `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` unset, so
+`run_alert_worker` idles (`alerts.worker_idle_no_bot_token`) and no alert can
+reach a phone. Outstanding.
+
+### Step 7 — replay invariant ✓
+
+`replay_portfolio` reproduces cash **and** positions exactly for all three
+live portfolios, including the two traded today:
+
+```
+portfolio  9: cash stored=926157.0485 replay=926157.0485 MATCH
+              instrument 642283 qty 0.95 avg_cost 77284.6123 MATCH
+portfolio 10: cash stored=997318.9900 replay=997318.9900 MATCH
+              instrument  58607 qty 2.00 avg_cost  1326.9600 MATCH
+portfolio 11: cash stored=999246.3200 replay=999246.3200 MATCH
+              instrument  58607 qty 0E-8 avg_cost  1327.2600 MATCH
+```
+
+Portfolio 11 net: ₹1,000,000.00 → ₹999,246.32, i.e. ₹753.68 for two round
+trips (₹560.68 charges + ₹193.00 adverse price movement).
+
+### Step 8 — currency enforcement ✓
+
+INR portfolio 11 buying BTC-USDT (642283) → **HTTP 400**:
+
+```
+portfolio 11 has base_currency='INR'; instrument_id=642283 is denominated
+in 'USDT' -- a portfolio is single-currency, no FX conversion
+```
+
+Names both currencies, as required.
+
+### Step 9 — reconciliation log ✓ (so far)
+
+**`paper_engine.reconcile_adopted`: 0 occurrences** across 5 orders placed
+through the HTTP API this session (26–30), all of which reached the engine by
+control message. Combined with the 7 orders of 2026-09-02, still pointing
+toward **FU-1 staying a follow-up**. Caveat unchanged: low order rate.
+
+### Step 10 — issues found
+
+**DISCOVERED-LIVE 1 — a `DAY` order silently becomes GTC across engine
+downtime. Fixed.**
+
+Order **24** (`RELIANCE BUY 2 MARKET DELIVERY`, portfolio 10) was submitted
+2026-09-03 07:12:48 UTC and **filled 2026-09-04 04:48:06 UTC** — one second
+after the engine was started this morning, ~21 hours late, at ₹1326.96
+against a price ~₹1301 when it was placed.
+
+`sweep_expired_day_orders` calls `_is_session_closed`, which derived the
+session date from `now` rather than from the order. It therefore asked "is
+*today's* session closed?" — at 10:18 IST it was not — so the order was never
+swept, on any run, including the `paper_engine.startup_sweep` that exists
+specifically to catch orders orphaned by downtime. It logged nothing.
+
+A continuously-running engine hides this completely (at 15:30 the two dates
+agree), which is why the suite missed it: every existing sweep test submits
+and sweeps within one simulated session.
+
+Fixed on branch `fix-day-order-session-expiry` (`403f823`), TDD: the session
+date is now derived per order from `submitted_at`, and the check moved inside
+the per-order loop since two orders on one instrument can belong to different
+sessions. Test
+`test_sweep_expires_day_order_submitted_in_an_earlier_session` fails
+(`assert [] == [order_id]`) before the change and passes after; 944 backend
+tests green, ruff and mypy clean.
+
+**DISCOVERED-LIVE 2 — live bar capture is ~20–30% complete.** See Step 0.
+Not a code defect; a consequence of running the stack on a sleeping laptop.
+Material for Phase 3b, which would otherwise build equity curves on it. Worth
+noting that the passing dogfood example recorded "491 `on_bar` calls over 5
+sessions" — 5 × 375 = 1,875 expected, so ~26%, matching this band exactly.
+
+**Observation — the engine logs no successful fill.** `paper_engine` logs
+races, rejections and sweeps, but a normal fill produces no line at all, so
+the engine log cannot be used to follow trading activity. Deliberate or not,
+it made Step 9's "watch the log" harder to trust than expected.
+
+**Observation — duplicate RELIANCE instruments.** `58607` (NSE, Upstox-bound,
+live), `108061` (NSE, no binding, no bars) and `101629` (BSE). Picking the
+wrong id yields an instrument that never ticks.
+

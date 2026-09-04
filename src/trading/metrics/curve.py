@@ -39,6 +39,7 @@ __all__ = [
     "periods_per_year",
     "sharpe",
     "sortino",
+    "summarize",
     "total_return",
     "value_at_risk",
     "worst_period",
@@ -57,6 +58,9 @@ _DAYS_PER_YEAR = Decimal("365")
 # would put a 19:00 UTC print into the previous month and silently move a
 # day's P&L across a month boundary.
 _IST = ZoneInfo("Asia/Kolkata")
+
+# Ratios cross the wire at a fixed scale -- see `summarize._s`.
+_RATIO_SCALE = Decimal("0.00000001")
 
 
 def periods_per_year(bars: str | None) -> int | None:
@@ -339,3 +343,74 @@ def rolling_sharpe(
             # index `end - 1` is stamped with that point's timestamp.
             out.append((points[end][0], value))
     return out
+
+
+def summarize(points: list[CurvePoint], bars: str | None, risk_free: Decimal) -> dict[str, object]:
+    """Every curve metric, rendered for the wire.
+
+    Ratios cross as strings alongside the money they derive from: JSON has
+    no decimal type, so a number here would reach every client as a double
+    -- the representation this codebase refuses to let money take, and
+    returns are money-derived.
+
+    `risk_free` is echoed back. On an Indian platform, silently assuming a
+    zero risk-free rate flatters every strategy: one returning 6% a year
+    reads as respectable and is in fact worse than a government bond. A
+    reader who never considered the question is told what was assumed.
+    """
+
+    def _s(value: Decimal | None) -> str | None:
+        """Ratios at a fixed 8 dp.
+
+        Full `Decimal` precision would leak the arithmetic's 28-digit
+        context onto the wire, where it is both noise and unstable:
+        reordering two mathematically identical operations shifts the last
+        digits, so every client sees a changed value and any test pinning
+        one breaks for no reason. Money has a declared scale; ratios need
+        one too, or the response is a function of the implementation
+        rather than of the data. Eight is far more than any display needs.
+        """
+        return None if value is None else str(value.quantize(_RATIO_SCALE))
+
+    periods = periods_per_year(bars)
+    returns = period_returns(points)
+    dd = drawdown(points)
+    return {
+        "risk_free": str(risk_free),
+        "periods_per_year": periods,
+        "total_return": _s(total_return(points)),
+        "cagr": _s(cagr(points)),
+        "volatility": _s(volatility(returns, periods) if periods else None),
+        "sharpe": _s(sharpe(returns, periods, risk_free) if periods else None),
+        "sortino": _s(sortino(returns, periods, risk_free) if periods else None),
+        "calmar": _s(calmar(points)),
+        "max_drawdown": None
+        if dd is None
+        else {
+            "depth": str(dd.depth.quantize(_RATIO_SCALE)),
+            "peak_ts": dd.peak_ts.isoformat(),
+            "trough_ts": dd.trough_ts.isoformat(),
+            "recovered_ts": None if dd.recovered_ts is None else dd.recovered_ts.isoformat(),
+            "recovered": dd.recovered,
+            "sessions": dd.sessions,
+            "days": dd.days,
+        },
+        "value_at_risk_95": _s(value_at_risk(returns, Decimal("0.05"))),
+        "worst_period": (
+            None
+            if (wp := worst_period(points)) is None
+            else {"ts": wp[0].isoformat(), "return": str(wp[1].quantize(_RATIO_SCALE))}
+        ),
+        "drawdown_curve": [
+            {"ts": ts.isoformat(), "drawdown": str(d.quantize(_RATIO_SCALE))}
+            for ts, d in drawdown_curve(points)
+        ],
+        "monthly_returns": [
+            {"month": m, "return": str(r.quantize(_RATIO_SCALE))}
+            for m, r in monthly_returns(points)
+        ],
+        "rolling_sharpe": [
+            {"ts": ts.isoformat(), "sharpe": str(v.quantize(_RATIO_SCALE))}
+            for ts, v in rolling_sharpe(points, bars, risk_free)
+        ],
+    }

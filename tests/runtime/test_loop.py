@@ -725,3 +725,65 @@ def test_dp_charge_is_suppressed_on_a_second_same_day_sell() -> None:
     assert outcome.fills == 3
     assert outcome.final_cash == "99910.00"
     assert outcome.final_equity == "99910.00"
+
+
+def test_the_curve_records_the_same_equity_the_breaker_latched_on() -> None:
+    """D3b-2's claim is that a drawdown drawn from the curve and a breaker
+    latch recorded in the same run *cannot* disagree, because they are one
+    number read once rather than two mark-to-market implementations. That is
+    only enforceable if something asserts the equality, so this does.
+
+    Reconstructing the curve outside the loop -- from returned fills, say --
+    is the alternative that makes this test impossible to write honestly: a
+    second implementation can drift from the one that actually stopped the
+    run, in a platform whose headline feature is an honest cost model.
+    """
+
+    class BuyAndHold:
+        def __init__(self) -> None:
+            self.done = False
+
+        def on_bar(self, ctx, bars) -> None:  # noqa: ANN001
+            if not self.done:
+                self.done = True
+                ctx.order(1, side="BUY", quantity=Decimal("100"), rationale="entry")
+
+    outcome = run_loop(
+        strategy=BuyAndHold(),
+        bars=InMemoryBars({1: _series(1, ["100", "100", "10"])}),
+        schedules=_schedules(),
+        starting_cash=Decimal("100000"),
+        slippage_bps=Decimal("0"),
+        max_daily_loss=Decimal("1000"),
+    )
+
+    assert outcome.breaker_reason is not None
+    assert outcome.equity_curve, "a run that dispatched bars must have a curve"
+    # One point per dispatched bar, and the last one is the equity the
+    # breaker stopped on -- the same read, not a recomputation.
+    assert len(outcome.equity_curve) == outcome.bar_calls
+    assert outcome.equity_curve[-1]["equity"] == outcome.final_equity
+    # Money as strings, like every other monetary field in RunOutcome:
+    # JSON numbers are IEEE 754 doubles and a curve of subtly wrong equity
+    # is worse than no curve at all.
+    assert all(isinstance(point["equity"], str) for point in outcome.equity_curve)
+    assert all(isinstance(point["cash"], str) for point in outcome.equity_curve)
+
+
+def test_the_curve_carries_the_loop_clock_so_a_daily_run_is_dated_by_session() -> None:
+    """The curve's `ts` is the loop's clock, which after the daily-clock fix
+    is the session close. A curve stamped `ts + 86400` would place every
+    point a day after the session it describes, and 3c persists these.
+    """
+    closes = [
+        datetime(2026, 3, 2, 10, 0, tzinfo=UTC),
+        datetime(2026, 3, 3, 10, 0, tzinfo=UTC),
+    ]
+    outcome = run_loop(
+        strategy=_Recorder(),
+        bars=InMemoryBars({1: tuple(_daily_bar(1, ts, "100") for ts in closes)}),
+        schedules=(),
+        starting_cash=Decimal("100000"),
+        slippage_bps=Decimal("0"),
+    )
+    assert [point["ts"] for point in outcome.equity_curve] == [ts.isoformat() for ts in closes]

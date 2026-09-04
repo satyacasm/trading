@@ -338,6 +338,14 @@ def run_loop(
             # as unset by a truthy-style fallback (see the module's
             # calling brief; both are always Decimal by this point).
             equity = ctx.portfolio.equity
+            # The breaker's own number, recorded rather than recomputed. A
+            # second mark-to-market outside this loop could drift from the
+            # one that actually stopped the run, so a drawdown drawn from
+            # this curve and a breaker latch in the same run are the same
+            # read by construction, not by agreement.
+            state.equity_curve.append(
+                {"ts": ts_iso, "equity": str(equity), "cash": str(state.cash)}
+            )
             peak_equity = equity if state.peak_equity is None else max(state.peak_equity, equity)
             state.peak_equity = peak_equity
             if state.day_open_equity is None:
@@ -376,6 +384,7 @@ def run_loop(
             logs=tuple(state.logs),
             error=crash.detail,
             crashed_at={"handler": crash.handler, "ts": crash.ts, "bar_calls": state.bar_calls},
+            equity_curve=tuple(state.equity_curve),
         )
 
     return RunOutcome(
@@ -388,4 +397,5 @@ def run_loop(
         final_equity=str(ctx.portfolio.equity),
         breaker_reason=state.breaker_reason,
         logs=tuple(state.logs),
+        equity_curve=tuple(state.equity_curve),
     )

@@ -2,10 +2,10 @@
 
 **Status:** runbook prepared 2026-09-02 evening; **executed 2026-09-04 against
 an open NSE session.** Results are in the Results section at the bottom.
-8 of 10 steps pass. Step 3 (the charge comparison) awaits an external grading
-against Upstox's calculator; Step 6 is blocked on Telegram credentials; Step 5
-is confirmed resting and awaits the 15:30 sweep. Two live defects found, one
-fixed (`403f823`).
+**9 of 10 steps pass.** Step 5 completed at the 15:30 close. Step 3 (the
+charge comparison) awaits an external grading against Upstox's calculator,
+and Step 6 is blocked on Telegram credentials -- both operator actions, not
+code. Two live defects found, one fixed and merged (`b59f98c`).
 
 This is Task 12 of the paper-trading-core plan. It runs the shipped stack
 against real market data and records evidence, matching the evidentiary
@@ -260,8 +260,26 @@ fixes have **not** come apart. First contact with real data; passes.
 
 ### Step 5 — resting limit order and the session sweep
 
-Order **30**, limit BUY 10 @ ₹1200 (market ~₹1326). Rests as `OPEN` ✓, does
-not fill ✓. **Sweep to `EXPIRED` at 15:30 IST still to be confirmed.**
+Order **30**, limit BUY 10 @ ₹1200 (market ~₹1326). Rested as `OPEN` from
+10:23 ✓, never filled ✓, and **swept to `EXPIRED` at the close** ✓:
+
+```
+15:30:06 IST  paper_engine.session_sweep  order_ids=[30]
+order 30: LIMIT @ 1200.0000, DAY, EXPIRED
+          submitted_at 04:53:30 UTC (10:23 IST)
+          updated_at   10:00:06 UTC (15:30:06 IST)
+```
+
+Six seconds after the 15:30:00 close, by the engine's periodic sweep.
+
+**This also verifies the DISCOVERED-LIVE 1 fix against a real session
+close.** The engine was restarted at 10:54 on the corrected predicate,
+which now anchors the session date to the order's `submitted_at` rather
+than to `now`. Order 30 was submitted *today*, so both readings agree for
+it -- what this proves is that the fix does not over-expire a live order
+during its own session, having left it resting for five hours before
+expiring it exactly on time. The under-expiry half was proven separately
+by the unit test that reddens without the fix.
 
 ### Step 6 — circuit breaker
 
@@ -299,9 +317,10 @@ Names both currencies, as required.
 
 ### Step 9 — reconciliation log ✓ (so far)
 
-**`paper_engine.reconcile_adopted`: 0 occurrences** across 5 orders placed
-through the HTTP API this session (26–30), all of which reached the engine by
-control message. Combined with the 7 orders of 2026-09-02, still pointing
+**`paper_engine.reconcile_adopted`: 0 occurrences** across the whole
+session -- 5 orders placed through the HTTP API (26–30), all of which
+reached the engine by control message, plus a full 09:15–15:30 window
+including the session-close sweep. Combined with the 7 orders of 2026-09-02, still pointing
 toward **FU-1 staying a follow-up**. Caveat unchanged: low order rate.
 
 ### Step 10 — issues found

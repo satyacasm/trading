@@ -1,30 +1,83 @@
 # Where this project stands
 
-**Updated:** 2026-09-04, ~16:45 IST. Keep this file current — it is the
+**Updated:** 2026-09-04, ~17:15 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
 
 ## The one thing to do next
 
-**A per-fill ledger in `RunOutcome`.** It is now the single highest-value
-change left in Phase 3, and it is a *runtime* change, not a metrics or UI
-one. `OrderSnapshot` stops at `status` and `submitted_at`, and `fills` is a
-bare count, so nothing downstream can see a fill's price, side or charges.
-Emitting one unblocks, in a single change:
+**Phase 3f — walk-forward and the robustness suite.** Everything it needs
+now exists: 3d's metrics, 3c's stored curves, and the fill ledger. Three
+pieces, per implementation-plan.md §228:
 
-- **the cost-drag report** (gross versus net of all Indian charges) — the
-  one §8 calls the most sobering chart we can show a retail options trader;
-- **trade metrics** — win rate, profit factor, average win/loss,
-  expectancy, turnover;
-- **the post-tax P&L lens** (§8), which needs holding periods per fill.
+- **A 2x slippage-and-cost stress rerun** on every backtest. "If the edge
+  dies at 2x, it was never an edge." The ledger makes the cost half of
+  that measurable for the first time.
+- **A Monte Carlo trade-order reshuffle**, producing a *distribution* of
+  max drawdowns and terminal equities rather than one lucky path, with the
+  5th-percentile outcome shown as prominently as the mean. `round_trips`
+  is the input.
+- **Walk-forward analysis** (§6).
 
-3d and 3e are both built to receive it: the metrics module is a pure
-function of what it is given, and the report page already has the panel
-grid to hold it.
+The **post-tax P&L lens** (§8) is the other open item and is deliberately
+its own design: STCG/LTCG holding periods, F&O business-income framing,
+and the crypto 30% + 1% TDS regime with no loss offset. Four regimes and a
+holding-period engine, and the fill ledger is now the input it was waiting
+on.
 
-After that, **3f** — walk-forward, the 2× cost stress rerun, and the Monte
-Carlo trade-order reshuffle — all of which consume 3d's metrics.
+---
+
+## The fill ledger — shipped 2026-09-04 (merged)
+
+`RunOutcome` now carries one record per fill with all nine charge
+components itemised, migration `0013` stores them in `backtest_fills`,
+`trading.metrics.trades` computes round trips and cost drag, and the
+report has a **What it cost** panel.
+
+`ChargeBreakdown`'s docstring had said why for months — "the cost-drag
+report needs the breakdown and it cannot be reconstructed from a lump sum
+afterwards" — while `run_loop` computed one per fill and kept only
+`.total`.
+
+**A trade is a FIFO round trip**, stated because win rate, profit factor
+and expectancy all depend on it. A fill's charges split **proportionally
+by quantity** when matched in parts. A position still open at the end is
+counted neither way.
+
+**`backtest_fills` uses an `ordinal`, not `(run_id, ts)`** — unlike the
+equity curve. Two fills can genuinely share a bar, so the composite key
+that is right for the curve would reject correct data here.
+
+**Demonstrating it needed a strategy that trades.** Buy-and-hold pays two
+sets of charges over six years and shows no drag; `phase3f-five-session-churn`
+(strategy 18, run 3) round-trips RELIANCE every five sessions:
+
+```
+659 fills · 329 trades · win rate 43.16% · profit factor 0.72
+gross P&L   -12,313.50
+charges      68,227.36     <- 5.5x the gross loss
+net P&L     -80,540.86
+```
+
+That is §8's "most sobering chart" made concrete, and it is unreachable
+from a buy-and-hold run. Remove with
+`DELETE FROM strategies WHERE name LIKE 'phase3f-%'`.
+
+**Two things worth not relearning:**
+
+1. **The real run found a hole no fixture would have.** `charges / gross`
+   over a *negative* gross gives -5.54, and "costs took -554% of the gross
+   result" is not a sentence — the guard only covered `gross == 0`. Drag is
+   now undefined unless the gross result is positive, and the UI says the
+   true thing instead. A hand-written fixture would have used a positive
+   gross and never exposed it.
+2. **Nothing leaves as a bare `str(Decimal)`.** Third instance in one day —
+   the equity curve, the metric ratios, now trade money. `str(Decimal)`
+   reports whatever precision the arithmetic produced, which is an
+   implementation detail rather than data. **Money 4 dp, ratios and
+   quantities 8 dp**, and the rule is now written into
+   `trading/metrics/trades.py` rather than rediscovered a fourth time.
 
 ---
 

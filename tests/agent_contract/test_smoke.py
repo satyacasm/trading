@@ -1380,3 +1380,78 @@ def test_a_backtest_whose_run_fails_says_why(db_conn, local_user_id, monkeypatch
     assert "BACKTEST_RUN_FAILED" in codes, codes
     message = next(f.message for f in verdict.report.findings if f.code == "BACKTEST_RUN_FAILED")
     assert "OOM" in message or "SMOKE_OOM" in message
+
+
+def test_stressed_schedules_double_both_the_rate_and_the_cap() -> None:
+    """A capped charge whose rate doubled but whose cap did not would simply
+    stay at its cap -- so the stress would silently not apply to exactly the
+    charges that dominate a large order.
+
+    Asserted on the fields rather than through a computed total, because a
+    total can look plausible while the cap is untouched.
+    """
+    from datetime import date as _date
+    from decimal import Decimal as _Decimal
+
+    from trading.agent_contract.smoke import stress_schedules
+    from trading.paper.enums import ChargeBasis, ChargeType, Rounding
+    from trading.paper.enums import Product as _Product
+    from trading.paper.models import ChargeSchedule
+
+    capped = ChargeSchedule(
+        broker="TEST",
+        exchange="NSE",
+        asset_class="EQUITY",
+        product=_Product.DELIVERY,
+        charge_type=ChargeType.BROKERAGE,
+        basis=ChargeBasis.PERCENT_OF_TURNOVER,
+        applies_to_side="BOTH",
+        rate=_Decimal("0.0003"),
+        cap=_Decimal("20.00"),
+        rounding=Rounding.TWO_DECIMALS,
+        gst_base_types=(),
+        effective_from=_date(2020, 1, 1),
+        effective_to=None,
+        source_note="test",
+    )
+
+    stressed = stress_schedules((capped,), multiplier=_Decimal("2"))
+    assert len(stressed) == 1
+    assert stressed[0].rate == _Decimal("0.0006")
+    assert stressed[0].cap == _Decimal("40.00")
+    # Everything else is untouched -- this is a harsher world, not a
+    # different charge structure.
+    assert stressed[0].charge_type is capped.charge_type
+    assert stressed[0].basis is capped.basis
+    assert stressed[0].applies_to_side == capped.applies_to_side
+
+
+def test_stressing_leaves_an_uncapped_schedule_uncapped() -> None:
+    """`None` means no cap, and 2 x None is not 0."""
+    from datetime import date as _date
+    from decimal import Decimal as _Decimal
+
+    from trading.agent_contract.smoke import stress_schedules
+    from trading.paper.enums import ChargeBasis, ChargeType, Rounding
+    from trading.paper.enums import Product as _Product
+    from trading.paper.models import ChargeSchedule
+
+    flat = ChargeSchedule(
+        broker="TEST",
+        exchange="NSE",
+        asset_class="EQUITY",
+        product=_Product.DELIVERY,
+        charge_type=ChargeType.BROKERAGE,
+        basis=ChargeBasis.FLAT_PER_ORDER,
+        applies_to_side="BOTH",
+        rate=_Decimal("20.00"),
+        cap=None,
+        rounding=Rounding.TWO_DECIMALS,
+        gst_base_types=(),
+        effective_from=_date(2020, 1, 1),
+        effective_to=None,
+        source_note="test",
+    )
+    stressed = stress_schedules((flat,), multiplier=_Decimal("2"))
+    assert stressed[0].rate == _Decimal("40.00")
+    assert stressed[0].cap is None

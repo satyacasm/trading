@@ -69,7 +69,8 @@ from trading.agent_contract.smoke import (
 )
 from trading.agent_contract.validation import Finding, ValidationReport, validate_strategy
 from trading.metrics.curve import summarize
-from trading.metrics.trades import cost_drag, trade_metrics
+from trading.metrics.robustness import reshuffle
+from trading.metrics.trades import cost_drag, round_trips, trade_metrics
 from trading.streaming.db import get_db_connection
 
 router = APIRouter()
@@ -481,6 +482,13 @@ def get_backtest(
         # ledger exists.
         metrics["trades"] = trade_metrics(ledger)
         metrics["cost_drag"] = cost_drag(ledger)
+        # Computed here rather than stored: the reshuffle is arithmetic over
+        # the stored fills, so improving it applies retroactively to every
+        # run ever recorded instead of only to new ones.
+        run["reshuffle"] = reshuffle(
+            [trip.net_pnl for trip in round_trips(ledger)],
+            starting_equity=points[0][1],
+        )
     run["metrics"] = metrics
     return BacktestDetail(**run)
 

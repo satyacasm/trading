@@ -49,6 +49,7 @@ from trading.config import get_settings
 from trading.corpactions.adjust import adjusted_bars
 from trading.paper.charges import load_schedules
 from trading.paper.enums import Product
+from trading.paper.models import ChargeSchedule
 from trading.runtime.payload import MODE_SMOKE, SmokePayload
 from trading.runtime.provider import BarRecord
 
@@ -1110,6 +1111,38 @@ def plan_backtest(
     )
 
 
+# §228: "an automatic 2x slippage-and-cost stress rerun (if the edge dies at
+# 2x, it was never an edge)."
+STRESS_MULTIPLIER = Decimal("2")
+
+
+def stress_schedules(
+    schedules: Sequence[ChargeSchedule], *, multiplier: Decimal = STRESS_MULTIPLIER
+) -> tuple[ChargeSchedule, ...]:
+    """The same charge structure in a harsher world.
+
+    Scaling the schedules host-side rather than plumbing a multiplier
+    through `SmokePayload`, the runner, `run_loop` and `compute_charges`:
+    that is four boundaries, and the container then runs unmodified code.
+    It is also the more honest model -- a stress test *is* a different cost
+    environment, not a different calculation.
+
+    `cap` is scaled alongside `rate`, deliberately. A capped charge whose
+    rate doubled but whose cap did not would simply stay at its cap, and the
+    stress would silently fail to apply to exactly the charges that dominate
+    a large order. `None` means no cap and stays `None`.
+    """
+    return tuple(
+        schedule.model_copy(
+            update={
+                "rate": schedule.rate * multiplier,
+                "cap": None if schedule.cap is None else schedule.cap * multiplier,
+            }
+        )
+        for schedule in schedules
+    )
+
+
 @dataclass(frozen=True)
 class BacktestVerdict:
     """What one backtest produced, or why it was refused."""
@@ -1126,6 +1159,10 @@ class BacktestVerdict:
     # re-resolving it later against a different `as_of` and getting a
     # different answer.
     instrument_ids: tuple[int, ...] = ()
+    # §228's 2x cost-and-slippage rerun. An observation, not a derivation:
+    # doubling slippage changes which fills happen, so it cannot be
+    # re-derived from the base run's output and has to be executed.
+    stress: dict[str, Any] | None = None
 
 
 def _refused(*findings: Finding, plan: BacktestPlan | None = None) -> BacktestVerdict:
@@ -1276,6 +1313,34 @@ def backtest(
     result = run_smoke_in_sandbox(payload, resolved)
     outcome = _outcome_of(result)
     passed = bool(outcome.get("ok"))
+
+    # The stress pass, run only when the base run succeeded: stressing a run
+    # that already crashed answers nothing, and costs a container to say so.
+    stress: dict[str, Any] | None = None
+    if passed:
+        stressed = run_smoke_in_sandbox(
+            SmokePayload(
+                mode=MODE_SMOKE,
+                source=record.source,
+                contract_version=CONTRACT_VERSION,
+                window=window,
+                bars=bars,
+                charge_schedules=stress_schedules(schedules),
+                starting_cash=payload.starting_cash,
+                slippage_bps=payload.slippage_bps * STRESS_MULTIPLIER,
+                dispatch_from=plan.dispatch_from,
+            ),
+            resolved,
+        )
+        stressed_outcome = _outcome_of(stressed)
+        stress = {
+            "multiplier": str(STRESS_MULTIPLIER),
+            "ok": bool(stressed_outcome.get("ok")),
+            "fills": stressed_outcome.get("fills"),
+            "final_equity": stressed_outcome.get("final_equity"),
+            "breaker_reason": stressed_outcome.get("breaker_reason"),
+            "error": stressed_outcome.get("error"),
+        }
     # A crashed run has to carry a reason. The failure lives in
     # `outcome["error"]`, and leaving it there produced the least
     # actionable thing this platform can say -- "refused", with an empty
@@ -1301,4 +1366,5 @@ def backtest(
         runtime=result.runtime,
         kernel_isolated=result.kernel_isolated,
         instrument_ids=tuple(instrument_ids),
+        stress=stress,
     )

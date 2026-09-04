@@ -53,7 +53,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from psycopg import Connection
 from pydantic import BaseModel, Field
 
-from trading.agent_contract.persistence import record_backtest_run
+from trading.agent_contract.persistence import (
+    get_backtest_run,
+    list_backtest_runs,
+    record_backtest_run,
+)
 from trading.agent_contract.registry import CONTRACT_VERSION, register_strategy
 from trading.agent_contract.smoke import (
     BacktestVerdict,
@@ -365,6 +369,77 @@ def run_backtest(
             instrument_ids=verdict.instrument_ids,
         )
     return _backtest_response(strategy_id, verdict, run_id)
+
+
+class BacktestSummary(BaseModel):
+    """One stored run, WITHOUT its curve.
+
+    The omission is the whole reason there are two read routes: a history
+    view that embedded curves would transfer every point of every run to
+    render a table of dates and final equities.
+    """
+
+    backtest_run_id: int
+    strategy_id: int
+    status: str
+    requested_start: str
+    requested_end: str
+    fetch_start: str
+    dispatch_from: str
+    sessions: int
+    instruments: list[int]
+    history_bars_requested: int
+    history_bars_available: int
+    bars: str | None
+    bar_calls: int
+    orders_placed: int
+    fills: int
+    final_cash: str | None
+    final_equity: str | None
+    breaker_reason: str | None
+    error: str | None
+    findings: list[dict[str, Any]]
+    runtime: str
+    kernel_isolated: bool
+    contract_version: str
+    ran_at: str
+
+
+class BacktestDetail(BacktestSummary):
+    """One stored run WITH its curve, in `ts` order. Money as strings."""
+
+    equity_curve: list[dict[str, str]]
+
+
+@router.get("/strategies/{strategy_id}/backtests", response_model=list[BacktestSummary])
+def list_backtests(
+    strategy_id: int,
+    conn: Annotated[Connection, Depends(get_db_connection)],
+) -> list[BacktestSummary]:
+    """A strategy's run history, newest first, without curves.
+
+    Plain `def`, and a GET that never writes. Not scoped by `user_id`,
+    matching `GET /strategies` -- harmless with one seeded user and no auth,
+    and the same single line to change when auth lands.
+    """
+    return [BacktestSummary(**row) for row in list_backtest_runs(conn, strategy_id)]
+
+
+@router.get("/backtests/{backtest_run_id}", response_model=BacktestDetail)
+def get_backtest(
+    backtest_run_id: int,
+    conn: Annotated[Connection, Depends(get_db_connection)],
+) -> BacktestDetail:
+    """One stored run, with its equity curve.
+
+    Plain `def`, and a GET that never writes.
+    """
+    try:
+        return BacktestDetail(**get_backtest_run(conn, backtest_run_id))
+    except KeyError:
+        raise HTTPException(
+            status_code=404, detail=f"no backtest run with backtest_run_id={backtest_run_id}"
+        ) from None
 
 
 class ContractBundle(BaseModel):

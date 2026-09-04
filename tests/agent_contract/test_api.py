@@ -659,3 +659,80 @@ def test_a_refused_backtest_stores_no_run(client, db_conn, local_user_id) -> Non
     assert body["backtest_run_id"] is None
     after = db_conn.execute("SELECT count(*) FROM backtest_runs").fetchone()[0]
     assert after == before
+
+
+def _stored_run(db_conn, local_user_id, *, points):  # noqa: ANN001, ANN201
+    """A stored run, written through the real write path rather than by
+    hand, so these read tests cannot drift from what the writer produces."""
+    from datetime import date
+
+    from tests.agent_contract.test_backtest_persistence import _verdict
+    from trading.agent_contract.persistence import record_backtest_run
+    from trading.agent_contract.registry import register_strategy
+
+    registered = register_strategy(
+        db_conn,
+        user_id=local_user_id,
+        name="read-fixture",
+        version="1.0.0",
+        source=VALID_SOURCE,
+    )
+    run_id = record_backtest_run(
+        db_conn,
+        registered.strategy_id,
+        _verdict(points),
+        requested_start=date(2024, 1, 8),
+        requested_end=date(2024, 1, 10),
+        instrument_ids=[58607],
+    )
+    return registered.strategy_id, run_id
+
+
+def test_the_list_route_omits_curves_and_the_detail_route_includes_them(
+    client,  # noqa: ANN001
+    db_conn,  # noqa: ANN001
+    local_user_id,  # noqa: ANN001
+) -> None:
+    """The cheap list is the entire reason there are two routes, and nothing
+    else enforces it: a list that embedded curves would transfer every point
+    of every run to render a table of dates and final equities.
+    """
+    points = [
+        {"ts": "2024-01-08T10:00:00+00:00", "equity": "1000000.0000", "cash": "1000000.0000"},
+        {"ts": "2024-01-09T10:00:00+00:00", "equity": "1000123.4567", "cash": "924286.2400"},
+        {"ts": "2024-01-10T10:00:00+00:00", "equity": "999876.5433", "cash": "924286.2400"},
+    ]
+    strategy_id, run_id = _stored_run(db_conn, local_user_id, points=points)
+
+    listed = client.get(f"/strategies/{strategy_id}/backtests")
+    assert listed.status_code == 200
+    rows = listed.json()
+    assert [r["backtest_run_id"] for r in rows] == [run_id]
+    assert "equity_curve" not in rows[0]
+    assert rows[0]["status"] == "PASSED"
+
+    detail = client.get(f"/backtests/{run_id}")
+    assert detail.status_code == 200
+    curve = detail.json()["equity_curve"]
+    assert [p["ts"] for p in curve] == [p["ts"] for p in points]
+    # Money as strings on the wire, for the reason RunSummary gives: JSON
+    # numbers are IEEE 754 doubles.
+    assert all(isinstance(p["equity"], str) for p in curve)
+    assert curve[1]["equity"] == "1000123.4567"
+
+
+def test_an_unknown_backtest_run_is_404(client) -> None:  # noqa: ANN001
+    response = client.get("/backtests/99999999")
+    assert response.status_code == 404
+    # Not the vacuous 404 an unrouted path returns: the handler ran, looked,
+    # and is naming what it could not find.
+    assert "99999999" in response.json()["detail"]
+
+
+def test_the_backtest_read_routes_are_not_coroutines() -> None:
+    """psycopg is synchronous and an async route running a blocking DB call
+    on the event loop deadlocked this gateway permanently once already."""
+    from trading.agent_contract.api import get_backtest, list_backtests
+
+    assert not inspect.iscoroutinefunction(get_backtest)
+    assert not inspect.iscoroutinefunction(list_backtests)

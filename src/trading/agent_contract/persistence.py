@@ -33,7 +33,7 @@ from psycopg import Connection
 
 from trading.agent_contract.registry import CONTRACT_VERSION
 
-__all__ = ["record_backtest_run"]
+__all__ = ["get_backtest_run", "list_backtest_runs", "record_backtest_run"]
 
 _INSERT_RUN = """
     INSERT INTO backtest_runs (
@@ -138,3 +138,90 @@ def record_backtest_run(
                 [(run_id, p["ts"], _money(p["equity"]), _money(p["cash"])) for p in curve],
             )
     return run_id
+
+
+_RUN_COLUMNS = """
+    backtest_run_id, strategy_id, status, requested_start, requested_end,
+    fetch_start, dispatch_from, sessions, instruments, history_bars_requested,
+    history_bars_available, bars, bar_calls, orders_placed, fills,
+    final_cash, final_equity, breaker_reason, error, findings,
+    runtime, kernel_isolated, contract_version, ran_at
+"""
+
+_SELECT_RUNS = f"""
+    SELECT {_RUN_COLUMNS} FROM backtest_runs
+    WHERE strategy_id = %s
+    ORDER BY ran_at DESC, backtest_run_id DESC
+    LIMIT %s
+"""
+
+_SELECT_RUN = f"SELECT {_RUN_COLUMNS} FROM backtest_runs WHERE backtest_run_id = %s"
+
+_SELECT_POINTS = """
+    SELECT ts, equity, cash FROM backtest_equity_points
+    WHERE backtest_run_id = %s ORDER BY ts
+"""
+
+
+def _run_to_dict(row: tuple[Any, ...]) -> dict[str, Any]:
+    """One run row, money rendered as strings.
+
+    `str(Decimal)` rather than `float()`: JSON has no decimal type, so a
+    number here would reach every client as a double -- the one
+    representation this codebase refuses to let money take.
+    """
+    return {
+        "backtest_run_id": row[0],
+        "strategy_id": row[1],
+        "status": row[2],
+        "requested_start": row[3].isoformat(),
+        "requested_end": row[4].isoformat(),
+        "fetch_start": row[5].isoformat(),
+        "dispatch_from": row[6].isoformat(),
+        "sessions": row[7],
+        "instruments": row[8],
+        "history_bars_requested": row[9],
+        "history_bars_available": row[10],
+        "bars": row[11],
+        "bar_calls": row[12],
+        "orders_placed": row[13],
+        "fills": row[14],
+        "final_cash": None if row[15] is None else str(row[15]),
+        "final_equity": None if row[16] is None else str(row[16]),
+        "breaker_reason": row[17],
+        "error": row[18],
+        "findings": row[19],
+        "runtime": row[20],
+        "kernel_isolated": row[21],
+        "contract_version": row[22],
+        "ran_at": row[23].isoformat(),
+    }
+
+
+def list_backtest_runs(
+    conn: Connection, strategy_id: int, *, limit: int = 50
+) -> list[dict[str, Any]]:
+    """One strategy's runs, newest first, WITHOUT their curves.
+
+    The omission is the point: a history view would otherwise transfer every
+    point of every run to render a table of dates and final equities.
+    """
+    rows = conn.execute(_SELECT_RUNS, (strategy_id, limit)).fetchall()
+    return [_run_to_dict(row) for row in rows]
+
+
+def get_backtest_run(conn: Connection, backtest_run_id: int) -> dict[str, Any]:
+    """One run with its equity curve, in `ts` order.
+
+    Raises `KeyError` if it does not exist -- a missing run is a caller bug,
+    not an empty result, matching `registry.get_strategy`.
+    """
+    row = conn.execute(_SELECT_RUN, (backtest_run_id,)).fetchone()
+    if row is None:
+        raise KeyError(f"no backtest run with backtest_run_id={backtest_run_id}")
+    run = _run_to_dict(row)
+    run["equity_curve"] = [
+        {"ts": ts.isoformat(), "equity": str(equity), "cash": str(cash)}
+        for ts, equity, cash in conn.execute(_SELECT_POINTS, (backtest_run_id,)).fetchall()
+    ]
+    return run

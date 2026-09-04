@@ -28,6 +28,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -52,7 +53,10 @@ from trading.runtime.payload import MODE_LIVE, SmokePayload, encode_payload
 
 log = structlog.get_logger(__name__)
 
-_BAR_CHANNEL_PATTERN = "bars:*"
+# The aggregator's own output, not Upstox's raw I1 feed on `bars:*`.
+# Conflating them would leave a subscriber unable to tell a bar that was
+# received from one that was computed.
+_BAR_CHANNEL_PATTERN = "closed_bars:*"
 
 # §166 puts order-rate limiting in the supervisor. Generous enough that no
 # sane strategy notices, tight enough that a runaway is stopped within a
@@ -303,6 +307,131 @@ def handle_bar(conn: Connection, api_url: str, run: LiveRun, bar: dict[str, Any]
     return True
 
 
+_SELECT_RUNNING = """
+    SELECT r.live_run_id, r.strategy_id, r.portfolio_id, s.source, s.manifest, p.cash_balance
+    FROM live_runs r
+    JOIN strategies s ON s.strategy_id = r.strategy_id
+    JOIN portfolios p ON p.portfolio_id = r.portfolio_id
+    WHERE r.status = 'RUNNING'
+"""
+
+
+def reconcile(conn: Connection, runs: dict[int, LiveRun]) -> None:
+    """Start what the database says should be running, stop what it does not.
+
+    The supervisor polls rather than being told. A control channel would be
+    one more thing that can be missed while a container is being launched,
+    and the table is the truth either way: a row is RUNNING or it is not.
+    This also means a supervisor restarted after a crash converges on the
+    intended state instead of needing to be re-driven.
+    """
+    from trading.agent_contract.smoke import resolve_universe
+    from trading.paper.charges import load_schedules
+    from trading.paper.enums import Product
+
+    wanted: dict[int, tuple[Any, ...]] = {
+        int(row[0]): row for row in conn.execute(_SELECT_RUNNING).fetchall()
+    }
+
+    for live_run_id, run in list(runs.items()):
+        if live_run_id not in wanted:
+            stop_run(conn, run, "STOPPED", "stopped by the operator")
+            runs.pop(live_run_id, None)
+        elif run.process.poll() is not None:
+            stop_run(conn, run, "CRASHED", "the container exited")
+            runs.pop(live_run_id, None)
+
+    for live_run_id, row in wanted.items():
+        if live_run_id in runs:
+            continue
+        _, strategy_id, portfolio_id, source, manifest, cash = row
+        if manifest is None:
+            stop_run_row(conn, live_run_id, "CRASHED", "this version stores no manifest")
+            continue
+        try:
+            instrument_ids = resolve_universe(conn, manifest, datetime.now(UTC).date())
+            broker, exchange, asset_class = _charge_key_for(conn, instrument_ids)
+            schedules = load_schedules(
+                conn, broker, exchange, asset_class, Product.DELIVERY, datetime.now(UTC).date()
+            )
+        except Exception as exc:  # noqa: BLE001 - an unresolvable run is a stopped run
+            stop_run_row(conn, live_run_id, "CRASHED", f"could not resolve the run: {exc}")
+            continue
+        # The row already exists, so adopt it rather than inserting another.
+        runs[live_run_id] = _launch(
+            conn,
+            live_run_id,
+            strategy_id,
+            portfolio_id,
+            source,
+            instrument_ids,
+            schedules,
+            Decimal(str(cash)),
+        )
+
+
+def stop_run_row(conn: Connection, live_run_id: int, status: str, reason: str) -> None:
+    """End a run that never got a process."""
+    conn.execute(
+        "UPDATE live_runs SET status=%s, stopped_reason=%s, stopped_at=now() WHERE live_run_id=%s",
+        (status, reason, live_run_id),
+    )
+    log.warning("live.not_started", live_run_id=live_run_id, reason=reason)
+
+
+def _charge_key_for(conn: Connection, instrument_ids: list[int]) -> tuple[str, str, str]:
+    from trading.agent_contract.smoke import _charge_key
+
+    return _charge_key(conn, instrument_ids)
+
+
+def _launch(
+    conn: Connection,
+    live_run_id: int,
+    strategy_id: int,
+    portfolio_id: int,
+    source: str,
+    instrument_ids: list[int],
+    schedules: Any,
+    starting_cash: Decimal,
+    limits: SandboxLimits | None = None,
+) -> LiveRun:
+    """Start a container for a run row that already exists."""
+    resolved = _resolve_limits(limits)
+    payload = encode_payload(
+        SmokePayload(
+            mode=MODE_LIVE,
+            source=source,
+            starting_cash=starting_cash,
+            slippage_bps=Decimal(str(get_settings().paper_slippage_bps)),
+            charge_schedules=tuple(schedules),
+        )
+    )
+    process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        _docker_args(resolved, f"live-{live_run_id}"),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdin is not None
+    process.stdin.write(b"%d\n" % len(payload) + payload)
+    process.stdin.flush()
+    conn.execute(
+        "UPDATE live_runs SET runtime=%s, kernel_isolated=%s WHERE live_run_id=%s",
+        (resolved.runtime or "runc", (resolved.runtime or "runc") == "runsc", live_run_id),
+    )
+    log.info("live.started", live_run_id=live_run_id, instruments=sorted(instrument_ids))
+    return LiveRun(
+        live_run_id=live_run_id,
+        strategy_id=strategy_id,
+        portfolio_id=portfolio_id,
+        process=process,
+        instrument_ids=set(instrument_ids),
+        runtime=resolved.runtime or "runc",
+        kernel_isolated=(resolved.runtime or "runc") == "runsc",
+    )
+
+
 def run_supervisor(stop: threading.Event | None = None) -> None:
     """Subscribe to closed bars and drive every running strategy.
 
@@ -321,8 +450,16 @@ def run_supervisor(stop: threading.Event | None = None) -> None:
     pubsub.psubscribe(_BAR_CHANNEL_PATTERN)
     runs: dict[int, LiveRun] = {}
     log.info("live.supervisor_started", channel=_BAR_CHANNEL_PATTERN)
+    last_reconcile = 0.0
 
     while stop is None or not stop.is_set():
+        if time.monotonic() - last_reconcile > 5.0:
+            try:
+                reconcile(conn, runs)
+            except Exception as exc:  # noqa: BLE001 - a bad row must not kill the loop
+                log.warning("live.reconcile_failed", reason=str(exc))
+            last_reconcile = time.monotonic()
+
         message = pubsub.get_message(timeout=1.0)
         if not message or message["type"] != "pmessage":
             continue

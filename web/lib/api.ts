@@ -381,7 +381,48 @@ export type MaxDrawdown = {
   days: number;
 };
 
+export type TradeMetrics = {
+  trades: number;
+  wins: number;
+  losses: number;
+  win_rate: string | null;
+  profit_factor: string | null;
+  average_win: string | null;
+  average_loss: string | null;
+  expectancy: string | null;
+};
+
+export type CostDrag = {
+  total_charges: string;
+  gross_pnl: string;
+  net_pnl: string;
+  /** Charges over the gross result. Null when there was no gross result. */
+  drag: string | null;
+};
+
+export type Fill = {
+  ordinal: number;
+  ts: string;
+  instrument_id: string;
+  side: string;
+  product: string;
+  quantity: string;
+  price: string;
+  brokerage: string;
+  stt: string;
+  exchange_txn: string;
+  sebi_fee: string;
+  stamp_duty: string;
+  ipft: string;
+  gst: string;
+  dp_charges: string;
+  tds: string;
+  total_charges: string;
+};
+
 export type BacktestMetrics = {
+  trades?: TradeMetrics;
+  cost_drag?: CostDrag;
   risk_free: string;
   periods_per_year: number | null;
   total_return: string | null;
@@ -427,6 +468,7 @@ export type BacktestSummary = {
 
 export type BacktestDetail = BacktestSummary & {
   equity_curve: EquityPoint[];
+  fills_ledger: Fill[];
   metrics: BacktestMetrics | null;
 };
 

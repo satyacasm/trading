@@ -69,6 +69,7 @@ from trading.agent_contract.smoke import (
 )
 from trading.agent_contract.validation import Finding, ValidationReport, validate_strategy
 from trading.metrics.curve import summarize
+from trading.metrics.trades import cost_drag, trade_metrics
 from trading.streaming.db import get_db_connection
 
 router = APIRouter()
@@ -297,7 +298,10 @@ class BacktestResponse(BaseModel):
     final_cash: str | None = None
     final_equity: str | None = None
     breaker_reason: str | None = None
-    equity_curve: list[dict[str, str]] = []
+    equity_curve: list[dict[str, str]]
+    # Every fill with its charges itemised. The list route carries neither
+    # this nor the curve, for the same reason.
+    fills_ledger: list[dict[str, Any]] = []
     findings: list[FindingOut] = []
     runtime: str | None = None
     kernel_isolated: bool | None = None
@@ -408,9 +412,13 @@ class BacktestSummary(BaseModel):
 
 
 class BacktestDetail(BacktestSummary):
-    """One stored run WITH its curve, in `ts` order. Money as strings."""
+    """One stored run WITH its curve and fills. Money as strings."""
 
     equity_curve: list[dict[str, str]]
+    # Every fill with its charges itemised. The list route carries neither
+    # this nor the curve, for the same reason: a history table would drag
+    # every fill of every run behind it.
+    fills_ledger: list[dict[str, Any]] = []
     # Computed on read from the curve, never stored: a stored metric is a
     # second source of truth that can drift from the series it came from,
     # and recomputing means a corrected metric applies retroactively to
@@ -465,7 +473,15 @@ def get_backtest(
         (datetime.fromisoformat(p["ts"]), Decimal(p["equity"]), Decimal(p["cash"]))
         for p in run["equity_curve"]
     ]
-    run["metrics"] = summarize(points, run["bars"], risk_free) if points else None
+    metrics = summarize(points, run["bars"], risk_free) if points else None
+    if metrics is not None:
+        ledger = run.get("fills_ledger") or []
+        # Trade metrics and cost drag read the fill ledger, not the curve:
+        # a curve cannot say what a strategy paid, which is exactly why the
+        # ledger exists.
+        metrics["trades"] = trade_metrics(ledger)
+        metrics["cost_drag"] = cost_drag(ledger)
+    run["metrics"] = metrics
     return BacktestDetail(**run)
 
 

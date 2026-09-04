@@ -249,3 +249,102 @@ def test_money_is_never_routed_through_a_float(db_conn) -> None:  # noqa: ANN001
     ).fetchone()
     assert equity == Decimal(exact)
     assert cash == Decimal(exact)
+
+
+_FILLS = [
+    {
+        "ts": "2024-01-08T10:00:00+00:00",
+        "instrument_id": "58607",
+        "side": "BUY",
+        "product": "DELIVERY",
+        "quantity": "100.00000000",
+        "price": "1327.6600",
+        "brokerage": "20.0000",
+        "stt": "133.0000",
+        "exchange_txn": "4.0800",
+        "sebi_fee": "0.1300",
+        "stamp_duty": "19.9100",
+        "ipft": "0.0000",
+        "gst": "4.3300",
+        "dp_charges": "0.0000",
+        "tds": "0.0000",
+        "total_charges": "181.4500",
+    },
+    {
+        "ts": "2024-01-09T10:00:00+00:00",
+        "instrument_id": "58607",
+        "side": "SELL",
+        "product": "DELIVERY",
+        "quantity": "100.00000000",
+        "price": "1326.5400",
+        "brokerage": "20.0000",
+        "stt": "133.0000",
+        "exchange_txn": "4.0700",
+        "sebi_fee": "0.1300",
+        "stamp_duty": "0.0000",
+        "ipft": "0.0000",
+        "gst": "7.9300",
+        "dp_charges": "20.0000",
+        "tds": "0.0000",
+        "total_charges": "185.1300",
+    },
+]
+
+
+def test_the_fill_ledger_round_trips_with_every_charge_component(db_conn) -> None:  # noqa: ANN001
+    """A total cannot be un-summed, so the components are what get stored.
+    Asserted as exact Decimals -- this is the money path."""
+    from trading.agent_contract.persistence import record_backtest_run
+
+    verdict = _verdict(_POINTS)
+    verdict.outcome["fill_ledger"] = _FILLS
+    run_id = record_backtest_run(
+        db_conn,
+        _strategy(db_conn),
+        verdict,
+        requested_start=date(2024, 1, 8),
+        requested_end=date(2024, 1, 10),
+        instrument_ids=[58607],
+    )
+
+    rows = db_conn.execute(
+        "SELECT ordinal, side, product, quantity, price, brokerage, stt, dp_charges, "
+        "total_charges FROM backtest_fills WHERE backtest_run_id=%s ORDER BY ordinal",
+        (run_id,),
+    ).fetchall()
+
+    assert [r[0] for r in rows] == [0, 1]
+    assert [r[1] for r in rows] == ["BUY", "SELL"]
+    assert rows[0][4] == Decimal("1327.6600")
+    assert rows[0][5] == Decimal("20.0000")
+    # DP on the delivery sell only -- the itemisation is the whole point.
+    assert rows[0][7] == Decimal("0.0000")
+    assert rows[1][7] == Decimal("20.0000")
+    assert rows[1][8] == Decimal("185.1300")
+
+
+def test_two_fills_at_the_same_timestamp_are_both_stored(db_conn) -> None:  # noqa: ANN001
+    """One bar can fill orders on several instruments, and one bar's price
+    events can fill more than one order on the same instrument. A composite
+    (run_id, ts) key -- the one the equity curve correctly uses -- would
+    reject correct data here, which is why fills carry an ordinal instead.
+    """
+    from trading.agent_contract.persistence import record_backtest_run
+
+    same_ts = [dict(f, ts="2024-01-08T10:00:00+00:00") for f in _FILLS]
+    verdict = _verdict(_POINTS)
+    verdict.outcome["fill_ledger"] = same_ts
+    run_id = record_backtest_run(
+        db_conn,
+        _strategy(db_conn),
+        verdict,
+        requested_start=date(2024, 1, 8),
+        requested_end=date(2024, 1, 10),
+        instrument_ids=[58607],
+    )
+    assert (
+        db_conn.execute(
+            "SELECT count(*) FROM backtest_fills WHERE backtest_run_id=%s", (run_id,)
+        ).fetchone()[0]
+        == 2
+    )

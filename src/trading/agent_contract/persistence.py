@@ -52,6 +52,36 @@ _INSERT_RUN = """
     ) RETURNING backtest_run_id
 """
 
+_FILL_COLUMNS = (
+    "ts",
+    "instrument_id",
+    "side",
+    "product",
+    "quantity",
+    "price",
+    "brokerage",
+    "stt",
+    "exchange_txn",
+    "sebi_fee",
+    "stamp_duty",
+    "ipft",
+    "gst",
+    "dp_charges",
+    "tds",
+    "total_charges",
+)
+
+_INSERT_FILL = f"""
+    INSERT INTO backtest_fills (
+        backtest_run_id, ordinal, {", ".join(_FILL_COLUMNS)}
+    ) VALUES ({", ".join(["%s"] * (len(_FILL_COLUMNS) + 2))})
+"""
+
+_SELECT_FILLS = f"""
+    SELECT ordinal, {", ".join(_FILL_COLUMNS)} FROM backtest_fills
+    WHERE backtest_run_id = %s ORDER BY ordinal
+"""
+
 _INSERT_POINT = """
     INSERT INTO backtest_equity_points (backtest_run_id, ts, equity, cash)
     VALUES (%s, %s, %s, %s)
@@ -126,6 +156,20 @@ def record_backtest_run(
     ).fetchone()
     assert row is not None  # noqa: S101 - RETURNING always yields a row
     run_id = int(row[0])
+
+    ledger = outcome.get("fill_ledger") or []
+    if ledger:
+        # `ordinal` is the run's own sequence, which FIFO round-trip
+        # matching depends on and a timestamp cannot supply: two fills can
+        # legitimately share one bar.
+        with conn.cursor() as cur:
+            cur.executemany(
+                _INSERT_FILL,
+                [
+                    (run_id, index, *(fill[column] for column in _FILL_COLUMNS))
+                    for index, fill in enumerate(ledger)
+                ],
+            )
 
     if curve:
         # `executemany`, not COPY: this codebase reserves COPY for the bulk
@@ -220,6 +264,16 @@ def get_backtest_run(conn: Connection, backtest_run_id: int) -> dict[str, Any]:
     if row is None:
         raise KeyError(f"no backtest run with backtest_run_id={backtest_run_id}")
     run = _run_to_dict(row)
+    run["fills_ledger"] = [
+        dict(
+            zip(
+                ("ordinal", *_FILL_COLUMNS),
+                (row[0], row[1].isoformat(), *map(str, row[2:])),
+                strict=True,
+            )
+        )
+        for row in conn.execute(_SELECT_FILLS, (backtest_run_id,)).fetchall()
+    ]
     run["equity_curve"] = [
         {"ts": ts.isoformat(), "equity": str(equity), "cash": str(cash)}
         for ts, equity, cash in conn.execute(_SELECT_POINTS, (backtest_run_id,)).fetchall()

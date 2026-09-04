@@ -7,6 +7,7 @@ import { fetchBacktest, type BacktestDetail } from "@/lib/api";
 import {
   UNDEFINED_METRIC,
   describeDrawdown,
+  describeCostDrag,
   describeHurdleRate,
   describeRunWindow,
   formatPercent,
@@ -193,6 +194,31 @@ export default function BacktestReportPage() {
           {underwater.length > 0 ? (
             <SeriesChart lines={underwater} height={180} priceFormat="percent" />
           ) : null}
+        </section>
+      ) : null}
+
+      {metrics?.cost_drag && metrics.trades ? (
+        <section className="border-line flex flex-col gap-4 border-t pt-6">
+          <div className="flex flex-wrap items-baseline gap-x-3">
+            <h2 className="font-display text-lg">What it cost</h2>
+            {/* The tested sentence, not a re-typing of it. */}
+            <span className="text-muted text-sm">{describeCostDrag(metrics.cost_drag)}</span>
+          </div>
+          <div className="grid grid-cols-2 gap-6 sm:grid-cols-4">
+            <Stat label="Gross P&L" value={metrics.cost_drag.gross_pnl} />
+            <Stat label="Charges" value={metrics.cost_drag.total_charges} tone="down" />
+            <Stat label="Net P&L" value={metrics.cost_drag.net_pnl} />
+            <Stat label="Trades" value={String(metrics.trades.trades)} />
+            <Stat label="Win rate" value={formatPercent(metrics.trades.win_rate)} />
+            <Stat label="Profit factor" value={formatRatio(metrics.trades.profit_factor)} />
+            <Stat label="Average win" value={metrics.trades.average_win ?? UNDEFINED_METRIC} />
+            <Stat label="Average loss" value={metrics.trades.average_loss ?? UNDEFINED_METRIC} />
+          </div>
+          <p className="text-muted text-xs">
+            A round trip is a FIFO match: each sell closes the oldest open buy on the same
+            instrument, and a position still open at the end is counted neither way. Win and
+            loss are measured after charges.
+          </p>
         </section>
       ) : null}
 

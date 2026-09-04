@@ -48,3 +48,6 @@ class RunState:
     # IEEE 754 doubles, and a curve of subtly wrong equity is worse than
     # no curve.
     equity_curve: list[dict[str, str]] = field(default_factory=list)
+    # One record per fill. Money as strings, like the curve, and every
+    # charge component kept separately -- see RunOutcome.fill_ledger.
+    fill_ledger: list[dict[str, str]] = field(default_factory=list)

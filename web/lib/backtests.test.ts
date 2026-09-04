@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   UNDEFINED_METRIC,
+  describeCostDrag,
   describeDrawdown,
   describeHurdle,
   describeHurdleRate,
@@ -10,7 +11,7 @@ import {
   lostToTheHurdle,
   riskFreeCurve,
 } from "./backtests";
-import type { BacktestMetrics, BacktestSummary, MaxDrawdown } from "./api";
+import type { BacktestMetrics, BacktestSummary, CostDrag, MaxDrawdown } from "./api";
 
 function drawdown(overrides: Partial<MaxDrawdown> = {}): MaxDrawdown {
   return {
@@ -175,5 +176,38 @@ describe("riskFreeCurve", () => {
 
   it("is empty for an empty curve", () => {
     expect(riskFreeCurve([], "0.065")).toEqual([]);
+  });
+});
+
+
+describe("describeCostDrag", () => {
+  function drag(overrides: Partial<CostDrag> = {}): CostDrag {
+    return {
+      total_charges: "68227.36",
+      gross_pnl: "-12313.50",
+      net_pnl: "-80540.86",
+      drag: null,
+      ...overrides,
+    };
+  }
+
+  it("states the share when the strategy made something gross", () => {
+    expect(describeCostDrag(drag({ gross_pnl: "100", net_pnl: "60", drag: "0.4" }))).toBe(
+      "costs took 40.00% of the gross result",
+    );
+  });
+
+  it("says what costs actually did when the gross result was a loss", () => {
+    // From the real five-session-churn run. "costs took -554% of the gross
+    // result" is not a sentence; this is, and it is more useful.
+    expect(describeCostDrag(drag())).toBe(
+      "costs turned a 12,313.50 gross loss into a 80,540.86 net loss",
+    );
+  });
+
+  it("says there was no gross result when there was none", () => {
+    expect(describeCostDrag(drag({ gross_pnl: "0", net_pnl: "-40" }))).toBe(
+      "no gross result for costs to take a share of",
+    );
   });
 });

@@ -48,3 +48,9 @@ class RunOutcome:
     # One point per dispatched bar. Present on the crash path too: a
     # partial curve is evidence about where a run died, not noise.
     equity_curve: tuple[dict[str, str], ...] = ()
+    # One record per fill, with every charge component itemised.
+    # `ChargeBreakdown`'s docstring is the reason it is not a total: the
+    # cost-drag report needs the parts, and a lump sum cannot be un-summed.
+    # Present on the crash path too -- a partial ledger says what a run paid
+    # before it died, as a partial curve says where it died.
+    fill_ledger: tuple[dict[str, str], ...] = ()

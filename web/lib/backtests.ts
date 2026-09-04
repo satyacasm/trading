@@ -1,4 +1,10 @@
-import type { BacktestMetrics, BacktestSummary, EquityPoint, MaxDrawdown } from "./api";
+import type {
+  BacktestMetrics,
+  BacktestSummary,
+  CostDrag,
+  EquityPoint,
+  MaxDrawdown,
+} from "./api";
 
 /**
  * Presentation logic for the backtest report, kept pure and out of the page
@@ -116,4 +122,39 @@ export function riskFreeCurve(
     const years = (Date.parse(point.ts) - startMs) / msPerYear;
     return { ts: point.ts, value: start * Math.pow(1 + rate, years) };
   });
+}
+
+
+/** A money magnitude, grouped, sign dropped -- the surrounding words carry it. */
+export function formatMoney(value: string): string {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return value;
+  return Math.abs(parsed).toLocaleString("en-IN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+/**
+ * What the costs did, in one sentence.
+ *
+ * Three cases, because one sentence cannot cover them honestly. When the
+ * strategy made something gross, costs took a share of it. When it did not,
+ * there is no share to take -- and the true statement is the more useful
+ * one anyway: a real run turned a 12,313 gross loss into an 80,541 net loss
+ * on 68,227 of charges, which is the whole argument for showing this at all.
+ */
+export function describeCostDrag(drag: CostDrag): string {
+  if (drag.drag !== null) {
+    return `costs took ${formatPercent(drag.drag)} of the gross result`;
+  }
+  const gross = Number(drag.gross_pnl);
+  if (gross < 0) {
+    // Magnitudes, because "loss" already carries the sign: "a -12,313.50
+    // gross loss" states it twice and reads as a double negative.
+    return `costs turned a ${formatMoney(drag.gross_pnl)} gross loss into a ${formatMoney(
+      drag.net_pnl,
+    )} net loss`;
+  }
+  return "no gross result for costs to take a share of";
 }

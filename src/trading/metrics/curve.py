@@ -21,12 +21,16 @@ zero for any of these would be a claim the data does not support.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
 __all__ = [
     "CurvePoint",
+    "Drawdown",
     "cagr",
+    "calmar",
+    "drawdown",
     "period_returns",
     "periods_per_year",
     "sharpe",
@@ -174,3 +178,86 @@ def worst_period(points: list[CurvePoint]) -> tuple[datetime, Decimal] | None:
         return None
     worst = min(returns)
     return points[returns.index(worst) + 1][0], worst
+
+
+@dataclass(frozen=True)
+class Drawdown:
+    """The deepest peak-to-trough decline, and how long it lasted.
+
+    `recovered` is load-bearing. A drawdown still open at the end of the
+    run has no recovery date, and reporting its span as if it had closed
+    would understate the risk the strategy is still carrying -- the single
+    most misleading thing this module could say.
+    """
+
+    depth: Decimal  # non-positive
+    peak_ts: datetime
+    trough_ts: datetime
+    recovered_ts: datetime | None
+    sessions: int
+    days: int
+
+    @property
+    def recovered(self) -> bool:
+        return self.recovered_ts is not None
+
+
+def drawdown(points: list[CurvePoint]) -> Drawdown | None:
+    """The maximum drawdown, defined by DEPTH rather than by duration.
+
+    Returns `None` when the curve never declines: a drawdown that did not
+    happen has no peak, no trough and no span, and a zero-depth record
+    would invite a Calmar of infinity.
+    """
+    if len(points) < 2:
+        return None
+
+    peak_ts, peak_value = points[0][0], points[0][1]
+    best: tuple[Decimal, datetime, datetime, int] | None = None  # depth, peak, trough, peak_index
+    peak_index = 0
+
+    for index, (ts, equity, _cash) in enumerate(points):
+        if equity > peak_value:
+            peak_value, peak_ts, peak_index = equity, ts, index
+            continue
+        if peak_value == 0:
+            continue
+        depth = equity / peak_value - 1
+        if depth < 0 and (best is None or depth < best[0]):
+            best = (depth, peak_ts, ts, peak_index)
+
+    if best is None:
+        return None
+
+    depth, dd_peak_ts, trough_ts, dd_peak_index = best
+    peak_equity = points[dd_peak_index][1]
+
+    # The first point AFTER the peak that regains it. Searching from the
+    # peak rather than from the trough matters not at all for the value but
+    # keeps the definition readable: the drawdown is the whole excursion
+    # away from that peak, not just its downward leg.
+    recovered_ts: datetime | None = None
+    end_index = len(points) - 1
+    for index in range(dd_peak_index + 1, len(points)):
+        if points[index][1] >= peak_equity:
+            recovered_ts, end_index = points[index][0], index
+            break
+
+    end_ts = points[end_index][0]
+    return Drawdown(
+        depth=depth,
+        peak_ts=dd_peak_ts,
+        trough_ts=trough_ts,
+        recovered_ts=recovered_ts,
+        sessions=end_index - dd_peak_index,
+        days=(end_ts - dd_peak_ts).days,
+    )
+
+
+def calmar(points: list[CurvePoint]) -> Decimal | None:
+    """`CAGR / |max drawdown depth|`. `None` when either is undefined."""
+    growth = cagr(points)
+    dd = drawdown(points)
+    if growth is None or dd is None or dd.depth == 0:
+        return None
+    return growth / abs(dd.depth)

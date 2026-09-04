@@ -632,12 +632,19 @@ function RegisteredStrategiesSection({
                 <th className="text-right font-normal px-3 py-2">Sessions</th>
                 <th className="text-right font-normal px-3 py-2">Final equity</th>
                 <th className="text-left font-normal px-3 py-2">Contract</th>
+                <th className="text-right font-normal px-3 py-2">Backtest</th>
               </tr>
             </thead>
             <tbody>
               {sorted.map((s) => (
-                <tr key={s.strategy_id} className="border-t border-line">
-                  <td className="px-3 py-2">{s.name}</td>
+                <tr key={s.strategy_id} className="border-t border-line hover:bg-surface">
+                  <td className="px-3 py-2">
+                    {/* The way into backtesting: without this the strategy
+                        page and its reports exist but nothing reaches them. */}
+                    <Link href={`/strategies/${s.strategy_id}`} className="text-live">
+                      {s.name}
+                    </Link>
+                  </td>
                   <td className="num px-3 py-2 text-muted">{s.version}</td>
                   <td className="num px-3 py-2 text-muted">{s.bars ?? "--"}</td>
                   <td className="px-3 py-2">
@@ -658,6 +665,11 @@ function RegisteredStrategiesSection({
                       : "--"}
                   </td>
                   <td className="num px-3 py-2 text-muted">v{s.contract_version}</td>
+                  <td className="px-3 py-2 text-right">
+                    <Link href={`/strategies/${s.strategy_id}`} className="text-live text-xs">
+                      run &amp; reports →
+                    </Link>
+                  </td>
                 </tr>
               ))}
             </tbody>

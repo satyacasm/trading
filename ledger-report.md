@@ -1,0 +1,119 @@
+- generic [active] [ref=f1e1]:
+  - main [ref=f1e2]:
+    - generic [ref=f1e14]:
+      - link "← strategy 18" [ref=f1e15] [cursor=pointer]:
+        - /url: /strategies/18
+      - generic [ref=f1e16]:
+        - heading "Backtest 3" [level=1] [ref=f1e17]
+        - generic [ref=f1e18]: PASSED · runsc · kernel isolated
+      - paragraph [ref=f1e19]: 2020-01-01 to 2026-08-21 · 1647 sessions · 5 bars warm-up
+    - generic [ref=f1e20]:
+      - generic [ref=f1e21]:
+        - generic [ref=f1e22]: "-1.25%"
+        - generic [ref=f1e23]: a year against a 6.50% risk-free rate
+      - paragraph [ref=f1e24]: This strategy returned less than a government bond over the same period. Total return -8.04%.
+      - table [ref=f1e27]:
+        - row [ref=f1e28]:
+          - cell
+          - cell [ref=f1e29]
+          - cell [ref=f1e38]
+        - row [ref=f1e42]:
+          - cell
+          - cell [ref=f1e43]
+          - cell [ref=f1e47]
+      - paragraph [ref=f1e50]: Equity against the same capital compounded at the risk-free rate. The gap between the lines is the result.
+    - generic [ref=f1e51]:
+      - generic [ref=f1e52]:
+        - generic [ref=f1e53]: Sharpe
+        - generic [ref=f1e54]: "-5.49"
+      - generic [ref=f1e55]:
+        - generic [ref=f1e56]: Sortino
+        - generic [ref=f1e57]: "-7.41"
+      - generic [ref=f1e58]:
+        - generic [ref=f1e59]: Calmar
+        - generic [ref=f1e60]: "-0.15"
+      - generic [ref=f1e61]:
+        - generic [ref=f1e62]: Volatility
+        - generic [ref=f1e63]: 1.41%
+      - generic [ref=f1e64]:
+        - generic [ref=f1e65]: VaR 95
+        - generic [ref=f1e66]: "-0.14%"
+      - generic [ref=f1e67]:
+        - generic [ref=f1e68]: Worst day
+        - generic [ref=f1e69]: "-0.59%"
+      - generic [ref=f1e70]:
+        - generic [ref=f1e71]: Fills
+        - generic [ref=f1e72]: "659"
+      - generic [ref=f1e73]:
+        - generic [ref=f1e74]: Final equity
+        - generic [ref=f1e75]: "919559.1400"
+    - generic [ref=f1e76]:
+      - generic [ref=f1e77]:
+        - heading "Drawdown" [level=2] [ref=f1e78]
+        - generic [ref=f1e79]: "-8.24% over 1472 sessions, not recovered after 2171 days"
+      - table [ref=f1e82]:
+        - row [ref=f1e83]:
+          - cell
+          - cell [ref=f1e84]
+          - cell [ref=f1e93]
+        - row [ref=f1e97]:
+          - cell
+          - cell [ref=f1e98]
+          - cell [ref=f1e102]
+    - generic [ref=f1e105]:
+      - generic [ref=f1e106]:
+        - heading "What it cost" [level=2] [ref=f1e107]
+        - generic [ref=f1e108]: costs turned a 12,313.50 gross loss into a 80,540.86 net loss
+      - generic [ref=f1e109]:
+        - generic [ref=f1e110]:
+          - generic [ref=f1e111]: Gross P&L
+          - generic [ref=f1e112]: "-12313.5000"
+        - generic [ref=f1e113]:
+          - generic [ref=f1e114]: Charges
+          - generic [ref=f1e115]: "68227.3600"
+        - generic [ref=f1e116]:
+          - generic [ref=f1e117]: Net P&L
+          - generic [ref=f1e118]: "-80540.8600"
+        - generic [ref=f1e119]:
+          - generic [ref=f1e120]: Trades
+          - generic [ref=f1e121]: "329"
+        - generic [ref=f1e122]:
+          - generic [ref=f1e123]: Win rate
+          - generic [ref=f1e124]: 43.16%
+        - generic [ref=f1e125]:
+          - generic [ref=f1e126]: Profit factor
+          - generic [ref=f1e127]: "0.72"
+        - generic [ref=f1e128]:
+          - generic [ref=f1e129]: Average win
+          - generic [ref=f1e130]: "1469.7946"
+        - generic [ref=f1e131]:
+          - generic [ref=f1e132]: Average loss
+          - generic [ref=f1e133]: "-1546.2556"
+      - paragraph [ref=f1e134]: "A round trip is a FIFO match: each sell closes the oldest open buy on the same instrument, and a position still open at the end is counted neither way. Win and loss are measured after charges."
+    - generic [ref=f1e135]:
+      - heading "Monthly returns" [level=2] [ref=f1e136]
+      - table [ref=f1e138]:
+        - rowgroup [ref=f1e139]:
+          - row "J F M A M J J A S O N D" [ref=f1e140]
+        - rowgroup [ref=f1e154]:
+          - row "2020 -0.4 -0.3 -0.4 0.9 -0.3 0.0 0.2 -0.1 0.2 -0.3 -0.3 -0.1" [ref=f1e155]
+          - row "2021 -0.5 0.3 -0.3 -0.1 -0.0 -0.1 -0.3 0.3 0.5 0.3 -0.4 0.1" [ref=f1e169]
+          - row "2022 0.1 -0.6 -0.2 0.4 -0.8 -0.2 -0.7 0.2 -0.4 0.0 0.6 -0.4" [ref=f1e183]
+          - row "2023 -0.4 -0.2 0.1 0.1 -0.2 0.2 -0.7 -0.5 -0.1 -0.3 0.1 0.3" [ref=f1e197]
+          - row "2024 0.8 -0.1 0.1 -0.2 -0.2 0.1 -0.3 -0.2 -0.4 -0.6 -0.3 -0.6" [ref=f1e211]
+          - row "2025 0.2 -0.5 0.2 0.1 0.1 0.2 -0.5 -0.0 -0.2 0.3 0.0 0.1" [ref=f1e225]
+          - 'row "2026 -0.7 -1.0 -0.1 0.2 -0.4 -0.1 -0.1 -0.1 2026-09: no data 2026-10: no data 2026-11: no data 2026-12: no data" [ref=f1e239]'
+    - generic [ref=f1e253]:
+      - heading "Rolling 6-month Sharpe" [level=2] [ref=f1e254]
+      - table [ref=f1e257]:
+        - row [ref=f1e258]:
+          - cell
+          - cell [ref=f1e259]
+          - cell [ref=f1e268]
+        - row [ref=f1e272]:
+          - cell
+          - cell [ref=f1e273]
+          - cell [ref=f1e277]
+      - paragraph [ref=f1e280]: At the same 6.50% risk-free rate. Starts once six months of returns are available.
+  - button "Open Next.js Dev Tools" [ref=f1e9] [cursor=pointer]
+  - alert [ref=f1e13]

@@ -642,6 +642,32 @@ def list_strategies(
     return [_strategy_summary_from_row(row) for row in rows]
 
 
+_GET_STRATEGY_SQL = _LIST_STRATEGIES_SQL.replace(
+    "ORDER BY s.registered_at DESC, s.strategy_id DESC\n    LIMIT %s",
+    "WHERE s.strategy_id = %s",
+)
+
+
+@router.get("/strategies/{strategy_id}", response_model=StrategySummary)
+def get_strategy_summary(
+    strategy_id: int,
+    conn: Annotated[Connection, Depends(get_db_connection)],
+) -> StrategySummary:
+    """One registered strategy, shaped exactly like a row of `GET /strategies`.
+
+    The same projection, deliberately: a detail page and a list row showing
+    different fields for the same strategy is how the two drift. Fetching
+    the whole list and filtering client-side would transfer every strategy
+    to render one.
+
+    Plain `def`, and a GET that never writes.
+    """
+    row = conn.execute(_GET_STRATEGY_SQL, (strategy_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"no strategy with strategy_id={strategy_id}")
+    return _strategy_summary_from_row(row)
+
+
 __all__ = [
     "ContractBundle",
     "LatestRun",

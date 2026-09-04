@@ -16,6 +16,12 @@ class Settings(BaseSettings):
     redis_url: str
     data_root: Path = Path("./data")
 
+    # Browser origins the gateway will answer. A comma-separated list so a
+    # second dev server -- a git worktree verifying its own branch, say --
+    # can be allowed without editing code. The default is the one port the
+    # web app runs on, so nothing changes for anyone who sets nothing.
+    cors_allow_origins: str = "http://localhost:3000"
+
     upstox_api_key: str | None = None
     upstox_api_secret: str | None = None
     upstox_analytics_token: str | None = None

@@ -361,3 +361,125 @@ export async function fetchStrategies(limit?: number): Promise<RegisteredStrateg
   if (!res.ok) throw await readError(res, `GET /strategies failed: ${res.status}`);
   return res.json();
 }
+
+/**
+ * `GET /backtests/{id}` -- one stored run with its curve and metrics.
+ *
+ * Every number arrives as a string: JSON has no decimal type, and this
+ * platform refuses to let money reach a client as a double. Parse for
+ * charts, never for arithmetic that is then displayed.
+ */
+export type EquityPoint = { ts: string; equity: string; cash: string };
+
+export type MaxDrawdown = {
+  depth: string;
+  peak_ts: string;
+  trough_ts: string;
+  recovered_ts: string | null;
+  recovered: boolean;
+  sessions: number;
+  days: number;
+};
+
+export type BacktestMetrics = {
+  risk_free: string;
+  periods_per_year: number | null;
+  total_return: string | null;
+  cagr: string | null;
+  volatility: string | null;
+  sharpe: string | null;
+  sortino: string | null;
+  calmar: string | null;
+  max_drawdown: MaxDrawdown | null;
+  value_at_risk_95: string | null;
+  worst_period: { ts: string; return: string } | null;
+  drawdown_curve: { ts: string; drawdown: string }[];
+  monthly_returns: { month: string; return: string }[];
+  rolling_sharpe: { ts: string; sharpe: string }[];
+};
+
+export type BacktestSummary = {
+  backtest_run_id: number;
+  strategy_id: number;
+  status: string;
+  requested_start: string;
+  requested_end: string;
+  fetch_start: string;
+  dispatch_from: string;
+  sessions: number;
+  instruments: number[];
+  history_bars_requested: number;
+  history_bars_available: number;
+  bars: string | null;
+  bar_calls: number;
+  orders_placed: number;
+  fills: number;
+  final_cash: string | null;
+  final_equity: string | null;
+  breaker_reason: string | null;
+  error: string | null;
+  findings: StrategyFinding[];
+  runtime: string;
+  kernel_isolated: boolean;
+  contract_version: string;
+  ran_at: string;
+};
+
+export type BacktestDetail = BacktestSummary & {
+  equity_curve: EquityPoint[];
+  metrics: BacktestMetrics | null;
+};
+
+/** What `POST /strategies/{id}/backtests` returns: a run, or a refusal. */
+export type BacktestRunResult = {
+  strategy_id: number;
+  status: string;
+  backtest_run_id: number | null;
+  bars: string | null;
+  bar_calls: number | null;
+  fills: number | null;
+  final_cash: string | null;
+  final_equity: string | null;
+  breaker_reason: string | null;
+  equity_curve: EquityPoint[];
+  findings: StrategyFinding[];
+  runtime: string | null;
+  kernel_isolated: boolean | null;
+};
+
+export async function fetchStrategy(strategyId: number): Promise<RegisteredStrategy> {
+  const res = await fetch(`${API_URL}/strategies/${strategyId}`);
+  if (!res.ok) throw await readError(res, `GET /strategies/${strategyId} failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchBacktests(strategyId: number): Promise<BacktestSummary[]> {
+  const res = await fetch(`${API_URL}/strategies/${strategyId}/backtests`);
+  if (!res.ok)
+    throw await readError(res, `GET /strategies/${strategyId}/backtests failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchBacktest(
+  runId: number,
+  riskFree?: string,
+): Promise<BacktestDetail> {
+  const query = riskFree === undefined ? "" : `?risk_free=${encodeURIComponent(riskFree)}`;
+  const res = await fetch(`${API_URL}/backtests/${runId}${query}`);
+  if (!res.ok) throw await readError(res, `GET /backtests/${runId} failed: ${res.status}`);
+  return res.json();
+}
+
+export async function runBacktest(
+  strategyId: number,
+  body: { start: string; end: string },
+): Promise<BacktestRunResult> {
+  const res = await fetch(`${API_URL}/strategies/${strategyId}/backtests`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok)
+    throw await readError(res, `POST /strategies/${strategyId}/backtests failed: ${res.status}`);
+  return res.json();
+}

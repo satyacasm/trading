@@ -7,11 +7,13 @@ import {
   fetchBacktests,
   fetchStrategy,
   runBacktest,
+  startLiveRun,
   type BacktestSummary,
   type RegisteredStrategy,
   type StrategyFinding,
 } from "@/lib/api";
 import { UNDEFINED_METRIC, backtestBlockedReason } from "@/lib/backtests";
+import { usePortfolios } from "@/lib/usePortfolios";
 
 export default function StrategyPage() {
   const params = useParams<{ id: string }>();
@@ -29,6 +31,10 @@ export default function StrategyPage() {
   const [drawdownPct, setDrawdownPct] = useState("");
   const [running, setRunning] = useState(false);
   const [refusal, setRefusal] = useState<StrategyFinding[]>([]);
+
+  const { portfolios, selectedId, setSelectedId } = usePortfolios();
+  const [starting, setStarting] = useState(false);
+  const [liveError, setLiveError] = useState<string | null>(null);
 
   const blocked = strategy ? backtestBlockedReason(strategy.bars) : null;
 
@@ -67,6 +73,19 @@ export default function StrategyPage() {
       setError((cause as Error).message);
     } finally {
       setRunning(false);
+    }
+  }
+
+  async function onGoLive() {
+    if (selectedId === null) return;
+    setStarting(true);
+    setLiveError(null);
+    try {
+      const run = await startLiveRun(strategyId, selectedId);
+      router.push(`/live/${run.live_run_id}`);
+    } catch (cause) {
+      setLiveError((cause as Error).message);
+      setStarting(false);
     }
   }
 
@@ -173,6 +192,44 @@ export default function StrategyPage() {
           </ul>
         ) : null}
         {error ? <p className="text-down text-xs">{error}</p> : null}
+      </section>
+
+      <section className="border-line bg-surface flex flex-col gap-3 rounded border p-4">
+        <h2 className="font-display text-lg">Trade live</h2>
+        <p className="text-muted text-xs">
+          Runs the same code forward against live prices, in the same sandbox, placing
+          simulated orders in the portfolio you pick. Dispatch is one-minute closed bars
+          whatever the strategy declared for backtests, and one portfolio holds one live
+          run at a time.
+        </p>
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="flex flex-col gap-1">
+            <span className="text-muted text-xs tracking-wide uppercase">Portfolio</span>
+            <select
+              value={selectedId ?? ""}
+              onChange={(e) => setSelectedId(Number(e.target.value))}
+              className="border-line bg-raised rounded border px-2 py-1 text-sm"
+            >
+              {portfolios.map((p) => (
+                <option key={p.portfolio_id} value={p.portfolio_id}>
+                  {p.name} ({p.base_currency})
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            onClick={onGoLive}
+            disabled={starting || selectedId === null}
+            className="border-live text-live hover:bg-raised rounded border px-4 py-1.5 text-sm disabled:opacity-50"
+          >
+            {starting ? "Starting…" : "Start live run"}
+          </button>
+          <Link href="/live" className="text-muted hover:text-text py-1.5 text-xs">
+            all live runs →
+          </Link>
+        </div>
+        {liveError ? <p className="text-down text-xs">{liveError}</p> : null}
       </section>
 
       <section className="flex flex-col gap-3">

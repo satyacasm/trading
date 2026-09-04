@@ -164,6 +164,9 @@ export default function WatchlistPage() {
           <Link href="/strategies" className="hover:text-text">
             Strategies
           </Link>
+          <Link href="/live" className="hover:text-text">
+            Live runs
+          </Link>
           <span className="flex items-center gap-2">
             <span className="inline-block h-2 w-2 rounded-full bg-live" aria-hidden="true" />
             <span>{liveCount} streaming</span>

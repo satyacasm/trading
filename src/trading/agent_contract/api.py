@@ -562,14 +562,32 @@ class LiveRunOut(BaseModel):
     kernel_isolated: bool | None
     bars_seen: int
     orders_placed: int
+    orders_refused: int
+    last_refusal: str | None
     started_at: str
     stopped_at: str | None
 
 
-_LIVE_RUN_COLUMNS = (
-    "live_run_id, strategy_id, portfolio_id, status, stopped_reason, runtime,"
-    " kernel_isolated, bars_seen, orders_placed, started_at, stopped_at"
+# Named, because the joined detail query appends columns after these and
+# hard-coded offsets into that row are exactly what breaks when a column is
+# added in the middle. Ask the list where a column is; never count by eye.
+_LIVE_RUN_COLUMN_LIST = (
+    "live_run_id",
+    "strategy_id",
+    "portfolio_id",
+    "status",
+    "stopped_reason",
+    "runtime",
+    "kernel_isolated",
+    "bars_seen",
+    "orders_placed",
+    "orders_refused",
+    "last_refusal",
+    "started_at",
+    "stopped_at",
 )
+_LIVE_RUN_COLUMNS = ", ".join(_LIVE_RUN_COLUMN_LIST)
+_LIVE_RUN_COLUMN_COUNT = len(_LIVE_RUN_COLUMN_LIST)
 
 
 def _live_run_out(row: tuple[Any, ...]) -> LiveRunOut:
@@ -583,8 +601,10 @@ def _live_run_out(row: tuple[Any, ...]) -> LiveRunOut:
         kernel_isolated=row[6],
         bars_seen=row[7],
         orders_placed=row[8],
-        started_at=row[9].isoformat(),
-        stopped_at=None if row[10] is None else row[10].isoformat(),
+        orders_refused=row[9],
+        last_refusal=row[10],
+        started_at=row[11].isoformat(),
+        stopped_at=None if row[12] is None else row[12].isoformat(),
     )
 
 
@@ -651,6 +671,175 @@ def stop_live_run(
     if row is None:
         raise HTTPException(status_code=404, detail=f"no live run with live_run_id={live_run_id}")
     return _live_run_out(row)
+
+
+class LivePosition(BaseModel):
+    instrument_id: int
+    symbol: str
+    quantity: str
+    avg_cost: str
+    last_price: str | None
+    market_value: str | None
+    unrealised_pnl: str | None
+
+
+class LiveFill(BaseModel):
+    order_id: int
+    symbol: str
+    side: str
+    quantity: str
+    price: str
+    total_charges: str
+    rationale: str
+    filled_at: str
+
+
+class LiveRunDetail(LiveRunOut):
+    """One run, with everything needed to watch it.
+
+    Equity comes from `portfolio_equity_snapshots`, which the breaker
+    already writes on every tick -- the same number that would pause the
+    run, so the chart and the limit cannot disagree. That is the same
+    reasoning D3b-2 used for the backtest curve, and it applies with more
+    force here: a monitoring page that drew a different equity from the one
+    being enforced would be actively misleading.
+    """
+
+    strategy_name: str
+    strategy_version: str
+    portfolio_name: str
+    base_currency: str
+    cash_balance: str
+    equity: str | None
+    peak_equity: str | None
+    drawdown_pct: str | None
+    positions: list[LivePosition] = []
+    recent_fills: list[LiveFill] = []
+    equity_curve: list[dict[str, str]] = []
+
+
+# The run's own columns, qualified: `strategy_id` and `portfolio_id` are
+# ambiguous once the joins are in, and an unqualified list fails only at
+# runtime.
+_LIVE_RUN_COLUMNS_QUALIFIED = ", ".join(f"r.{column}" for column in _LIVE_RUN_COLUMN_LIST)
+
+_LIVE_DETAIL_SQL = f"""
+    SELECT {_LIVE_RUN_COLUMNS_QUALIFIED}, s.name, s.version, p.name, p.base_currency,
+           p.cash_balance
+    FROM live_runs r
+    JOIN strategies s ON s.strategy_id = r.strategy_id
+    JOIN portfolios p ON p.portfolio_id = r.portfolio_id
+    WHERE r.live_run_id = %s
+"""
+
+_LIVE_POSITIONS_SQL = """
+    SELECT pos.instrument_id, i.symbol, pos.quantity, pos.avg_cost,
+           (SELECT b.close FROM bars_intraday b WHERE b.instrument_id = pos.instrument_id
+            ORDER BY b.ts DESC LIMIT 1) AS last_price
+    FROM positions pos JOIN instruments i ON i.instrument_id = pos.instrument_id
+    WHERE pos.portfolio_id = %s AND pos.quantity <> 0
+    ORDER BY i.symbol
+"""
+
+_LIVE_FILLS_SQL = """
+    SELECT o.order_id, i.symbol, o.side, f.quantity, f.price, f.total_charges,
+           o.rationale, f.filled_at
+    FROM fills f
+    JOIN orders o ON o.order_id = f.order_id
+    JOIN instruments i ON i.instrument_id = o.instrument_id
+    WHERE o.live_run_id = %s
+    ORDER BY f.filled_at DESC LIMIT 50
+"""
+
+# Sampled, not every row: the breaker writes a snapshot per tick, so a
+# day's run is tens of thousands of points and a chart cannot use them all.
+# Every Nth row by ordinal keeps the shape without pretending to a
+# resolution the eye could read.
+_LIVE_EQUITY_SQL = """
+    SELECT ts, equity FROM (
+        SELECT ts, equity, row_number() OVER (ORDER BY ts) AS rn,
+               count(*) OVER () AS total
+        FROM portfolio_equity_snapshots
+        WHERE portfolio_id = %s AND ts >= %s
+    ) sampled
+    WHERE rn %% greatest(1, total / 400) = 0
+    ORDER BY ts
+"""
+
+
+@router.get("/live/{live_run_id}", response_model=LiveRunDetail)
+def get_live_run(
+    live_run_id: int,
+    conn: Annotated[Connection, Depends(get_db_connection)],
+) -> LiveRunDetail:
+    """One live run and the portfolio it is trading. A GET that never writes."""
+    row = conn.execute(_LIVE_DETAIL_SQL, (live_run_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"no live run with live_run_id={live_run_id}")
+
+    base = _live_run_out(row[:_LIVE_RUN_COLUMN_COUNT])
+    joined = row[_LIVE_RUN_COLUMN_COUNT:]
+    # The curve is the run's, not the portfolio's: a portfolio that has been
+    # traded by hand for a week would otherwise open with a week of history
+    # this run had nothing to do with.
+    started_at = row[_LIVE_RUN_COLUMN_LIST.index("started_at")]
+    positions = []
+    for instrument_id, symbol, quantity, avg_cost, last_price in conn.execute(
+        _LIVE_POSITIONS_SQL, (row[2],)
+    ).fetchall():
+        value = None if last_price is None else last_price * quantity
+        positions.append(
+            LivePosition(
+                instrument_id=instrument_id,
+                symbol=symbol,
+                quantity=str(quantity),
+                avg_cost=str(avg_cost),
+                last_price=None if last_price is None else str(last_price),
+                market_value=None if value is None else str(value),
+                unrealised_pnl=None if value is None else str(value - avg_cost * quantity),
+            )
+        )
+
+    fills = [
+        LiveFill(
+            order_id=o,
+            symbol=sym,
+            side=side,
+            quantity=str(qty),
+            price=str(price),
+            total_charges=str(charges),
+            rationale=rationale,
+            filled_at=filled_at.isoformat(),
+        )
+        for o, sym, side, qty, price, charges, rationale, filled_at in conn.execute(
+            _LIVE_FILLS_SQL, (live_run_id,)
+        ).fetchall()
+    ]
+
+    curve = [
+        {"ts": ts.isoformat(), "equity": str(equity)}
+        for ts, equity in conn.execute(_LIVE_EQUITY_SQL, (row[2], started_at)).fetchall()
+    ]
+    latest = conn.execute(
+        "SELECT equity, peak_equity, drawdown_pct FROM portfolio_equity_snapshots"
+        " WHERE portfolio_id = %s ORDER BY ts DESC LIMIT 1",
+        (row[2],),
+    ).fetchone()
+
+    return LiveRunDetail(
+        **base.model_dump(),
+        strategy_name=joined[0],
+        strategy_version=joined[1],
+        portfolio_name=joined[2],
+        base_currency=joined[3],
+        cash_balance=str(joined[4]),
+        equity=None if latest is None else str(latest[0]),
+        peak_equity=None if latest is None else str(latest[1]),
+        drawdown_pct=None if latest is None else str(latest[2]),
+        positions=positions,
+        recent_fills=fills,
+        equity_curve=curve,
+    )
 
 
 @router.get("/live", response_model=list[LiveRunOut])

@@ -291,8 +291,6 @@ def main() -> int:
     return 0
 
 
-
-
 def _run_live(payload, instance, manifest, strategy_cls):  # noqa: ANN001, ANN202
     """Drive the strategy a bar at a time, from frames on stdin.
 

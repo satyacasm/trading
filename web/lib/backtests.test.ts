@@ -12,6 +12,7 @@ import {
   describeRunWindow,
   formatPercent,
   formatRatio,
+  formatSignedMoney,
   lostToTheHurdle,
   riskFreeCurve,
 } from "./backtests";
@@ -311,5 +312,24 @@ describe("METRIC_HELP", () => {
       "win_rate", "profit_factor", "cost_drag", "reshuffle", "stress"]) {
       expect(METRIC_HELP[key], key).toBeDefined();
     }
+  });
+});
+
+describe("formatSignedMoney", () => {
+  it("keeps the minus on a losing position", () => {
+    // A table column has no surrounding words to carry the sign, so the
+    // sign has to survive the formatter. 2 RELIANCE bought at 1,326.96
+    // and marked at 1,322.00 is a loss, and a page that renders it as
+    // "9.92" says the opposite of what the API sent.
+    expect(formatSignedMoney("-9.92")).toBe("-9.92");
+  });
+
+  it("groups in lakhs like the rest of the app", () => {
+    expect(formatSignedMoney("-850000")).toBe("-8,50,000.00");
+    expect(formatSignedMoney("850000")).toBe("8,50,000.00");
+  });
+
+  it("passes a non-numeric string through untouched", () => {
+    expect(formatSignedMoney("n/a")).toBe("n/a");
   });
 });

@@ -77,6 +77,10 @@ class LiveRun:
     kernel_isolated: bool
     bars_seen: int = 0
     orders_placed: int = 0
+    # A refused order is information, not a failure -- but a run refused on
+    # every bar reads as an idle one unless the count is kept.
+    orders_refused: int = 0
+    last_refusal: str | None = None
     _order_times: list[float] = field(default_factory=list)
 
     def over_rate_limit(self) -> bool:
@@ -180,8 +184,17 @@ def stop_run(conn: Connection, run: LiveRun, status: str, reason: str | None) ->
             run.process.kill()
     conn.execute(
         "UPDATE live_runs SET status=%s, stopped_reason=%s, stopped_at=now(),"
-        " bars_seen=%s, orders_placed=%s WHERE live_run_id=%s",
-        (status, reason, run.bars_seen, run.orders_placed, run.live_run_id),
+        " bars_seen=%s, orders_placed=%s, orders_refused=%s, last_refusal=%s"
+        " WHERE live_run_id=%s",
+        (
+            status,
+            reason,
+            run.bars_seen,
+            run.orders_placed,
+            run.orders_refused,
+            run.last_refusal,
+            run.live_run_id,
+        ),
     )
     log.info("live.stopped", live_run_id=run.live_run_id, status=status, reason=reason)
 
@@ -221,6 +234,26 @@ def read_frames(run: LiveRun, timeout: float = 30.0) -> list[dict[str, Any]]:
     return frames
 
 
+def _refusal_text(detail: str) -> str:
+    """The gateway's sentence, unwrapped from its JSON envelope.
+
+    Showing a person `{"detail":"portfolio 10 has base_currency=..."}` puts
+    a layer of transport between them and an explanation that was already
+    written for them. A body that is not the expected envelope is passed
+    through as-is rather than discarded -- an unexpected shape is still the
+    only evidence of what went wrong.
+    """
+    try:
+        parsed = json.loads(detail)
+    except ValueError:
+        return detail
+    if isinstance(parsed, dict):
+        inner = parsed.get("detail")
+        if isinstance(inner, str):
+            return inner
+    return detail
+
+
 def place_order(api_url: str, run: LiveRun, intent: dict[str, Any], seq: int) -> bool:
     """Turn an intent into an ordinary paper order, over HTTP.
 
@@ -258,12 +291,17 @@ def place_order(api_url: str, run: LiveRun, intent: dict[str, Any], seq: int) ->
     except urllib.error.HTTPError as exc:
         # A refused order is information, not a failure: the currency gate
         # or the market-hours check doing its job is exactly what a live
-        # strategy should experience, and the run continues.
+        # strategy should experience, and the run continues. The gateway's
+        # own sentence is kept on the run so the monitor can answer "why is
+        # nothing happening" without anyone opening this log.
+        detail = exc.read()[:300].decode("utf-8", "replace")
+        run.orders_refused += 1
+        run.last_refusal = _refusal_text(detail)
         log.warning(
             "live.order_refused",
             live_run_id=run.live_run_id,
             status=exc.code,
-            detail=exc.read()[:300].decode("utf-8", "replace"),
+            detail=detail,
         )
         return False
     except Exception as exc:  # noqa: BLE001 - the gateway being down is not the strategy's fault
@@ -301,8 +339,9 @@ def handle_bar(conn: Connection, api_url: str, run: LiveRun, bar: dict[str, Any]
             stop_run(conn, run, "STOPPED", frame.get("breaker_reason") or "the breaker latched")
             return False
     conn.execute(
-        "UPDATE live_runs SET bars_seen=%s, orders_placed=%s WHERE live_run_id=%s",
-        (run.bars_seen, run.orders_placed, run.live_run_id),
+        "UPDATE live_runs SET bars_seen=%s, orders_placed=%s, orders_refused=%s,"
+        " last_refusal=%s WHERE live_run_id=%s",
+        (run.bars_seen, run.orders_placed, run.orders_refused, run.last_refusal, run.live_run_id),
     )
     return True
 

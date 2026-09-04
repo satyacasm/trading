@@ -1,21 +1,62 @@
 # Where this project stands
 
-**Updated:** 2026-09-04, ~17:40 IST. Keep this file current — it is the
+**Updated:** 2026-09-04, ~21:00 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
 
 ## The one thing to do next
 
-**Walk-forward analysis**, the last piece of §228/§6 and the last thing
-standing between Phase 3 and complete. It was held out of 3f deliberately:
-its splitting policy is a design in itself — anchored or rolling folds, how
-many, what in-sample/out-of-sample ratio — plus N container runs per
-backtest and a report shape for comparing folds. Decide the policy first.
+**The live strategy supervisor** — Phase 2's "forward paper-running of
+strategies with monitoring dashboard" (§254). Design settled at
+`docs/superpowers/specs/2026-09-04-live-strategy-runtime-design.md`; the
+foundations are merged and the supervisor itself is what remains.
 
-After that, the **post-tax P&L lens** (§8): STCG/LTCG holding periods,
-F&O business-income framing, and the crypto 30% + 1% TDS regime with no
-loss offset. The fill ledger is the input it was waiting on.
+Built already:
+
+- **One dispatcher.** `run_loop`'s per-bar body is now a `step(close_ts,
+  indexed) -> bool` the supervisor will drive once per closed bar. §166
+  claims backtest and forward behaviour are "bit-identical by construction";
+  this is the construction. A second loop would drift, invisibly, until a
+  strategy behaved differently in production than in its backtest.
+- **`InMemoryBars.append`**, so a run that has not finished can learn bars
+  one at a time. A late bar is refused rather than reordered — reordering
+  would change history a strategy had already read.
+
+Still to build: the framed-JSON protocol, the runner's live mode, the
+supervisor process, a `live_runs` table, start/stop routes, orders flowing
+into the existing paper order API, and the supervisor-side order-rate limit
+(§166 puts it there). Then the monitoring page.
+
+**Most of the live path already exists.** `paper.engine` fills orders from
+live ticks with the real cost model, the circuit breaker watches the
+portfolio, and the outbox alerts. What is missing is only the piece that
+turns `ctx.order()` into a row in `orders`. Crypto bars arrive 24/7, so a
+live run is demonstrable outside NSE hours.
+
+### The transport diverges from §166, and the spike is why
+
+§166 specifies Unix socket RPC between supervisor and strategy. Measured on
+this machine:
+
+| approach | reaches supervisor | reaches internet |
+|---|---|---|
+| `--network none` (today) | no | no |
+| bind-mounted Unix socket | **no — `OSError 95` across the macOS/Lima share** | no |
+| default bridge | yes | **yes** |
+| `--internal` bridge | only containers on it | no |
+
+Unix domain sockets do not work across the macOS-to-VM filesystem share.
+The internal bridge blocks the internet but cannot reach the host, so the
+supervisor would have to run inside `colima-sandbox` — which holds no
+database, because the VM split deliberately keeps 51M bars and the paper
+ledger out of a container escape's blast radius.
+
+**Framed JSON over stdin/stdout** keeps `--network none`, keeps all fifteen
+containment tests, and keeps the supervisor beside the database. The
+supervisor's role is exactly §166's; only the pipe differs, and it is the
+pipe that already carries the source and the payload. Five minutes of
+spiking; it would have been a week of building the wrong thing.
 
 ---
 

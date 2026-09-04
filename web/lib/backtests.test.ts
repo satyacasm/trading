@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   UNDEFINED_METRIC,
+  backtestBlockedReason,
   describeCostDrag,
   describeDrawdown,
   describeHurdle,
@@ -209,5 +210,26 @@ describe("describeCostDrag", () => {
     expect(describeCostDrag(drag({ gross_pnl: "0", net_pnl: "-40" }))).toBe(
       "no gross result for costs to take a share of",
     );
+  });
+});
+
+
+describe("backtestBlockedReason", () => {
+  it("permits a daily strategy", () => {
+    expect(backtestBlockedReason("1d")).toBe(null);
+  });
+
+  it("explains why a 1m strategy cannot be backtested, before the button is pressed", () => {
+    const reason = backtestBlockedReason("1m");
+    expect(reason).not.toBe(null);
+    expect(reason).toContain("1m");
+    expect(reason).toContain('bars="1d"');
+  });
+
+  it("permits a strategy whose interval is unknown", () => {
+    // Registered before manifests were persisted. An unknown interval is
+    // not a known problem, so the backend decides rather than the page
+    // refusing something that might work.
+    expect(backtestBlockedReason(null)).toBe(null);
   });
 });

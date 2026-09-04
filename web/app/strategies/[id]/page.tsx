@@ -11,7 +11,7 @@ import {
   type RegisteredStrategy,
   type StrategyFinding,
 } from "@/lib/api";
-import { UNDEFINED_METRIC } from "@/lib/backtests";
+import { UNDEFINED_METRIC, backtestBlockedReason } from "@/lib/backtests";
 
 export default function StrategyPage() {
   const params = useParams<{ id: string }>();
@@ -26,6 +26,8 @@ export default function StrategyPage() {
   const [end, setEnd] = useState("2026-08-21");
   const [running, setRunning] = useState(false);
   const [refusal, setRefusal] = useState<StrategyFinding[]>([]);
+
+  const blocked = strategy ? backtestBlockedReason(strategy.bars) : null;
 
   const load = useCallback(() => {
     fetchStrategy(strategyId).then(setStrategy).catch((c: Error) => setError(c.message));
@@ -76,10 +78,16 @@ export default function StrategyPage() {
 
       <section className="border-line bg-surface flex flex-col gap-3 rounded border p-4">
         <h2 className="font-display text-lg">Run backtest</h2>
-        <p className="text-muted text-xs">
-          Daily bars only. Data runs to 2026-08-21; a window past that is refused rather
-          than run on nothing.
-        </p>
+        {blocked ? (
+          <p className="border-down/40 bg-raised text-muted rounded border-l-2 px-3 py-2 text-xs">
+            {blocked}
+          </p>
+        ) : (
+          <p className="text-muted text-xs">
+            Daily bars only. Data runs to 2026-08-21; a window past that is refused rather
+            than run on nothing.
+          </p>
+        )}
         <form onSubmit={onRun} className="flex flex-wrap items-end gap-3">
           <label className="flex flex-col gap-1">
             <span className="text-muted text-xs tracking-wide uppercase">Start</span>
@@ -101,7 +109,7 @@ export default function StrategyPage() {
           </label>
           <button
             type="submit"
-            disabled={running}
+            disabled={running || blocked !== null}
             className="border-live text-live hover:bg-raised rounded border px-4 py-1.5 text-sm disabled:opacity-50"
           >
             {running ? "Running…" : "Run backtest"}
@@ -124,7 +132,9 @@ export default function StrategyPage() {
         <h2 className="font-display text-lg">Runs</h2>
         {runs.length === 0 ? (
           <p className="text-muted text-sm">
-            No backtests yet. Pick a window above and run one.
+            {blocked
+              ? "No backtests, and none possible until this strategy declares daily bars."
+              : "No backtests yet. Pick a window above and run one."}
           </p>
         ) : (
           <table className="w-full text-sm">

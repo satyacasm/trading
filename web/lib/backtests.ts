@@ -158,3 +158,19 @@ export function describeCostDrag(drag: CostDrag): string {
   }
   return "no gross result for costs to take a share of";
 }
+
+
+/**
+ * Why this strategy cannot be backtested, or null if it can.
+ *
+ * The strategy page knows the declared interval before the button is
+ * pressed, so offering a Run backtest control that can only return
+ * BACKTEST_INTERVAL_UNSUPPORTED is a refusal the reader could have been
+ * spared. `null` bars means the interval is unknown -- registered before
+ * manifests were persisted -- and an unknown interval is not a known
+ * problem, so the run is allowed and the backend decides.
+ */
+export function backtestBlockedReason(bars: string | null): string | null {
+  if (bars === null || bars === "1d") return null;
+  return `This strategy declares ${bars} bars. Backtests run on daily bars only: a multi-year intraday run is millions of bars and the sandbox receives them as one payload. Re-upload it with bars="1d" under a new version to backtest it.`;
+}

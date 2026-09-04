@@ -125,6 +125,10 @@ class CreateOrderRequest(BaseModel):
     time_in_force: TimeInForce = TimeInForce.DAY
     rationale: str
     idempotency_key: str = Field(min_length=1)
+    # Set by the live supervisor, never by a human. Null means a
+    # person placed this order; it is the only thing distinguishing a
+    # strategy's orders from manual ones in the same blotter.
+    live_run_id: int | None = None
 
     @model_validator(mode="after")
     def _rationale_non_empty(self) -> CreateOrderRequest:
@@ -359,8 +363,9 @@ def _insert_order(conn: Connection, body: CreateOrderRequest) -> tuple[Order, bo
         with conn.transaction():
             row = conn.execute(
                 "INSERT INTO orders (portfolio_id, instrument_id, side, order_type, quantity,"
-                " limit_price, product, time_in_force, status, rationale, idempotency_key)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                " limit_price, product, time_in_force, status, rationale, idempotency_key,"
+                " live_run_id)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
                 f" RETURNING {_ORDER_COLUMNS}",
                 (
                     body.portfolio_id,
@@ -374,6 +379,7 @@ def _insert_order(conn: Connection, body: CreateOrderRequest) -> tuple[Order, bo
                     OrderStatus.PENDING.value,
                     body.rationale,
                     body.idempotency_key,
+                    body.live_run_id,
                 ),
             ).fetchone()
         assert row is not None

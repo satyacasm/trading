@@ -31,11 +31,21 @@ from typing import Any
 from trading.paper.models import ChargeSchedule
 from trading.runtime.provider import BarRecord
 
-__all__ = ["MODE_CONFIGURE", "MODE_SMOKE", "SmokePayload", "decode_payload", "encode_payload"]
+__all__ = [
+    "MODE_CONFIGURE",
+    "MODE_LIVE",
+    "MODE_SMOKE",
+    "SmokePayload",
+    "decode_payload",
+    "encode_payload",
+]
 
 MODE_CONFIGURE = "configure"
 MODE_SMOKE = "smoke"
-_MODES = frozenset({MODE_CONFIGURE, MODE_SMOKE})
+# A run with no end: the host feeds bars over stdin as they close, rather
+# than shipping them all up front. Same image, same dispatcher, no network.
+MODE_LIVE = "live"
+_MODES = frozenset({MODE_CONFIGURE, MODE_SMOKE, MODE_LIVE})
 
 
 @dataclass(frozen=True)

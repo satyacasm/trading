@@ -35,6 +35,33 @@ from typing import Any
 SOURCE_NAME = "strategy.py"
 
 
+def _read_payload_bytes() -> bytes:
+    """Exactly the payload, leaving anything after it on the stream.
+
+    Length-prefixed: a decimal byte count on its own line, then that many
+    bytes. `read()` to EOF would be simpler and is what this did while every
+    run was a batch -- but a live run sends bar frames down the same pipe
+    after the payload, and reading to EOF would swallow them and then block
+    forever waiting for an EOF that had already happened.
+
+    A header rather than relying on gzip being self-delimiting: a buffered
+    reader may pull bytes past the end of the gzip member into its own
+    buffer, which would eat the first frame in a way that depends on
+    buffer sizes rather than on anything in the protocol.
+    """
+    header = sys.stdin.buffer.readline().strip()
+    length = int(header)
+    remaining = length
+    chunks: list[bytes] = []
+    while remaining > 0:
+        chunk = sys.stdin.buffer.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 def _emit(result: dict[str, Any]) -> None:
     # A single line on stdout, and nothing else ever written there, so the
     # host can parse the last line without heuristics even if the strategy
@@ -166,12 +193,12 @@ def _load_strategy_class(source: str) -> tuple[type | None, dict[str, Any] | Non
 
 
 def main() -> int:
-    from trading.runtime.payload import MODE_SMOKE, decode_payload
+    from trading.runtime.payload import MODE_LIVE, MODE_SMOKE, decode_payload
 
     _install_sdk_alias()
 
     try:
-        payload = decode_payload(sys.stdin.buffer.read())
+        payload = decode_payload(_read_payload_bytes())
     except Exception:  # noqa: BLE001
         _emit({"ok": False, "stage": "payload", "error": traceback.format_exc(limit=20)})
         return 0
@@ -195,6 +222,9 @@ def main() -> int:
             }
         )
         return 0
+
+    if payload.mode == MODE_LIVE:
+        return _run_live(payload, instance, manifest, strategy_cls)
 
     if payload.mode != MODE_SMOKE:
         _emit(
@@ -259,6 +289,154 @@ def main() -> int:
         }
     )
     return 0
+
+
+
+
+def _run_live(payload, instance, manifest, strategy_cls):  # noqa: ANN001, ANN202
+    """Drive the strategy a bar at a time, from frames on stdin.
+
+    The same `step` the backtester drives, so forward and historical
+    behaviour are identical by sharing rather than by discipline. The
+    process stays alive between bars, which is what keeps the strategy's
+    own state -- `self.` attributes as much as `ctx.state` -- intact across
+    dispatches. Re-invoking a fresh container per bar would silently reset
+    anything not written to `ctx.state`, and most strategies use both.
+
+    Frames in: `bar` carries one closed bar; `stop` ends the run. Frames
+    out: `ready` once initialised, `orders` after each bar with whatever the
+    strategy submitted, `error` if a handler raised.
+
+    Orders are reported as intents, not placed. This process has no network
+    and no database by design; the supervisor turns an intent into a real
+    paper order, which is also where §166 puts the rate limit.
+    """
+    import sys
+    from decimal import Decimal
+
+    from trading.live.protocol import (
+        FRAME_BAR,
+        FRAME_ERROR,
+        FRAME_ORDERS,
+        FRAME_READY,
+        FRAME_STOP,
+        decode_frame,
+        encode_frame,
+    )
+    from trading.runtime.loop import open_session
+    from trading.runtime.provider import BarRecord, InMemoryBars
+
+    bars = InMemoryBars({})
+    session = open_session(
+        instance,
+        bars,
+        payload.charge_schedules,
+        payload.starting_cash,
+        payload.slippage_bps,
+        max_daily_loss=(
+            payload.max_daily_loss
+            if payload.max_daily_loss is not None
+            else getattr(manifest, "max_daily_loss", None)
+        ),
+        max_drawdown_pct=(
+            payload.max_drawdown_pct
+            if payload.max_drawdown_pct is not None
+            else getattr(manifest, "max_drawdown_pct", None)
+        ),
+    )
+
+    def _write(line: str) -> None:
+        # The same explicit write loop `_emit` uses, for the same reason: a
+        # raw unbuffered stream can accept a short write and drop the rest.
+        data = line.encode("utf-8")
+        stream = sys.stdout.buffer
+        view = memoryview(data)
+        while view:
+            written = stream.write(view)
+            if not written:
+                break
+            view = view[written:]
+        stream.flush()
+
+    initialised = False
+    submitted_before = 0
+
+    for raw in sys.stdin:
+        frame = decode_frame(raw)
+        if frame is None:
+            continue
+        if frame["type"] == FRAME_STOP:
+            break
+        if frame["type"] != FRAME_BAR:
+            continue
+
+        try:
+            record = BarRecord(
+                instrument_id=int(frame["instrument_id"]),
+                ts=_parse_ts(frame["ts"]),
+                interval_sec=int(frame["interval_sec"]),
+                open=Decimal(frame["open"]),
+                high=Decimal(frame["high"]),
+                low=Decimal(frame["low"]),
+                close=Decimal(frame["close"]),
+                volume=None if frame.get("volume") is None else Decimal(frame["volume"]),
+                knowable_at=None
+                if frame.get("knowable_at") is None
+                else _parse_ts(frame["knowable_at"]),
+            )
+            bar, index = bars.append(record)
+            if not initialised:
+                session.initialize(bar.close_ts)
+                initialised = True
+                _write(encode_frame(FRAME_READY, strategy_class=strategy_cls.__name__))
+            alive = session.step(bar.close_ts, ((bar, index),))
+        except BaseException:  # noqa: BLE001 - any failure is still an outcome
+            _write(encode_frame(FRAME_ERROR, error=traceback.format_exc(limit=20)))
+            break
+
+        # Only what this bar produced. `state.submissions` is cumulative, so
+        # replaying it whole would re-place every earlier order.
+        new_orders = session.state.submissions[submitted_before:]
+        submitted_before = len(session.state.submissions)
+        _write(
+            encode_frame(
+                FRAME_ORDERS,
+                ts=bar.close_ts.isoformat(),
+                orders=[_order_intent(session.state.orders[oid]) for oid in new_orders],
+                breaker_reason=session.state.breaker_reason,
+                alive=alive,
+            )
+        )
+        if not alive:
+            break
+
+    _emit({"ok": True, "stage": "live", "outcome": _as_dict(session.outcome())})
+    return 0
+
+
+def _parse_ts(raw):  # noqa: ANN001, ANN202
+    from datetime import datetime
+
+    return datetime.fromisoformat(raw)
+
+
+def _order_intent(order):  # noqa: ANN001, ANN202
+    """What the supervisor needs to place a real order. Money as strings."""
+    return {
+        "instrument_id": order.instrument_id,
+        "side": order.side.value,
+        "order_type": order.order_type.value,
+        "quantity": str(order.quantity),
+        "limit_price": None if order.limit_price is None else str(order.limit_price),
+        "product": order.product.value,
+        "rationale": order.rationale,
+    }
+
+
+def _as_dict(outcome):  # noqa: ANN001, ANN202
+    from dataclasses import asdict
+
+    return asdict(outcome)
 
 
 if __name__ == "__main__":

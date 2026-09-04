@@ -1,19 +1,49 @@
 # Where this project stands
 
-**Updated:** 2026-09-04, ~21:25 IST. Keep this file current — it is the
+**Updated:** 2026-09-04, ~22:10 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
 
 ## The one thing to do next
 
-**The live monitoring page.** Strategies now run forward and trade; nothing
-shows it happening. `GET /live` lists runs with `bars_seen`, `orders_placed`
-and `stopped_reason`; the orders are ordinary rows tagged `live_run_id`, so
-equity, P&L and positions all come from the existing portfolio queries.
+**Restart/resume across supervisor death.** A supervisor restart relaunches
+every `RUNNING` row, which is right for the row and wrong for the strategy:
+the container is new, so whatever the strategy held in memory is gone and
+its next bar looks like its first. Nothing in `live_runs` records that this
+happened, so the run's own history reads as continuous when it is not.
 
-Then: restart/resume across supervisor death, and tick-level dispatch if
-ever wanted (it would need a contract change).
+Then: tick-level dispatch, if ever wanted (it would need a contract
+change), and the post-tax P&L lens.
+
+---
+
+## The live monitoring page — shipped 2026-09-04 (merged)
+
+`/live` lists the runs; `/live/{id}` is one run — equity curve, P&L since
+the run began, positions marked to the last bar, and each fill with the
+rationale the strategy gave for it. Both poll every five seconds, the
+supervisor's own reconcile cadence. A strategy page grows a portfolio
+picker to start one.
+
+**The curve is the run's, not the portfolio's.** It starts at `started_at`
+and samples ~400 points from `portfolio_equity_snapshots` — the table the
+circuit breaker reads, so the chart and the limit that would halt the run
+cannot tell different stories.
+
+**Refused orders are counted, and the reason kept** (`0018`). Found by
+running the crypto probe against the INR portfolio: the currency gate
+refused every order with a perfectly clear sentence, and the page showed
+`0 orders` — indistinguishable from a strategy that had decided to sit
+still. The gateway's own sentence is stored, not a code, because a code
+would have to be translated back into that sentence somewhere else.
+
+**Worth not relearning:** `formatMoney` in `web/lib/backtests.ts` drops the
+sign on purpose — prose carries it ("lost 80,541 to charges"). A table
+column has no prose, so a 9.92 loss rendered green as `9.92`. Signed
+columns use `formatSignedMoney`. Equally: slicing an ISO string to show a
+time throws away the offset that gave the digits meaning — a fill at 21:19
+IST was displaying as 15:49.
 
 ---
 
@@ -376,7 +406,7 @@ AC. Anything long-running deserves better than a laptop that sleeps.
 | **Phase 1** — streaming + manual paper trading | **Shipped.** Task 12 executed 2026-09-04, 8/10 steps pass; the three open items are operator actions, not code. |
 | **Phase 2** — Agent Contract + strategy runtime | **Started.** Draft at `docs/agent-contract/STRATEGY_CONTRACT.md`. |
 | **Phase 2.5** — intelligence layer | Not started. Recorders were meant to start in Phase 0 and compound; check whether the news/announcements recorder is actually running. |
-| **Phase 3** — backtesting + metrics | **Sub-project 3a complete, and now visible in the UI.** `smoke_test` reads a strategy's declared `data.bars` and either serves it correctly (`"1m"`, `"1d"`) or rejects it with an honest finding naming the gap (see below); `/strategies` reports which interval a run actually received, and lists what is registered. **3b, 3c, 3d and 3e shipped and merged 2026-09-04.** 3f (persistence, metrics, report UI, walk-forward, robustness) not started. |
+| **Phase 3** — backtesting + metrics | **Sub-project 3a complete, and now visible in the UI.** `smoke_test` reads a strategy's declared `data.bars` and either serves it correctly (`"1m"`, `"1d"`) or rejects it with an honest finding naming the gap (see below); `/strategies` reports which interval a run actually received, and lists what is registered. **3b through 3f shipped and merged 2026-09-04**, and strategies now also run forward against live prices with a page to watch them on. Walk-forward analysis is the one piece of the original 3f scope still open. |
 
 ---
 

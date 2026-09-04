@@ -170,10 +170,13 @@ export default function LiveRunPage() {
             refused
           </h2>
           <p className="text-muted mt-1 text-xs">
-            The gateway checked these the same way it checks a manual order, and said:{" "}
-            <span className="text-text">{run.last_refusal}</span> The run continues — a
-            refusal is the rules working, not a crash — but a strategy refused on every
-            bar will sit at zero fills until whatever it collided with is changed.
+            The gateway checked these the same way it checks a manual order, and said:
+          </p>
+          <p className="text-text num mt-1 text-xs">{run.last_refusal}</p>
+          <p className="text-muted mt-2 text-xs">
+            The run continues — a refusal is the rules working, not a crash — but a
+            strategy refused on every bar will sit at zero fills until whatever it
+            collided with is changed.
           </p>
         </section>
       ) : null}

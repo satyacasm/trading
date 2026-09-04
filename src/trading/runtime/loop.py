@@ -238,6 +238,216 @@ def run_loop(
                     rejections.append(order.rejection_reason)
             reported[order_id] = order.status
 
+    current_ist_day: date | None = None
+
+    def step(close_ts: datetime, indexed: Sequence[tuple[BarRecord, int]]) -> bool:
+        """Advance the run by one closed bar. False means the breaker latched.
+
+        Extracted from the loop rather than copied for it: the live
+        supervisor drives this same function once per bar close, so
+        backtest and forward behaviour are identical by sharing rather
+        than by discipline. §166 claims they are "bit-identical by
+        construction"; this is the construction.
+        """
+        nonlocal fills, current_ist_day
+        state.now = close_ts
+        ts_iso = close_ts.isoformat()
+
+        if dispatch_from is not None and close_ts < dispatch_from:
+            # Warm-up. This bar is history the strategy may read, not an
+            # event it experiences: no handler is called, no resting
+            # order is priced against it (there are none, and inventing
+            # them would be the lookahead the cursor exists to prevent),
+            # no day rolls, and no curve point is recorded -- equity
+            # before the run began is not a data point about the run.
+            # The cursor still advances, which is precisely what makes
+            # these bars readable through `ctx.data.bars()` at the first
+            # real dispatch.
+            for warm_bar, _index in indexed:
+                state.marks[warm_bar.instrument_id] = warm_bar.close
+            for warm_bar, index in indexed:
+                state.cursor[warm_bar.instrument_id] = index + 1
+            # `return True` rather than `continue`: this is a step now, and
+            # skipping a warm-up bar means "done with this bar, keep going",
+            # which is exactly what the driver reads a True as.
+            return True
+
+        # Roll day_open_equity at the IST calendar boundary -- see
+        # the module docstring. Read equity *before* this bar's own
+        # marks are applied, so the new day's opening reading is the
+        # portfolio as it stood at the previous bar's close, not
+        # already moved by today's first print.
+        ist_day = close_ts.astimezone(_IST).date()
+        if current_ist_day is None:
+            current_ist_day = ist_day
+        elif ist_day != current_ist_day:
+            state.day_open_equity = ctx.portfolio.equity
+            current_ist_day = ist_day
+
+        printed = {bar.instrument_id: bar for bar, _ in indexed}
+        for instrument_id, bar in printed.items():
+            state.marks[instrument_id] = bar.close
+
+        # 1. Price resting orders against this bar, before the
+        #    strategy has seen it. See the module docstring.
+        for order_id in list(state.submissions):
+            order = state.orders.get(order_id)
+            if order is None or order.status in _TERMINAL:
+                continue
+            resting_bar = printed.get(order.instrument_id)
+            if resting_bar is None:
+                continue
+            for price in _price_events(resting_bar):
+                order = state.orders[order_id]
+                if order.status in _TERMINAL:
+                    break
+                decision = decide_fill(order, price, close_ts, slippage_bps)
+                if decision is None:
+                    continue
+                # I3: the flag is considered only for SELL,
+                # mirroring trading.paper.engine's
+                # `order.side is Side.SELL and _dp_already_applied_today(...)`
+                # -- a BUY neither reads nor writes it, so a
+                # same-day BUY-then-SELL still pays DP exactly
+                # once, on the SELL. The key's date is IST, not
+                # UTC: DP is an Indian broker-day convention
+                # (breaker.py's _IST / engine.py's
+                # _ist_day_bounds_utc), and a UTC date would
+                # split an IST trading day in two.
+                key = (order.instrument_id, close_ts.astimezone(_IST).date())
+                already = order.side is Side.SELL and key in scrip_days
+                breakdown = compute_charges(
+                    schedules,
+                    order.side,
+                    decision.quantity,
+                    decision.price,
+                    scrip_day_charge_already_applied=already,
+                )
+                if order.product is Product.DELIVERY and order.side is Side.SELL:
+                    scrip_days.add(key)
+                notional = decision.quantity * decision.price
+                if order.side is Side.BUY:
+                    state.cash -= notional + breakdown.total
+                else:
+                    state.cash += notional - breakdown.total
+                # Recorded here, where the breakdown still exists. One
+                # line later only `breakdown.total` survives, and the
+                # itemisation cannot be recovered from it.
+                state.fill_ledger.append(
+                    {
+                        "ts": ts_iso,
+                        "instrument_id": str(order.instrument_id),
+                        "side": order.side.value,
+                        "product": order.product.value,
+                        # The strategy's own words for why it traded.
+                        # The contract already requires a non-empty
+                        # rationale on every order; carrying it here is
+                        # what lets a chart marker say WHY, which is the
+                        # only part of a trade a chart cannot infer.
+                        "rationale": order.rationale,
+                        # Quantized to the scales the columns that will
+                        # store these declare -- quantity 8 dp, money
+                        # 4 dp. `str(Decimal)` preserves whatever scale
+                        # the arithmetic produced, so an unquantized
+                        # value reads "100.00" here and "100.0000" after
+                        # a round trip, and the same fill then has two
+                        # string forms depending on which endpoint is
+                        # asked. The equity curve had exactly this bug.
+                        "quantity": str(decision.quantity.quantize(_QUANTITY_SCALE)),
+                        "price": str(decision.price.quantize(_MONEY_SCALE)),
+                        "brokerage": str(breakdown.brokerage.quantize(_MONEY_SCALE)),
+                        "stt": str(breakdown.stt.quantize(_MONEY_SCALE)),
+                        "exchange_txn": str(breakdown.exchange_txn.quantize(_MONEY_SCALE)),
+                        "sebi_fee": str(breakdown.sebi_fee.quantize(_MONEY_SCALE)),
+                        "stamp_duty": str(breakdown.stamp_duty.quantize(_MONEY_SCALE)),
+                        "ipft": str(breakdown.ipft.quantize(_MONEY_SCALE)),
+                        "gst": str(breakdown.gst.quantize(_MONEY_SCALE)),
+                        "dp_charges": str(breakdown.dp_charges.quantize(_MONEY_SCALE)),
+                        "tds": str(breakdown.tds.quantize(_MONEY_SCALE)),
+                        "total_charges": str(breakdown.total.quantize(_MONEY_SCALE)),
+                    }
+                )
+                _apply_position(state, order, decision.quantity, decision.price)
+                filled = order.filled_quantity + decision.quantity
+                state.orders[order_id] = order.model_copy(
+                    update={
+                        "filled_quantity": filled,
+                        "status": (
+                            OrderStatus.FILLED
+                            if filled >= order.quantity
+                            else OrderStatus.PARTIALLY_FILLED
+                        ),
+                    }
+                )
+                fills += 1
+
+        # 2. Tell the strategy what changed.
+        _deliver_updates(ts_iso)
+
+        # 3. Dispatch the bar. Only instruments that actually printed.
+        state.bar_calls += 1
+        _call(strategy, "on_bar", ts_iso, ctx, dict(printed))
+
+        # 4. Any order submitted in on_bar is OPEN and unreported;
+        #    a rejection must reach the strategy in the same session.
+        _deliver_updates(ts_iso)
+
+        # 5. Advance the cursor. Only now has this bar "closed" for
+        #    ctx.data -- during on_bar it was the present, not history.
+        for bar, index in indexed:
+            state.cursor[bar.instrument_id] = index + 1
+
+        # 6. The breaker. Explicit `is None` checks, not `or` --
+        # `state.peak_equity`/`state.day_open_equity` are seeded to
+        # starting_cash before the loop and never left `None` here,
+        # but a legitimate equity of exactly `0` must not be treated
+        # as unset by a truthy-style fallback (see the module's
+        # calling brief; both are always Decimal by this point).
+        equity = ctx.portfolio.equity
+        # The breaker's own number, recorded rather than recomputed. A
+        # second mark-to-market outside this loop could drift from the
+        # one that actually stopped the run, so a drawdown drawn from
+        # this curve and a breaker latch in the same run are the same
+        # read by construction, not by agreement.
+        # Quantized to the 4 dp scale contract §5 declares for cash and
+        # equity, not left at whatever scale the arithmetic produced.
+        # `str(Decimal)` preserves scale, so an unquantized point reads
+        # "1000000" here and "1000000.0000" after a round trip through
+        # numeric(18,4) -- numerically identical, but the same run then
+        # has two string forms depending on which endpoint is asked, and
+        # a client that caches or diffs them sees changes that did not
+        # happen.
+        state.equity_curve.append(
+            {
+                "ts": ts_iso,
+                "equity": str(equity.quantize(_MONEY_SCALE)),
+                "cash": str(state.cash.quantize(_MONEY_SCALE)),
+            }
+        )
+        peak_equity = equity if state.peak_equity is None else max(state.peak_equity, equity)
+        state.peak_equity = peak_equity
+        day_open_equity = starting_cash if state.day_open_equity is None else state.day_open_equity
+        # Latched explicitly, not left to the `break` below to make
+        # true only by construction: once tripped, stays tripped,
+        # and that invariant must hold on its own terms so it
+        # survives any future restructuring of this loop.
+        if state.breaker_reason is None:
+            state.breaker_reason = evaluate_breach(
+                equity,
+                day_open_equity,
+                peak_equity,
+                max_daily_loss,
+                max_drawdown_pct,
+            )
+        if state.breaker_reason is not None:
+            # Mirror trading.paper.breaker.trip: stop trading the
+            # instant a declared limit is breached. Continuing would
+            # report fills for a run that could never have happened
+            # against a portfolio that trip() would have paused.
+            _cancel_resting_orders(state)
+            return False
+        return True
+
     try:
         # The first timestamp the strategy will actually experience. With
         # warm-up in play that is not the first bar in the payload: the
@@ -257,203 +467,13 @@ def run_loop(
         state.now = first_dispatched
         _call(strategy, "initialize", state.now.isoformat(), ctx)
 
-        current_ist_day: date | None = None
         for close_ts, indexed in bars.indexed_groups():
-            state.now = close_ts
-            ts_iso = close_ts.isoformat()
-
-            if dispatch_from is not None and close_ts < dispatch_from:
-                # Warm-up. This bar is history the strategy may read, not an
-                # event it experiences: no handler is called, no resting
-                # order is priced against it (there are none, and inventing
-                # them would be the lookahead the cursor exists to prevent),
-                # no day rolls, and no curve point is recorded -- equity
-                # before the run began is not a data point about the run.
-                # The cursor still advances, which is precisely what makes
-                # these bars readable through `ctx.data.bars()` at the first
-                # real dispatch.
-                for warm_bar, _index in indexed:
-                    state.marks[warm_bar.instrument_id] = warm_bar.close
-                for warm_bar, index in indexed:
-                    state.cursor[warm_bar.instrument_id] = index + 1
-                continue
-
-            # Roll day_open_equity at the IST calendar boundary -- see
-            # the module docstring. Read equity *before* this bar's own
-            # marks are applied, so the new day's opening reading is the
-            # portfolio as it stood at the previous bar's close, not
-            # already moved by today's first print.
-            ist_day = close_ts.astimezone(_IST).date()
-            if current_ist_day is None:
-                current_ist_day = ist_day
-            elif ist_day != current_ist_day:
-                state.day_open_equity = ctx.portfolio.equity
-                current_ist_day = ist_day
-
-            printed = {bar.instrument_id: bar for bar, _ in indexed}
-            for instrument_id, bar in printed.items():
-                state.marks[instrument_id] = bar.close
-
-            # 1. Price resting orders against this bar, before the
-            #    strategy has seen it. See the module docstring.
-            for order_id in list(state.submissions):
-                order = state.orders.get(order_id)
-                if order is None or order.status in _TERMINAL:
-                    continue
-                resting_bar = printed.get(order.instrument_id)
-                if resting_bar is None:
-                    continue
-                for price in _price_events(resting_bar):
-                    order = state.orders[order_id]
-                    if order.status in _TERMINAL:
-                        break
-                    decision = decide_fill(order, price, close_ts, slippage_bps)
-                    if decision is None:
-                        continue
-                    # I3: the flag is considered only for SELL,
-                    # mirroring trading.paper.engine's
-                    # `order.side is Side.SELL and _dp_already_applied_today(...)`
-                    # -- a BUY neither reads nor writes it, so a
-                    # same-day BUY-then-SELL still pays DP exactly
-                    # once, on the SELL. The key's date is IST, not
-                    # UTC: DP is an Indian broker-day convention
-                    # (breaker.py's _IST / engine.py's
-                    # _ist_day_bounds_utc), and a UTC date would
-                    # split an IST trading day in two.
-                    key = (order.instrument_id, close_ts.astimezone(_IST).date())
-                    already = order.side is Side.SELL and key in scrip_days
-                    breakdown = compute_charges(
-                        schedules,
-                        order.side,
-                        decision.quantity,
-                        decision.price,
-                        scrip_day_charge_already_applied=already,
-                    )
-                    if order.product is Product.DELIVERY and order.side is Side.SELL:
-                        scrip_days.add(key)
-                    notional = decision.quantity * decision.price
-                    if order.side is Side.BUY:
-                        state.cash -= notional + breakdown.total
-                    else:
-                        state.cash += notional - breakdown.total
-                    # Recorded here, where the breakdown still exists. One
-                    # line later only `breakdown.total` survives, and the
-                    # itemisation cannot be recovered from it.
-                    state.fill_ledger.append(
-                        {
-                            "ts": ts_iso,
-                            "instrument_id": str(order.instrument_id),
-                            "side": order.side.value,
-                            "product": order.product.value,
-                            # The strategy's own words for why it traded.
-                            # The contract already requires a non-empty
-                            # rationale on every order; carrying it here is
-                            # what lets a chart marker say WHY, which is the
-                            # only part of a trade a chart cannot infer.
-                            "rationale": order.rationale,
-                            # Quantized to the scales the columns that will
-                            # store these declare -- quantity 8 dp, money
-                            # 4 dp. `str(Decimal)` preserves whatever scale
-                            # the arithmetic produced, so an unquantized
-                            # value reads "100.00" here and "100.0000" after
-                            # a round trip, and the same fill then has two
-                            # string forms depending on which endpoint is
-                            # asked. The equity curve had exactly this bug.
-                            "quantity": str(decision.quantity.quantize(_QUANTITY_SCALE)),
-                            "price": str(decision.price.quantize(_MONEY_SCALE)),
-                            "brokerage": str(breakdown.brokerage.quantize(_MONEY_SCALE)),
-                            "stt": str(breakdown.stt.quantize(_MONEY_SCALE)),
-                            "exchange_txn": str(breakdown.exchange_txn.quantize(_MONEY_SCALE)),
-                            "sebi_fee": str(breakdown.sebi_fee.quantize(_MONEY_SCALE)),
-                            "stamp_duty": str(breakdown.stamp_duty.quantize(_MONEY_SCALE)),
-                            "ipft": str(breakdown.ipft.quantize(_MONEY_SCALE)),
-                            "gst": str(breakdown.gst.quantize(_MONEY_SCALE)),
-                            "dp_charges": str(breakdown.dp_charges.quantize(_MONEY_SCALE)),
-                            "tds": str(breakdown.tds.quantize(_MONEY_SCALE)),
-                            "total_charges": str(breakdown.total.quantize(_MONEY_SCALE)),
-                        }
-                    )
-                    _apply_position(state, order, decision.quantity, decision.price)
-                    filled = order.filled_quantity + decision.quantity
-                    state.orders[order_id] = order.model_copy(
-                        update={
-                            "filled_quantity": filled,
-                            "status": (
-                                OrderStatus.FILLED
-                                if filled >= order.quantity
-                                else OrderStatus.PARTIALLY_FILLED
-                            ),
-                        }
-                    )
-                    fills += 1
-
-            # 2. Tell the strategy what changed.
-            _deliver_updates(ts_iso)
-
-            # 3. Dispatch the bar. Only instruments that actually printed.
-            state.bar_calls += 1
-            _call(strategy, "on_bar", ts_iso, ctx, dict(printed))
-
-            # 4. Any order submitted in on_bar is OPEN and unreported;
-            #    a rejection must reach the strategy in the same session.
-            _deliver_updates(ts_iso)
-
-            # 5. Advance the cursor. Only now has this bar "closed" for
-            #    ctx.data -- during on_bar it was the present, not history.
-            for bar, index in indexed:
-                state.cursor[bar.instrument_id] = index + 1
-
-            # 6. The breaker. Explicit `is None` checks, not `or` --
-            # `state.peak_equity`/`state.day_open_equity` are seeded to
-            # starting_cash before the loop and never left `None` here,
-            # but a legitimate equity of exactly `0` must not be treated
-            # as unset by a truthy-style fallback (see the module's
-            # calling brief; both are always Decimal by this point).
-            equity = ctx.portfolio.equity
-            # The breaker's own number, recorded rather than recomputed. A
-            # second mark-to-market outside this loop could drift from the
-            # one that actually stopped the run, so a drawdown drawn from
-            # this curve and a breaker latch in the same run are the same
-            # read by construction, not by agreement.
-            # Quantized to the 4 dp scale contract §5 declares for cash and
-            # equity, not left at whatever scale the arithmetic produced.
-            # `str(Decimal)` preserves scale, so an unquantized point reads
-            # "1000000" here and "1000000.0000" after a round trip through
-            # numeric(18,4) -- numerically identical, but the same run then
-            # has two string forms depending on which endpoint is asked, and
-            # a client that caches or diffs them sees changes that did not
-            # happen.
-            state.equity_curve.append(
-                {
-                    "ts": ts_iso,
-                    "equity": str(equity.quantize(_MONEY_SCALE)),
-                    "cash": str(state.cash.quantize(_MONEY_SCALE)),
-                }
-            )
-            peak_equity = equity if state.peak_equity is None else max(state.peak_equity, equity)
-            state.peak_equity = peak_equity
-            if state.day_open_equity is None:
-                day_open_equity = starting_cash
-            else:
-                day_open_equity = state.day_open_equity
-            # Latched explicitly, not left to the `break` below to make
-            # true only by construction: once tripped, stays tripped,
-            # and that invariant must hold on its own terms so it
-            # survives any future restructuring of this loop.
-            if state.breaker_reason is None:
-                state.breaker_reason = evaluate_breach(
-                    equity,
-                    day_open_equity,
-                    peak_equity,
-                    max_daily_loss,
-                    max_drawdown_pct,
-                )
-            if state.breaker_reason is not None:
-                # Mirror trading.paper.breaker.trip: stop trading the
-                # instant a declared limit is breached. Continuing would
-                # report fills for a run that could never have happened
-                # against a portfolio that trip() would have paused.
-                _cancel_resting_orders(state)
+            # One dispatcher, driven at two speeds. The live supervisor
+            # calls this same `step` once per closed bar; a second loop
+            # written for live would drift, and the drift would be
+            # invisible until a strategy behaved differently in
+            # production than in its backtest.
+            if not step(close_ts, indexed):
                 break
     except _Crash as crash:
         return RunOutcome(

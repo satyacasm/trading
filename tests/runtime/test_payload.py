@@ -163,3 +163,28 @@ def test_knowable_at_survives_the_payload_round_trip() -> None:
     # An intraday bar sets nothing and keeps the arithmetic it always had.
     assert decoded.bars[2][0].knowable_at is None
     assert decoded.bars[2][0].close_ts == datetime(2026, 3, 2, 10, 1, tzinfo=UTC)
+
+
+def test_dispatch_from_survives_the_payload_round_trip() -> None:
+    """Warm-up is decided on the host and executed in the container, so
+    `dispatch_from` has to cross the envelope like the bars do.
+
+    Third boundary this sub-project crosses, and the second that is
+    hand-written: `asdict` carries new RunOutcome fields OUT of the container
+    for free, but everything going IN is encoded field by field. A
+    `dispatch_from` that stops at the host leaves the container dispatching
+    every warm-up bar as a real event -- the run silently starts earlier than
+    the caller asked, with no error anywhere.
+    """
+    ts = datetime(2026, 3, 5, 10, 0, tzinfo=UTC)
+    decoded = decode_payload(
+        encode_payload(SmokePayload(mode="smoke", source="x", dispatch_from=ts))
+    )
+    assert decoded.dispatch_from == ts
+
+
+def test_dispatch_from_defaults_to_none_for_a_payload_that_omits_it() -> None:
+    """Warm-up is opt-in: an envelope without it must dispatch everything,
+    exactly as every payload did before this field existed."""
+    decoded = decode_payload(encode_payload(SmokePayload(mode="smoke", source="x")))
+    assert decoded.dispatch_from is None

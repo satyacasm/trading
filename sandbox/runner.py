@@ -193,6 +193,8 @@ def main() -> int:
             slippage_bps=payload.slippage_bps,
             max_daily_loss=getattr(manifest, "max_daily_loss", None),
             max_drawdown_pct=getattr(manifest, "max_drawdown_pct", None),
+            # None for a smoke run, which dispatches every bar it is given.
+            dispatch_from=payload.dispatch_from,
         )
     except BaseException:  # noqa: BLE001 - the loop itself failing is still an outcome
         _emit(

@@ -37,7 +37,7 @@ from typing import Any
 
 from psycopg import Connection
 
-from trading.agent_contract.registry import CONTRACT_VERSION
+from trading.agent_contract.registry import CONTRACT_VERSION, get_strategy
 from trading.agent_contract.sandbox import (
     SandboxLimits,
     SandboxResult,
@@ -1056,4 +1056,175 @@ def plan_backtest(
         data_start=data_start,
         data_end=data_end,
         findings=tuple(findings),
+    )
+
+
+@dataclass(frozen=True)
+class BacktestVerdict:
+    """What one backtest produced, or why it was refused."""
+
+    passed: bool
+    report: ValidationReport
+    plan: BacktestPlan | None
+    bars: str | None
+    outcome: dict[str, Any] | None
+    runtime: str | None = None
+    kernel_isolated: bool = False
+
+
+def _refused(*findings: Finding, plan: BacktestPlan | None = None) -> BacktestVerdict:
+    return BacktestVerdict(
+        passed=False,
+        report=ValidationReport(findings=findings),
+        plan=plan,
+        bars=None,
+        outcome=None,
+    )
+
+
+def backtest(
+    conn: Connection,
+    strategy_id: int,
+    *,
+    start: date,
+    end: date,
+    limits: SandboxLimits | None = None,
+) -> BacktestVerdict:
+    """Run a registered strategy over an operator-chosen window.
+
+    Runs the **registered source**, read from the row, rather than anything
+    the caller supplied: the registry's rule is that a version is immutable
+    "because results already attributed to that version must keep describing
+    the code that produced them", and a backtest result is exactly such an
+    attribution. A backtest therefore cannot execute code that never passed
+    stage 1.
+
+    The window is the caller's, not the manifest's -- a strategy declares
+    what data it needs, an operator decides what period to ask about.
+
+    Raises `KeyError` if `strategy_id` does not exist; the route turns that
+    into a 404.
+    """
+    record = get_strategy(conn, strategy_id)
+    resolved = SandboxLimits.for_backtest(_resolve_limits(limits))
+
+    manifest = record.manifest
+    if manifest is None:
+        # Registered before the manifest was persisted. Recover it the only
+        # honest way -- by asking the strategy, in the sandbox -- rather than
+        # assuming a default universe on its behalf.
+        configured = run_strategy_in_sandbox(record.source, resolved)
+        if not configured.ok or configured.manifest is None:
+            return _refused(
+                Finding(
+                    code="MANIFEST_UNRESOLVABLE",
+                    message=(
+                        "this version stores no manifest and configure() did not return "
+                        f"a usable one: {(configured.error or 'no manifest').strip()[:400]}"
+                    ),
+                    contract_section="§3",
+                )
+            )
+        manifest = configured.manifest
+
+    try:
+        interval_sec = resolve_bar_interval(manifest)
+    except _InvalidBarInterval as invalid:
+        return _refused(
+            Finding(code="MANIFEST_UNRESOLVABLE", message=str(invalid), contract_section="§3")
+        )
+
+    if interval_sec != 86400:
+        # Scope, stated rather than approximated. `bars_daily` holds 51M rows
+        # across 585,266 instruments; `bars_intraday` holds 2.2M across 30.
+        # A backtest at scale is a daily one, and serving this request from
+        # the intraday table would silently be a different, far narrower
+        # experiment than the caller asked for.
+        return _refused(
+            Finding(
+                code="BACKTEST_INTERVAL_UNSUPPORTED",
+                message=(
+                    f"this strategy declares data.bars={manifest.get('data', {}).get('bars')!r}; "
+                    'backtests currently run on daily bars only ("1d"). Multi-year intraday '
+                    "does not fit one payload and chunked delivery is not built yet."
+                ),
+                contract_section="§3",
+            )
+        )
+
+    try:
+        # `as_of` is the window's END, matching D3a-2's fixed factor set: one
+        # point-in-time universe for the whole run, not one that drifts.
+        instrument_ids = resolve_universe(conn, manifest, end)
+    except _UnresolvedUniverse as unresolved:
+        return _refused(
+            Finding(code="MANIFEST_UNRESOLVABLE", message=str(unresolved), contract_section="§3")
+        )
+
+    plan = plan_backtest(conn, manifest, instrument_ids, start=start, end=end, limits=resolved)
+    if plan.findings:
+        # Refused on the estimate, before a single bar was materialised.
+        return _refused(*plan.findings, plan=plan)
+
+    window: dict[str, Any] = {
+        "start": plan.start.isoformat(),
+        "end": plan.end.isoformat(),
+        "sessions": plan.sessions,
+        "bars": "1d",
+        "interval_sec": interval_sec,
+        "instruments": {},
+    }
+    bars = (
+        fetch_bars(conn, instrument_ids, window, interval_sec=interval_sec)
+        if instrument_ids
+        else {}
+    )
+    if not bars:
+        return _refused(
+            Finding(
+                code="NO_DATA",
+                message=(
+                    f"the manifest's universe resolved to {len(instrument_ids)} instrument(s) "
+                    f"and no daily bars exist between {start.isoformat()} and {end.isoformat()}."
+                ),
+                contract_section="§3",
+            ),
+            plan=plan,
+        )
+
+    try:
+        broker, exchange, asset_class = _charge_key(conn, instrument_ids)
+    except _MixedUniverse as mixed:
+        return _refused(
+            Finding(code="MANIFEST_UNRESOLVABLE", message=str(mixed), contract_section="§3"),
+            plan=plan,
+        )
+
+    schedules = load_schedules(conn, broker, exchange, asset_class, Product.DELIVERY, end)
+    payload = SmokePayload(
+        mode=MODE_SMOKE,
+        source=record.source,
+        contract_version=CONTRACT_VERSION,
+        window=window,
+        bars=bars,
+        charge_schedules=tuple(schedules),
+        starting_cash=Decimal(str(manifest.get("capital", "0"))),
+        slippage_bps=Decimal("0"),
+        # Warm-up bars were fetched above; dispatch still begins where the
+        # caller asked.
+        dispatch_from=plan.dispatch_from,
+    )
+    # Once, not twice: determinism was proved at upload by stage 2's
+    # double run, and re-proving it here would double the cost of every
+    # backtest to re-answer a settled question about the same source.
+    result = run_smoke_in_sandbox(payload, resolved)
+    outcome = _outcome_of(result)
+    return BacktestVerdict(
+        passed=bool(outcome.get("ok")),
+        report=ValidationReport(findings=()),
+        plan=plan,
+        bars="1d",
+        outcome=outcome,
+        runtime=result.runtime,
+        kernel_isolated=result.kernel_isolated,
     )

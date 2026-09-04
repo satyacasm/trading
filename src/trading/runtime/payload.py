@@ -48,6 +48,10 @@ class SmokePayload:
     charge_schedules: tuple[ChargeSchedule, ...] = ()
     starting_cash: Decimal = Decimal("0")
     slippage_bps: Decimal = Decimal("0")
+    # Where the run begins dispatching. Bars before it are warm-up: history
+    # the strategy can read, not events it experiences. None dispatches
+    # everything, which is what every smoke run does.
+    dispatch_from: datetime | None = None
 
 
 def _money(value: Decimal | None) -> str | None:
@@ -127,6 +131,9 @@ def encode_payload(payload: SmokePayload) -> bytes:
         ],
         "starting_cash": str(payload.starting_cash),
         "slippage_bps": str(payload.slippage_bps),
+        "dispatch_from": (
+            None if payload.dispatch_from is None else payload.dispatch_from.isoformat()
+        ),
     }
     return gzip.compress(json.dumps(document, separators=(",", ":")).encode("utf-8"))
 
@@ -153,4 +160,9 @@ def decode_payload(raw: bytes) -> SmokePayload:
         ),
         starting_cash=Decimal(document.get("starting_cash", "0")),
         slippage_bps=Decimal(document.get("slippage_bps", "0")),
+        dispatch_from=(
+            datetime.fromisoformat(document["dispatch_from"])
+            if document.get("dispatch_from")
+            else None
+        ),
     )

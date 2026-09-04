@@ -835,3 +835,52 @@ def test_the_contract_route_is_not_swallowed_by_the_strategy_id_route(client) ->
     response = client.get("/strategies/contract")
     assert response.status_code == 200
     assert "contract" in response.json()
+
+
+def test_the_repeated_run_warning_appears_on_the_fourth_identical_window(
+    db_conn,  # noqa: ANN001
+    local_user_id,  # noqa: ANN001
+) -> None:
+    """§6's overfitting guardrail: "a gentle warning when a user re-runs the
+    same strategy many times on identical data".
+
+    Three is ordinary iteration; a fourth suggests tuning against one
+    period, which is how a backtest becomes a curve fit.
+    """
+    from datetime import date
+
+    from tests.agent_contract.test_backtest_persistence import _POINTS, _verdict
+    from trading.agent_contract.persistence import identical_run_count, record_backtest_run
+    from trading.agent_contract.registry import register_strategy
+
+    registered = register_strategy(
+        db_conn,
+        user_id=local_user_id,
+        name="repeat-fixture",
+        version="1.0.0",
+        source=VALID_SOURCE,
+    )
+    start, end = date(2024, 1, 8), date(2024, 1, 10)
+    assert identical_run_count(db_conn, registered.strategy_id, start, end) == 0
+
+    for expected in (1, 2, 3):
+        record_backtest_run(
+            db_conn,
+            registered.strategy_id,
+            _verdict(_POINTS),
+            requested_start=start,
+            requested_end=end,
+            instrument_ids=[58607],
+        )
+        assert identical_run_count(db_conn, registered.strategy_id, start, end) == expected
+
+    # A different window is a different experiment and does not count.
+    record_backtest_run(
+        db_conn,
+        registered.strategy_id,
+        _verdict(_POINTS),
+        requested_start=start,
+        requested_end=date(2024, 2, 10),
+        instrument_ids=[58607],
+    )
+    assert identical_run_count(db_conn, registered.strategy_id, start, end) == 3

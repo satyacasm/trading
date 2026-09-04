@@ -33,7 +33,12 @@ from psycopg import Connection
 
 from trading.agent_contract.registry import CONTRACT_VERSION
 
-__all__ = ["get_backtest_run", "list_backtest_runs", "record_backtest_run"]
+__all__ = [
+    "get_backtest_run",
+    "identical_run_count",
+    "list_backtest_runs",
+    "record_backtest_run",
+]
 
 _INSERT_RUN = """
     INSERT INTO backtest_runs (
@@ -41,14 +46,14 @@ _INSERT_RUN = """
         dispatch_from, sessions, instruments, history_bars_requested,
         history_bars_available, bars, bar_calls, orders_placed, fills,
         final_cash, final_equity, breaker_reason, error, findings,
-        runtime, kernel_isolated, contract_version
+        runtime, kernel_isolated, contract_version, stress
     ) VALUES (
         %(strategy_id)s, %(status)s, %(requested_start)s, %(requested_end)s,
         %(fetch_start)s, %(dispatch_from)s, %(sessions)s, %(instruments)s,
         %(history_bars_requested)s, %(history_bars_available)s, %(bars)s,
         %(bar_calls)s, %(orders_placed)s, %(fills)s, %(final_cash)s,
         %(final_equity)s, %(breaker_reason)s, %(error)s, %(findings)s,
-        %(runtime)s, %(kernel_isolated)s, %(contract_version)s
+        %(runtime)s, %(kernel_isolated)s, %(contract_version)s, %(stress)s
     ) RETURNING backtest_run_id
 """
 
@@ -152,6 +157,9 @@ def record_backtest_run(
             "runtime": verdict.runtime or "",
             "kernel_isolated": bool(verdict.kernel_isolated),
             "contract_version": CONTRACT_VERSION,
+            "stress": None
+            if getattr(verdict, "stress", None) is None
+            else json.dumps(verdict.stress),
         },
     ).fetchone()
     assert row is not None  # noqa: S101 - RETURNING always yields a row
@@ -189,7 +197,7 @@ _RUN_COLUMNS = """
     fetch_start, dispatch_from, sessions, instruments, history_bars_requested,
     history_bars_available, bars, bar_calls, orders_placed, fills,
     final_cash, final_equity, breaker_reason, error, findings,
-    runtime, kernel_isolated, contract_version, ran_at
+    runtime, kernel_isolated, contract_version, ran_at, stress
 """
 
 _SELECT_RUNS = f"""
@@ -239,6 +247,7 @@ def _run_to_dict(row: tuple[Any, ...]) -> dict[str, Any]:
         "kernel_isolated": row[21],
         "contract_version": row[22],
         "ran_at": row[23].isoformat(),
+        "stress": row[24],
     }
 
 
@@ -279,3 +288,20 @@ def get_backtest_run(conn: Connection, backtest_run_id: int) -> dict[str, Any]:
         for ts, equity, cash in conn.execute(_SELECT_POINTS, (backtest_run_id,)).fetchall()
     ]
     return run
+
+
+_COUNT_IDENTICAL_RUNS = """
+    SELECT count(*) FROM backtest_runs
+    WHERE strategy_id = %s AND requested_start = %s AND requested_end = %s
+"""
+
+
+def identical_run_count(conn: Connection, strategy_id: int, start: date, end: date) -> int:
+    """How many times this exact window has been run for this strategy.
+
+    §6 asks for "a gentle warning when a user re-runs the same strategy many
+    times on identical data". Now that runs are stored, the overfitting
+    guardrail is a COUNT rather than a feature.
+    """
+    row = conn.execute(_COUNT_IDENTICAL_RUNS, (strategy_id, start, end)).fetchone()
+    return 0 if row is None else int(row[0])

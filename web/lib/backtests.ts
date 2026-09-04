@@ -4,6 +4,7 @@ import type {
   CostDrag,
   EquityPoint,
   MaxDrawdown,
+  Stress,
 } from "./api";
 
 /**
@@ -173,4 +174,29 @@ export function describeCostDrag(drag: CostDrag): string {
 export function backtestBlockedReason(bars: string | null): string | null {
   if (bars === null || bars === "1d") return null;
   return `This strategy declares ${bars} bars. Backtests run on daily bars only: a multi-year intraday run is millions of bars and the sandbox receives them as one payload. Re-upload it with bars="1d" under a new version to backtest it.`;
+}
+
+
+/**
+ * What the 2x cost-and-slippage rerun says about the edge.
+ *
+ * §228's argument in one line: "if the edge dies at 2x, it was never an
+ * edge." The comparison is against the base run's final equity, so the
+ * sentence names both numbers rather than asking the reader to hold one.
+ */
+export function describeStress(stress: Stress, baseFinalEquity: string | null): string {
+  if (!stress.ok) {
+    return `at ${stress.multiplier}x costs the run did not complete${
+      stress.error ? `: ${stress.error}` : ""
+    }`;
+  }
+  const base = Number(baseFinalEquity);
+  const stressed = Number(stress.final_equity);
+  if (!Number.isFinite(base) || !Number.isFinite(stressed)) {
+    return `at ${stress.multiplier}x costs it ended at ${stress.final_equity}`;
+  }
+  const survived = stressed > base ? "gained" : "gave up";
+  return `at ${stress.multiplier}x costs it ${survived} ${formatMoney(
+    String(stressed - base),
+  )}, ending at ${formatMoney(stress.final_equity ?? "0")}`;
 }

@@ -1,30 +1,72 @@
 # Where this project stands
 
-**Updated:** 2026-09-04, ~17:15 IST. Keep this file current — it is the
+**Updated:** 2026-09-04, ~17:40 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
 
 ## The one thing to do next
 
-**Phase 3f — walk-forward and the robustness suite.** Everything it needs
-now exists: 3d's metrics, 3c's stored curves, and the fill ledger. Three
-pieces, per implementation-plan.md §228:
+**Walk-forward analysis**, the last piece of §228/§6 and the last thing
+standing between Phase 3 and complete. It was held out of 3f deliberately:
+its splitting policy is a design in itself — anchored or rolling folds, how
+many, what in-sample/out-of-sample ratio — plus N container runs per
+backtest and a report shape for comparing folds. Decide the policy first.
 
-- **A 2x slippage-and-cost stress rerun** on every backtest. "If the edge
-  dies at 2x, it was never an edge." The ledger makes the cost half of
-  that measurable for the first time.
-- **A Monte Carlo trade-order reshuffle**, producing a *distribution* of
-  max drawdowns and terminal equities rather than one lucky path, with the
-  5th-percentile outcome shown as prominently as the mean. `round_trips`
-  is the input.
-- **Walk-forward analysis** (§6).
+After that, the **post-tax P&L lens** (§8): STCG/LTCG holding periods,
+F&O business-income framing, and the crypto 30% + 1% TDS regime with no
+loss offset. The fill ledger is the input it was waiting on.
 
-The **post-tax P&L lens** (§8) is the other open item and is deliberately
-its own design: STCG/LTCG holding periods, F&O business-income framing,
-and the crypto 30% + 1% TDS regime with no loss offset. Four regimes and a
-holding-period engine, and the fill ledger is now the input it was waiting
-on.
+---
+
+## Phase 3f — the robustness suite, shipped 2026-09-04 (merged)
+
+§228's two checks, automatic on every backtest. Spec at
+`docs/superpowers/specs/2026-09-04-robustness-design.md`.
+
+**The rule this sub-project made explicit, and which 3c and 3d had already
+been following:** anything that required running the world is **stored**;
+anything that is arithmetic over what was stored is **computed**.
+
+- The **2x cost-and-slippage rerun** is an observation — doubling slippage
+  changes which fills happen — so it is executed and stored in
+  `backtest_runs.stress` (migration `0014`). It needs **no runtime
+  change**: the `ChargeSchedule`s are scaled host-side and the container
+  runs unmodified code against a harsher world. `rate` and `cap` scale
+  together, because a capped charge whose rate doubled alone would sit at
+  its cap and exempt exactly the charges that dominate a large order.
+- The **Monte Carlo reshuffle** is a pure function of the fill ledger and is
+  computed on read, so improving it applies retroactively to every stored
+  run. Seeded, 1,000 iterations.
+- §6's overfitting guardrail is now a `COUNT`: `identical_run_count` over
+  `(strategy_id, requested_start, requested_end)`.
+
+**What it found on the real churn run (backtest 5):**
+
+```
+2x stress:  919,559.14 -> 843,788.14     doubling costs took another 75,771
+reshuffle:  terminal equity p5 = p50 = p95 = 919,561.05   (identical, by design)
+            max drawdown   p5 -10.62%   p50 -9.06%   p95 -8.15%
+            actual         -8.24%
+```
+
+**The realised drawdown was lucky.** −8.24% sits nearer the *best* 5% than
+the median, with a bad tail at −10.62% — the base report understates this
+strategy's risk by roughly a fifth, purely through the order the trades
+arrived in. That is the claim §228 wants visible and a single path cannot
+make.
+
+Terminal equity being identical across all 1,000 orderings is the built-in
+correctness check: addition is commutative, so if those percentiles ever
+diverged the accumulation would be wrong.
+
+**Worth not relearning:** mutation caught a **vacuous determinism test** —
+the second vacuous guard in one day. With six P&L values there are only 720
+orderings and 1,000 samples saturates them, so the percentiles converged
+identically whatever the seed and the test passed with seeding removed.
+Widened to thirty values, where sampling actually matters. Same shape as
+3c's `float` money guard: a property that holds anyway, mistaken for one
+the code enforces.
 
 ---
 

@@ -8,6 +8,7 @@ import {
   UNDEFINED_METRIC,
   describeDrawdown,
   describeCostDrag,
+  describeStress,
   describeHurdleRate,
   describeRunWindow,
   formatPercent,
@@ -219,6 +220,47 @@ export default function BacktestReportPage() {
             instrument, and a position still open at the end is counted neither way. Win and
             loss are measured after charges.
           </p>
+        </section>
+      ) : null}
+
+      {run.stress || run.reshuffle ? (
+        <section className="border-line flex flex-col gap-4 border-t pt-6">
+          <h2 className="font-display text-lg">How fragile is this</h2>
+          {run.stress ? (
+            <p className="text-muted text-sm">
+              {describeStress(run.stress, run.final_equity)}. If the edge dies at{" "}
+              {run.stress.multiplier}x, it was never an edge.
+            </p>
+          ) : null}
+          {run.reshuffle ? (
+            <>
+              <div className="grid grid-cols-3 gap-6">
+                {/* The 5th is not smaller or greyer than the 50th: §228 asks
+                    for the bad tail shown as prominently as the middle,
+                    because the middle is the one that flatters. */}
+                <Stat
+                  label="Worst 5% drawdown"
+                  value={formatPercent(run.reshuffle.max_drawdown.p5)}
+                  tone="down"
+                />
+                <Stat
+                  label="Median drawdown"
+                  value={formatPercent(run.reshuffle.max_drawdown.p50)}
+                />
+                <Stat
+                  label="Best 5% drawdown"
+                  value={formatPercent(run.reshuffle.max_drawdown.p95)}
+                />
+              </div>
+              <p className="text-muted text-xs">
+                Across {run.reshuffle.iterations.toLocaleString("en-IN")} reshuffles of the
+                trade order. Terminal equity is identical in every ordering — addition does
+                not care about sequence — so this spread is about the path, not the outcome.
+                Reshuffling also removes serial correlation, so a strategy whose losses
+                genuinely cluster will look better here than it was.
+              </p>
+            </>
+          ) : null}
         </section>
       ) : null}
 

@@ -4,6 +4,7 @@ import {
   backtestBlockedReason,
   describeCostDrag,
   describeDrawdown,
+  describeStress,
   describeHurdle,
   describeHurdleRate,
   describeRunWindow,
@@ -12,7 +13,13 @@ import {
   lostToTheHurdle,
   riskFreeCurve,
 } from "./backtests";
-import type { BacktestMetrics, BacktestSummary, CostDrag, MaxDrawdown } from "./api";
+import type {
+  BacktestMetrics,
+  BacktestSummary,
+  CostDrag,
+  MaxDrawdown,
+  Stress,
+} from "./api";
 
 function drawdown(overrides: Partial<MaxDrawdown> = {}): MaxDrawdown {
   return {
@@ -231,5 +238,36 @@ describe("backtestBlockedReason", () => {
     // not a known problem, so the backend decides rather than the page
     // refusing something that might work.
     expect(backtestBlockedReason(null)).toBe(null);
+  });
+});
+
+
+describe("describeStress", () => {
+  function stress(overrides: Partial<Stress> = {}): Stress {
+    return {
+      multiplier: "2",
+      ok: true,
+      fills: 659,
+      final_equity: "850000.0000",
+      breaker_reason: null,
+      error: null,
+      ...overrides,
+    };
+  }
+
+  it("names what doubling the costs took, against the base result", () => {
+    // Indian grouping: 8,50,000.00, not 850,000.00. `formatMoney` uses
+    // en-IN deliberately -- lakhs and crores are how this audience reads
+    // money, and the earlier cost-drag figures simply never crossed a lakh
+    // boundary so the difference had not shown up before.
+    expect(describeStress(stress(), "919559.1400")).toBe(
+      "at 2x costs it gave up 69,559.14, ending at 8,50,000.00",
+    );
+  });
+
+  it("says plainly when the stressed run did not complete", () => {
+    expect(describeStress(stress({ ok: false, error: "[SMOKE_OOM] killed" }), "1")).toContain(
+      "did not complete",
+    );
   });
 });

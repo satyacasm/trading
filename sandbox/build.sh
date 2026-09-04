@@ -13,10 +13,13 @@
 # container quietly runs last week's code. Rebuild both, always.
 set -euo pipefail
 rm -rf sandbox/trading
-mkdir -p sandbox/trading/paper sandbox/trading/runtime sandbox/trading/agent_contract
+mkdir -p sandbox/trading/paper sandbox/trading/runtime sandbox/trading/agent_contract sandbox/trading/live
 touch sandbox/trading/__init__.py sandbox/trading/agent_contract/__init__.py
 cp src/trading/paper/{__init__,enums,models,fills,charges,breaker}.py sandbox/trading/paper/
 cp src/trading/runtime/*.py sandbox/trading/runtime/
+# The live wire protocol: the runner's live mode speaks it, and it must
+# be the same file the supervisor speaks so the two cannot drift.
+cp src/trading/live/{__init__,protocol}.py sandbox/trading/live/
 # The SDK ships at its real package path, not as a second top-level copy.
 cp src/trading/agent_contract/platform_sdk.py sandbox/trading/agent_contract/
 

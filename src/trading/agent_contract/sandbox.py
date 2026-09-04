@@ -247,7 +247,10 @@ def _run_payload(raw: bytes, limits: SandboxLimits) -> SandboxResult:
     try:
         completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
             _docker_args(limits, name),
-            input=raw,
+            # Length-prefixed so the runner can read exactly the payload
+            # and leave the stream open for whatever follows it -- bar
+            # frames, in a live run.
+            input=b"%d\n" % len(raw) + raw,
             capture_output=True,
             text=False,
             timeout=limits.timeout_seconds,

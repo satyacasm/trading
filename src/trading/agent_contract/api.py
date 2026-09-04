@@ -52,6 +52,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from psycopg import Connection
+from psycopg.errors import UniqueViolation
 from pydantic import BaseModel, Field
 
 from trading.agent_contract.persistence import (
@@ -59,7 +60,7 @@ from trading.agent_contract.persistence import (
     list_backtest_runs,
     record_backtest_run,
 )
-from trading.agent_contract.registry import CONTRACT_VERSION, register_strategy
+from trading.agent_contract.registry import CONTRACT_VERSION, get_strategy, register_strategy
 from trading.agent_contract.smoke import (
     BacktestVerdict,
     SmokeVerdict,
@@ -543,6 +544,127 @@ def get_backtest(
     run["notes"] = [] if note is None else [note]
 
     return BacktestDetail(**run)
+
+
+class LiveRunRequest(BaseModel):
+    """Which portfolio the strategy trades. One strategy, one portfolio."""
+
+    portfolio_id: int
+
+
+class LiveRunOut(BaseModel):
+    live_run_id: int
+    strategy_id: int
+    portfolio_id: int
+    status: str
+    stopped_reason: str | None
+    runtime: str | None
+    kernel_isolated: bool | None
+    bars_seen: int
+    orders_placed: int
+    started_at: str
+    stopped_at: str | None
+
+
+_LIVE_RUN_COLUMNS = (
+    "live_run_id, strategy_id, portfolio_id, status, stopped_reason, runtime,"
+    " kernel_isolated, bars_seen, orders_placed, started_at, stopped_at"
+)
+
+
+def _live_run_out(row: tuple[Any, ...]) -> LiveRunOut:
+    return LiveRunOut(
+        live_run_id=row[0],
+        strategy_id=row[1],
+        portfolio_id=row[2],
+        status=row[3],
+        stopped_reason=row[4],
+        runtime=row[5],
+        kernel_isolated=row[6],
+        bars_seen=row[7],
+        orders_placed=row[8],
+        started_at=row[9].isoformat(),
+        stopped_at=None if row[10] is None else row[10].isoformat(),
+    )
+
+
+@router.post("/strategies/{strategy_id}/live", response_model=LiveRunOut)
+def start_live_run(
+    strategy_id: int,
+    request: LiveRunRequest,
+    conn: Annotated[Connection, Depends(get_db_connection)],
+) -> LiveRunOut:
+    """Ask the supervisor to run this strategy forward.
+
+    Writes the intent and returns; the supervisor reconciles against this
+    table and launches the container. Deliberately not a synchronous start:
+    the gateway does not own the supervisor's process table, and a route
+    that waited for a container would fail differently depending on which
+    machine it ran on.
+
+    A partial unique index enforces one live run per portfolio, so a second
+    start against a busy portfolio is refused by the database rather than
+    by a check that could race.
+    """
+    try:
+        get_strategy(conn, strategy_id)
+    except KeyError:
+        raise HTTPException(
+            status_code=404, detail=f"no strategy with strategy_id={strategy_id}"
+        ) from None
+    try:
+        row = conn.execute(
+            f"INSERT INTO live_runs (strategy_id, portfolio_id, status)"
+            f" VALUES (%s,%s,'RUNNING') RETURNING {_LIVE_RUN_COLUMNS}",
+            (strategy_id, request.portfolio_id),
+        ).fetchone()
+    except UniqueViolation:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"portfolio {request.portfolio_id} already has a live run; "
+                "one strategy per portfolio at a time"
+            ),
+        ) from None
+    assert row is not None
+    return _live_run_out(row)
+
+
+@router.post("/live/{live_run_id}/stop", response_model=LiveRunOut)
+def stop_live_run(
+    live_run_id: int,
+    conn: Annotated[Connection, Depends(get_db_connection)],
+) -> LiveRunOut:
+    """Ask the supervisor to stop a run.
+
+    Marks it stopped; the supervisor sees the row is no longer RUNNING and
+    shuts the container down. Stopping an already-stopped run is not an
+    error -- it is the state the caller asked for.
+    """
+    row = conn.execute(
+        f"UPDATE live_runs SET status='STOPPED',"
+        f" stopped_reason=coalesce(stopped_reason,'stopped by the operator'),"
+        f" stopped_at=coalesce(stopped_at, now())"
+        f" WHERE live_run_id=%s RETURNING {_LIVE_RUN_COLUMNS}",
+        (live_run_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"no live run with live_run_id={live_run_id}")
+    return _live_run_out(row)
+
+
+@router.get("/live", response_model=list[LiveRunOut])
+def list_live_runs(
+    conn: Annotated[Connection, Depends(get_db_connection)],
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[LiveRunOut]:
+    """Every live run, newest first. A GET that never writes."""
+    rows = conn.execute(
+        f"SELECT {_LIVE_RUN_COLUMNS} FROM live_runs"
+        f" ORDER BY started_at DESC, live_run_id DESC LIMIT %s",
+        (limit,),
+    ).fetchall()
+    return [_live_run_out(row) for row in rows]
 
 
 class ContractBundle(BaseModel):

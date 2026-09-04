@@ -235,6 +235,52 @@ def write_upstox_bar(
     )
 
 
+_CLOSED_BAR_CHANNEL = "closed_bars"
+
+
+async def _publish_closed_bar(
+    redis: Redis, closed: ClosedBar, interval_seconds: int, source: DataSource
+) -> None:
+    """Announce a bar that just closed.
+
+    A separate channel from `bars:*`, which carries Upstox's already-complete
+    I1 bars straight off the feed. These are the aggregator's own output, and
+    conflating the two would make a subscriber unable to tell a bar that was
+    received from one that was computed -- a distinction that matters when
+    the two disagree.
+
+    Money as strings, like everywhere it crosses a process boundary. A
+    publish failure is logged and swallowed: a subscriber being absent or
+    Redis being briefly unavailable must not cost the bar its place in the
+    database, which is the durable record.
+    """
+    import json
+
+    try:
+        await redis.publish(
+            f"{_CLOSED_BAR_CHANNEL}:{closed.instrument_id}",
+            json.dumps(
+                {
+                    "instrument_id": closed.instrument_id,
+                    "ts": closed.bucket.isoformat(),
+                    "interval_sec": interval_seconds,
+                    "open": str(closed.bar.open),
+                    "high": str(closed.bar.high),
+                    "low": str(closed.bar.low),
+                    "close": str(closed.bar.close),
+                    "volume": None if closed.bar.volume is None else str(closed.bar.volume),
+                    "source": source.value,
+                }
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - the database write is the durable record
+        log.warning(
+            "bar_aggregator.publish_failed",
+            instrument_id=closed.instrument_id,
+            reason=str(exc),
+        )
+
+
 async def run_aggregation_loop(
     redis: Redis,
     conn: Connection,
@@ -300,7 +346,7 @@ async def run_aggregation_loop(
     written = 0
     done = asyncio.Event()
 
-    def _write_all(closed_bars: list[ClosedBar]) -> None:
+    async def _write_all(closed_bars: list[ClosedBar]) -> None:
         nonlocal written
         for closed in closed_bars:
             if closed.bucket < first_complete_bucket:
@@ -325,6 +371,13 @@ async def run_aggregation_loop(
                     reason=str(exc),
                 )
                 continue
+            # A closed bar is an event, and until now only this process knew
+            # one had happened -- it went to the database and was announced
+            # to nobody. The live supervisor needs to be told, and polling a
+            # hypertable for rows that may not exist is the worse half of
+            # that choice. Published after the write, so a subscriber that
+            # reacts by querying finds the row already there.
+            await _publish_closed_bar(redis, closed, interval_seconds, source)
             written += 1
         if max_bars_written is not None and written >= max_bars_written:
             done.set()
@@ -358,7 +411,7 @@ async def run_aggregation_loop(
                 continue
             if tick.instrument_id in excluded_instrument_ids:
                 continue
-            _write_all(aggregator.ingest(tick))
+            await _write_all(aggregator.ingest(tick))
             if done.is_set():
                 return
 
@@ -376,7 +429,7 @@ async def run_aggregation_loop(
     async def _periodic_flush() -> None:
         while not done.is_set():
             await sleep(flush_check_seconds)
-            _write_all(aggregator.flush_stale(datetime.now(UTC)))
+            await _write_all(aggregator.flush_stale(datetime.now(UTC)))
 
     pubsub = redis.pubsub()
     await pubsub.psubscribe(pattern)

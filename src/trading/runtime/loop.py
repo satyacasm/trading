@@ -52,7 +52,8 @@ stops -- no further bar is dispatched, no further fill occurs.
 from __future__ import annotations
 
 import traceback
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Protocol
@@ -195,7 +196,30 @@ def _cancel_resting_orders(state: RunState) -> None:
             state.orders[order_id] = order.model_copy(update={"status": OrderStatus.CANCELLED})
 
 
-def run_loop(
+@dataclass(frozen=True)
+class Session:
+    """One run in progress, driven a bar at a time.
+
+    The backtester drives `step` in a tight loop over recorded bars; the
+    live supervisor drives the same `step` once per closed bar. §166
+    claims backtest and forward behaviour are "bit-identical by
+    construction" -- this object is that construction. A second loop
+    written for live would drift, and the drift would stay invisible
+    until a strategy behaved differently in production than in its
+    backtest.
+
+    `outcome` is callable at any point: a live run's outcome is a
+    snapshot, not a conclusion.
+    """
+
+    state: RunState
+    ctx: LiveContext
+    step: Callable[[datetime, Sequence[tuple[BarRecord, int]]], bool]
+    initialize: Callable[[datetime], None]
+    outcome: Callable[..., RunOutcome]
+
+
+def open_session(
     strategy: _StrategyLike,
     bars: InMemoryBars,
     schedules: Sequence[ChargeSchedule],
@@ -204,7 +228,7 @@ def run_loop(
     max_daily_loss: Decimal | None = None,
     max_drawdown_pct: Decimal | None = None,
     dispatch_from: datetime | None = None,
-) -> RunOutcome:
+) -> Session:
     state = RunState(
         now=None,  # type: ignore[arg-type]  # set before any handler runs
         cash=starting_cash,
@@ -448,6 +472,61 @@ def run_loop(
             return False
         return True
 
+    def outcome(crash: _Crash | None = None) -> RunOutcome:
+        """The run as it stands, callable mid-run."""
+        return RunOutcome(
+            ok=crash is None,
+            bar_calls=state.bar_calls,
+            orders=_snapshots(state),
+            fills=fills,
+            rejections=tuple(rejections),
+            final_cash=str(state.cash.quantize(_MONEY_SCALE)),
+            final_equity=str(ctx.portfolio.equity.quantize(_MONEY_SCALE)),
+            breaker_reason=state.breaker_reason,
+            logs=tuple(state.logs),
+            error=None if crash is None else crash.detail,
+            crashed_at=(
+                None
+                if crash is None
+                else {"handler": crash.handler, "ts": crash.ts, "bar_calls": state.bar_calls}
+            ),
+            equity_curve=tuple(state.equity_curve),
+            fill_ledger=tuple(state.fill_ledger),
+        )
+
+    def initialize(first_ts: datetime) -> None:
+        state.now = first_ts
+        _call(strategy, "initialize", state.now.isoformat(), ctx)
+
+    return Session(state=state, ctx=ctx, step=step, initialize=initialize, outcome=outcome)
+
+
+def run_loop(
+    strategy: _StrategyLike,
+    bars: InMemoryBars,
+    schedules: Sequence[ChargeSchedule],
+    starting_cash: Decimal,
+    slippage_bps: Decimal,
+    max_daily_loss: Decimal | None = None,
+    max_drawdown_pct: Decimal | None = None,
+    dispatch_from: datetime | None = None,
+) -> RunOutcome:
+    """Drive a whole recorded bar set to completion.
+
+    A thin driver over `open_session`, so the backtester and the live
+    supervisor share one dispatcher rather than two that agree by
+    discipline.
+    """
+    session = open_session(
+        strategy,
+        bars,
+        schedules,
+        starting_cash,
+        slippage_bps,
+        max_daily_loss=max_daily_loss,
+        max_drawdown_pct=max_drawdown_pct,
+        dispatch_from=dispatch_from,
+    )
     try:
         # The first timestamp the strategy will actually experience. With
         # warm-up in play that is not the first bar in the payload: the
@@ -464,8 +543,7 @@ def run_loop(
         )
         if first_dispatched is None:
             raise _Crash("initialize", "", "no bars were provided to the run")
-        state.now = first_dispatched
-        _call(strategy, "initialize", state.now.isoformat(), ctx)
+        session.initialize(first_dispatched)
 
         for close_ts, indexed in bars.indexed_groups():
             # One dispatcher, driven at two speeds. The live supervisor
@@ -473,35 +551,8 @@ def run_loop(
             # written for live would drift, and the drift would be
             # invisible until a strategy behaved differently in
             # production than in its backtest.
-            if not step(close_ts, indexed):
+            if not session.step(close_ts, indexed):
                 break
     except _Crash as crash:
-        return RunOutcome(
-            ok=False,
-            bar_calls=state.bar_calls,
-            orders=_snapshots(state),
-            fills=fills,
-            rejections=tuple(rejections),
-            final_cash=str(state.cash.quantize(_MONEY_SCALE)),
-            final_equity=str(ctx.portfolio.equity.quantize(_MONEY_SCALE)),
-            breaker_reason=state.breaker_reason,
-            logs=tuple(state.logs),
-            error=crash.detail,
-            crashed_at={"handler": crash.handler, "ts": crash.ts, "bar_calls": state.bar_calls},
-            equity_curve=tuple(state.equity_curve),
-            fill_ledger=tuple(state.fill_ledger),
-        )
-
-    return RunOutcome(
-        ok=True,
-        bar_calls=state.bar_calls,
-        orders=_snapshots(state),
-        fills=fills,
-        rejections=tuple(rejections),
-        final_cash=str(state.cash.quantize(_MONEY_SCALE)),
-        final_equity=str(ctx.portfolio.equity.quantize(_MONEY_SCALE)),
-        breaker_reason=state.breaker_reason,
-        logs=tuple(state.logs),
-        equity_curve=tuple(state.equity_curve),
-        fill_ledger=tuple(state.fill_ledger),
-    )
+        return session.outcome(crash)
+    return session.outcome()

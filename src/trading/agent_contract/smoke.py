@@ -86,6 +86,11 @@ class SmokeVerdict:
     runtime: str
     kernel_isolated: bool
     notes: tuple[str, ...] = ()
+    # The limits the caller chose, if any. `None` means the strategy's own
+    # were used -- a distinction worth keeping, since one is a decision
+    # about this run and the other is not.
+    max_daily_loss: Decimal | None = None
+    max_drawdown_pct: Decimal | None = None
     # The manifest's declared capital, and the currency it is denominated
     # in. Optional because a verdict can exist without one -- a crash
     # before configure() resolved, or a caller that did not supply it --
@@ -1209,6 +1214,11 @@ class BacktestVerdict:
     # should know about, not a refusal. Separate from `findings`, which
     # mean the run did not happen.
     notes: tuple[str, ...] = ()
+    # The limits the caller chose, if any. `None` means the strategy's
+    # own were used -- a distinction worth keeping, since one is a
+    # decision about this run and the other is not.
+    max_daily_loss: Decimal | None = None
+    max_drawdown_pct: Decimal | None = None
 
 
 def _refused(*findings: Finding, plan: BacktestPlan | None = None) -> BacktestVerdict:
@@ -1229,6 +1239,8 @@ def backtest(
     end: date,
     limits: SandboxLimits | None = None,
     starting_cash: Decimal | None = None,
+    max_daily_loss: Decimal | None = None,
+    max_drawdown_pct: Decimal | None = None,
 ) -> BacktestVerdict:
     """Run a registered strategy over an operator-chosen window.
 
@@ -1362,6 +1374,8 @@ def backtest(
         # Warm-up bars were fetched above; dispatch still begins where the
         # caller asked.
         dispatch_from=plan.dispatch_from,
+        max_daily_loss=max_daily_loss,
+        max_drawdown_pct=max_drawdown_pct,
     )
     # Once, not twice: determinism was proved at upload by stage 2's
     # double run, and re-proving it here would double the cost of every
@@ -1385,6 +1399,10 @@ def backtest(
                 starting_cash=payload.starting_cash,
                 slippage_bps=payload.slippage_bps * STRESS_MULTIPLIER,
                 dispatch_from=plan.dispatch_from,
+                # The stress run must be constrained identically, or it is
+                # measuring two changes at once.
+                max_daily_loss=max_daily_loss,
+                max_drawdown_pct=max_drawdown_pct,
             ),
             resolved,
         )
@@ -1424,4 +1442,6 @@ def backtest(
         instrument_ids=tuple(instrument_ids),
         stress=stress,
         notes=() if charge_note is None else (charge_note,),
+        max_daily_loss=max_daily_loss,
+        max_drawdown_pct=max_drawdown_pct,
     )

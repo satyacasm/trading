@@ -466,6 +466,9 @@ export type BacktestSummary = {
   kernel_isolated: boolean;
   contract_version: string;
   ran_at: string;
+  /** Limits chosen for this run; null means the strategy's own applied. */
+  max_daily_loss: string | null;
+  max_drawdown_pct: string | null;
 };
 
 export type Percentiles = { p5: string; p50: string; p95: string };
@@ -537,7 +540,13 @@ export async function fetchBacktest(
 
 export async function runBacktest(
   strategyId: number,
-  body: { start: string; end: string; starting_cash?: string },
+  body: {
+    start: string;
+    end: string;
+    starting_cash?: string;
+    max_daily_loss?: string;
+    max_drawdown_pct?: string;
+  },
 ): Promise<BacktestRunResult> {
   const res = await fetch(`${API_URL}/strategies/${strategyId}/backtests`, {
     method: "POST",

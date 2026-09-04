@@ -219,8 +219,21 @@ def main() -> int:
             schedules=payload.charge_schedules,
             starting_cash=payload.starting_cash,
             slippage_bps=payload.slippage_bps,
-            max_daily_loss=getattr(manifest, "max_daily_loss", None),
-            max_drawdown_pct=getattr(manifest, "max_drawdown_pct", None),
+            # The caller's limits when given, else whatever the strategy
+            # declared. An operator asking "what would this have done with a
+            # wider stop?" is asking a different question from the one the
+            # manifest answers, and editing the strategy to ask it would
+            # create a version whose results are attributed separately.
+            max_daily_loss=(
+                payload.max_daily_loss
+                if payload.max_daily_loss is not None
+                else getattr(manifest, "max_daily_loss", None)
+            ),
+            max_drawdown_pct=(
+                payload.max_drawdown_pct
+                if payload.max_drawdown_pct is not None
+                else getattr(manifest, "max_drawdown_pct", None)
+            ),
             # None for a smoke run, which dispatches every bar it is given.
             dispatch_from=payload.dispatch_from,
         )

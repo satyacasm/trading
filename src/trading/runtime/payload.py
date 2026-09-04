@@ -52,6 +52,11 @@ class SmokePayload:
     # the strategy can read, not events it experiences. None dispatches
     # everything, which is what every smoke run does.
     dispatch_from: datetime | None = None
+    # Risk limits chosen by the caller, overriding whatever the manifest
+    # declared. `None` means "use the manifest's" -- NOT "no limit", and
+    # certainly not zero, which would halt on the first loss.
+    max_daily_loss: Decimal | None = None
+    max_drawdown_pct: Decimal | None = None
 
 
 def _money(value: Decimal | None) -> str | None:
@@ -134,6 +139,8 @@ def encode_payload(payload: SmokePayload) -> bytes:
         "dispatch_from": (
             None if payload.dispatch_from is None else payload.dispatch_from.isoformat()
         ),
+        "max_daily_loss": _money(payload.max_daily_loss),
+        "max_drawdown_pct": _money(payload.max_drawdown_pct),
     }
     return gzip.compress(json.dumps(document, separators=(",", ":")).encode("utf-8"))
 
@@ -164,5 +171,13 @@ def decode_payload(raw: bytes) -> SmokePayload:
             datetime.fromisoformat(document["dispatch_from"])
             if document.get("dispatch_from")
             else None
+        ),
+        max_daily_loss=(
+            None if document.get("max_daily_loss") is None else Decimal(document["max_daily_loss"])
+        ),
+        max_drawdown_pct=(
+            None
+            if document.get("max_drawdown_pct") is None
+            else Decimal(document["max_drawdown_pct"])
         ),
     )

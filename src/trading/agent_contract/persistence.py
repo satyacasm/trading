@@ -46,14 +46,16 @@ _INSERT_RUN = """
         dispatch_from, sessions, instruments, history_bars_requested,
         history_bars_available, bars, bar_calls, orders_placed, fills,
         final_cash, final_equity, breaker_reason, error, findings,
-        runtime, kernel_isolated, contract_version, stress
+        runtime, kernel_isolated, contract_version, stress,
+        max_daily_loss, max_drawdown_pct
     ) VALUES (
         %(strategy_id)s, %(status)s, %(requested_start)s, %(requested_end)s,
         %(fetch_start)s, %(dispatch_from)s, %(sessions)s, %(instruments)s,
         %(history_bars_requested)s, %(history_bars_available)s, %(bars)s,
         %(bar_calls)s, %(orders_placed)s, %(fills)s, %(final_cash)s,
         %(final_equity)s, %(breaker_reason)s, %(error)s, %(findings)s,
-        %(runtime)s, %(kernel_isolated)s, %(contract_version)s, %(stress)s
+        %(runtime)s, %(kernel_isolated)s, %(contract_version)s, %(stress)s,
+        %(max_daily_loss)s, %(max_drawdown_pct)s
     ) RETURNING backtest_run_id
 """
 
@@ -161,6 +163,8 @@ def record_backtest_run(
             "stress": None
             if getattr(verdict, "stress", None) is None
             else json.dumps(verdict.stress),
+            "max_daily_loss": getattr(verdict, "max_daily_loss", None),
+            "max_drawdown_pct": getattr(verdict, "max_drawdown_pct", None),
         },
     ).fetchone()
     assert row is not None  # noqa: S101 - RETURNING always yields a row
@@ -198,7 +202,8 @@ _RUN_COLUMNS = """
     fetch_start, dispatch_from, sessions, instruments, history_bars_requested,
     history_bars_available, bars, bar_calls, orders_placed, fills,
     final_cash, final_equity, breaker_reason, error, findings,
-    runtime, kernel_isolated, contract_version, ran_at, stress
+    runtime, kernel_isolated, contract_version, ran_at, stress,
+    max_daily_loss, max_drawdown_pct
 """
 
 _SELECT_RUNS = f"""
@@ -249,6 +254,8 @@ def _run_to_dict(row: tuple[Any, ...]) -> dict[str, Any]:
         "contract_version": row[22],
         "ran_at": row[23].isoformat(),
         "stress": row[24],
+        "max_daily_loss": None if row[25] is None else str(row[25]),
+        "max_drawdown_pct": None if row[26] is None else str(row[26]),
     }
 
 

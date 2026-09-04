@@ -171,7 +171,17 @@ export default function BacktestReportPage() {
             {run.kernel_isolated ? " · kernel isolated" : ""}
           </span>
         </div>
-        <p className="text-muted text-sm">{describeRunWindow(run)}</p>
+        <p className="text-muted text-sm">
+          {describeRunWindow(run)}
+          {run.max_daily_loss || run.max_drawdown_pct
+            ? ` · limits for this run: ${[
+                run.max_daily_loss ? `max daily loss ${run.max_daily_loss}` : null,
+                run.max_drawdown_pct ? `max drawdown ${run.max_drawdown_pct}%` : null,
+              ]
+                .filter(Boolean)
+                .join(", ")}`
+            : ""}
+        </p>
       </header>
 
       {halt ? (

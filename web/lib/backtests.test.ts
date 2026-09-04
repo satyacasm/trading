@@ -82,6 +82,8 @@ function run(overrides: Partial<BacktestSummary> = {}): BacktestSummary {
     kernel_isolated: true,
     contract_version: "0.1",
     ran_at: "2026-09-04T06:34:59+00:00",
+    max_daily_loss: null,
+    max_drawdown_pct: null,
     ...overrides,
   };
 }

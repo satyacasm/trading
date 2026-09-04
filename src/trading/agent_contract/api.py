@@ -53,6 +53,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from psycopg import Connection
 from pydantic import BaseModel, Field
 
+from trading.agent_contract.persistence import record_backtest_run
 from trading.agent_contract.registry import CONTRACT_VERSION, register_strategy
 from trading.agent_contract.smoke import (
     BacktestVerdict,
@@ -275,6 +276,9 @@ class BacktestResponse(BaseModel):
 
     strategy_id: int
     status: str
+    # None when the run was refused before it reached the container: a
+    # refusal is not a run and is deliberately not stored.
+    backtest_run_id: int | None = None
     bars: str | None = None
     window_start: str | None = None
     window_end: str | None = None
@@ -293,12 +297,15 @@ class BacktestResponse(BaseModel):
     kernel_isolated: bool | None = None
 
 
-def _backtest_response(strategy_id: int, verdict: BacktestVerdict) -> BacktestResponse:
+def _backtest_response(
+    strategy_id: int, verdict: BacktestVerdict, run_id: int | None = None
+) -> BacktestResponse:
     outcome = verdict.outcome or {}
     plan = verdict.plan
     return BacktestResponse(
         strategy_id=strategy_id,
         status="PASSED" if verdict.passed else "REFUSED",
+        backtest_run_id=run_id,
         bars=verdict.bars,
         window_start=plan.start.isoformat() if plan else None,
         window_end=plan.end.isoformat() if plan else None,
@@ -340,7 +347,24 @@ def run_backtest(
         raise HTTPException(
             status_code=404, detail=f"no strategy with strategy_id={strategy_id}"
         ) from None
-    return _backtest_response(strategy_id, verdict)
+
+    run_id: int | None = None
+    if verdict.plan is not None and verdict.outcome is not None:
+        # It reached the container, so it is a run: PASSED or FAILED, both
+        # stored, a crash with its partial curve. A pre-flight refusal has
+        # no outcome and is deliberately not recorded -- it is a
+        # deterministic function of the request, costs a COUNT to
+        # re-derive, and a row would imply to a later reader that a run
+        # happened.
+        run_id = record_backtest_run(
+            conn,
+            strategy_id,
+            verdict,
+            requested_start=request.start,
+            requested_end=request.end,
+            instrument_ids=verdict.instrument_ids,
+        )
+    return _backtest_response(strategy_id, verdict, run_id)
 
 
 class ContractBundle(BaseModel):

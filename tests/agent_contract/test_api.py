@@ -589,3 +589,73 @@ def test_the_backtest_route_is_not_a_coroutine() -> None:
     from trading.agent_contract.api import run_backtest
 
     assert not inspect.iscoroutinefunction(run_backtest)
+
+
+def _registered_with_daily_bars(db_conn, local_user_id, *, symbol, last_day):  # noqa: ANN001, ANN201
+    """A strategy registered WITH a manifest, over an instrument whose daily
+    bars stop at `last_day` of 2024-01.
+
+    The manifest matters: registered without one, `backtest` falls back to
+    recovering it by running `configure()` in a container and refuses on
+    MANIFEST_UNRESOLVABLE long before any gate -- so a test asserting only
+    that a refusal happened would pass without the path under test running.
+    """
+    from datetime import UTC, datetime
+
+    from trading.agent_contract.registry import register_strategy
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM',%s,'INR','ACTIVE',%s) "
+        "RETURNING instrument_id",
+        (symbol, f"NSE:CM:{symbol}"),
+    ).fetchone()
+    instrument_id = row[0]
+    for day in range(2, last_day + 1):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, datetime(2024, 1, day, 10, 0, tzinfo=UTC)),
+        )
+    registered = register_strategy(
+        db_conn,
+        user_id=local_user_id,
+        name=f"persist-{symbol.lower()}",
+        version="1.0.0",
+        source=VALID_SOURCE,
+        manifest={
+            "name": f"persist-{symbol.lower()}",
+            "version": "1.0.0",
+            "capital": "100000",
+            "base_currency": "INR",
+            "universe": [{"exchange": "NSE", "segment": "CM", "symbol": symbol}],
+            "data": {"bars": "1d", "history_bars": 0},
+        },
+    )
+    return registered.strategy_id
+
+
+def test_a_refused_backtest_stores_no_run(client, db_conn, local_user_id) -> None:  # noqa: ANN001
+    """Assert zero rows, not a status field.
+
+    A gate that refuses and writes anyway would pass an assertion on the
+    response alone, and the row would then claim a run happened -- which is
+    exactly what "only executed runs are stored" exists to prevent.
+    """
+    strategy_id = _registered_with_daily_bars(
+        db_conn, local_user_id, symbol="PERSISTREFUSE", last_day=4
+    )
+    before = db_conn.execute("SELECT count(*) FROM backtest_runs").fetchone()[0]
+
+    response = client.post(
+        f"/strategies/{strategy_id}/backtests",
+        json={"start": "2024-01-02", "end": "2026-12-31"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "REFUSED"
+    assert "BACKTEST_WINDOW_UNCOVERED" in [f["code"] for f in body["findings"]]
+    assert body["backtest_run_id"] is None
+    after = db_conn.execute("SELECT count(*) FROM backtest_runs").fetchone()[0]
+    assert after == before

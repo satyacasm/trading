@@ -1121,6 +1121,11 @@ class BacktestVerdict:
     outcome: dict[str, Any] | None
     runtime: str | None = None
     kernel_isolated: bool = False
+    # The universe as resolved point-in-time at the window's end. Carried on
+    # the verdict so the store records what was actually traded rather than
+    # re-resolving it later against a different `as_of` and getting a
+    # different answer.
+    instrument_ids: tuple[int, ...] = ()
 
 
 def _refused(*findings: Finding, plan: BacktestPlan | None = None) -> BacktestVerdict:
@@ -1295,4 +1300,5 @@ def backtest(
         outcome=outcome,
         runtime=result.runtime,
         kernel_isolated=result.kernel_isolated,
+        instrument_ids=tuple(instrument_ids),
     )

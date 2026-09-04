@@ -14,6 +14,7 @@ import {
   type UploadStrategyResult,
 } from "@/lib/api";
 import {
+  BACKTEST_BARS,
   SERVED_BARS,
   UNSERVED_BARS,
   dailyClockCaveat,
@@ -430,9 +431,20 @@ export default function StrategiesPage() {
             limit. The contract permits all five; this platform serves two.
           */}
           <p className="text-muted text-xs max-w-prose">
-            <span className="text-text">{SERVED_BARS.join(" and ")}</span> bars are served.{" "}
+            <span className="text-text">{SERVED_BARS.join(" and ")}</span> bars are served for the
+            smoke run above.{" "}
             <span className="num">{UNSERVED_BARS.join(", ")}</span> are contract-legal but rejected
             — the platform has no bar aggregation for them yet.
+          </p>
+          {/* Said here because the two rules genuinely differ and reading
+              only the first one made them look contradictory: "1m is served"
+              on this page, then BACKTEST_INTERVAL_UNSUPPORTED on the
+              strategy page, with nothing connecting them. */}
+          <p className="text-muted text-xs max-w-prose">
+            <span className="text-text">Backtests are {BACKTEST_BARS.join(" and ")} only.</span> A
+            smoke run is five sessions; a multi-year intraday backtest is hundreds of thousands of
+            bars and does not fit one payload. Declare{" "}
+            <span className="num">&quot;1d&quot;</span> if you want to backtest.
           </p>
 
           <div className="flex items-center gap-4">

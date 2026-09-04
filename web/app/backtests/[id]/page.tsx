@@ -7,6 +7,7 @@ import { fetchBacktest, type BacktestDetail } from "@/lib/api";
 import {
   UNDEFINED_METRIC,
   describeDrawdown,
+  describeBreakerHalt,
   describeCostDrag,
   describeStress,
   describeHurdleRate,
@@ -16,19 +17,39 @@ import {
   lostToTheHurdle,
   riskFreeCurve,
 } from "@/lib/backtests";
+import { MetricHelp } from "@/components/MetricHelp";
 import { MonthlyReturns } from "@/components/MonthlyReturns";
-import { SeriesChart, type Line } from "@/components/SeriesChart";
+import { SeriesChart, type Line, type Marker } from "@/components/SeriesChart";
 
 const UP = "#26a69a";
 const DOWN = "#ef5350";
 const MUTED = "#7a8794";
 const LIVE = "#4da3ff";
 
-function Stat({ label, value, tone }: { label: string; value: string; tone?: "up" | "down" }) {
+// Beyond this the arrows overlap into noise; the caption says so.
+const MAX_MARKERS = 120;
+
+// The table scrolls, but rendering thousands of rows stalls the page.
+const MAX_TRADE_ROWS = 500;
+
+function Stat({
+  label,
+  value,
+  tone,
+  help,
+}: {
+  label: string;
+  value: string;
+  tone?: "up" | "down";
+  help?: string;
+}) {
   const color = tone === "up" ? "text-up" : tone === "down" ? "text-down" : "text-text";
   return (
     <div className="flex flex-col gap-1">
-      <span className="text-muted text-xs tracking-wide uppercase">{label}</span>
+      <span className="text-muted flex items-center text-xs tracking-wide uppercase">
+        {label}
+        {help ? <MetricHelp metric={help} /> : null}
+      </span>
       <span className={`num text-lg ${color}`}>{value}</span>
     </div>
   );
@@ -70,6 +91,18 @@ export default function BacktestReportPage() {
     ];
   }, [run, metrics]);
 
+  const tradeMarkers = useMemo<Marker[]>(() => {
+    if (!run) return [];
+    // Capped: a 659-fill run would put an arrow on nearly every bar and the
+    // chart would be unreadable. The cap is stated in the caption rather
+    // than silently applied.
+    return run.fills_ledger.slice(0, MAX_MARKERS).map((fill) => ({
+      ts: fill.ts,
+      side: fill.side === "BUY" ? ("BUY" as const) : ("SELL" as const),
+      text: `${fill.side} ${Number(fill.quantity)} @ ${Number(fill.price).toLocaleString("en-IN")}`,
+    }));
+  }, [run]);
+
   const underwater = useMemo<Line[]>(() => {
     if (!metrics) return [];
     return [
@@ -80,6 +113,7 @@ export default function BacktestReportPage() {
         })),
         color: DOWN,
         area: true,
+        title: "drawdown",
       },
     ];
   }, [metrics]);
@@ -93,6 +127,7 @@ export default function BacktestReportPage() {
           value: Number(point.sharpe),
         })),
         color: LIVE,
+        title: "rolling Sharpe",
       },
     ];
   }, [metrics]);
@@ -117,6 +152,7 @@ export default function BacktestReportPage() {
   }
 
   const drawdownLine = describeDrawdown(metrics?.max_drawdown ?? null);
+  const halt = describeBreakerHalt(run.breaker_reason, run.bar_calls, run.sessions);
   const behind = metrics ? lostToTheHurdle(metrics) : false;
 
   return (
@@ -137,6 +173,24 @@ export default function BacktestReportPage() {
         </div>
         <p className="text-muted text-sm">{describeRunWindow(run)}</p>
       </header>
+
+      {halt ? (
+        <section className="border-down/50 bg-raised rounded border-l-2 px-4 py-3">
+          <h2 className="text-down text-sm">This run stopped early</h2>
+          <p className="text-muted mt-1 text-xs leading-relaxed">{halt}</p>
+        </section>
+      ) : null}
+
+      {(run.notes ?? []).length > 0 ? (
+        <section className="border-line bg-raised rounded border-l-2 px-4 py-3">
+          <h2 className="text-muted text-sm">Worth knowing</h2>
+          {(run.notes ?? []).map((note, index) => (
+            <p key={index} className="text-muted mt-1 text-xs leading-relaxed">
+              {note}
+            </p>
+          ))}
+        </section>
+      ) : null}
 
       {run.error ? (
         <section className="border-line bg-surface rounded border p-4">
@@ -165,21 +219,30 @@ export default function BacktestReportPage() {
             : "This strategy cleared the risk-free rate."}{" "}
           Total return {formatPercent(metrics?.total_return)}.
         </p>
-        {hurdleLines.length > 0 ? <SeriesChart lines={hurdleLines} height={320} /> : null}
+        {hurdleLines.length > 0 ? (
+          <SeriesChart lines={hurdleLines} markers={tradeMarkers} height={320} />
+        ) : null}
         <p className="text-muted text-xs">
           Equity against the same capital compounded at the risk-free rate. The gap between
           the lines is the result.
+          {run.fills_ledger.length > 0
+            ? ` Arrows mark trades${
+                run.fills_ledger.length > MAX_MARKERS
+                  ? ` — the first ${MAX_MARKERS} of ${run.fills_ledger.length}, beyond which they overlap into noise`
+                  : ""
+              }.`
+            : ""}
         </p>
       </section>
 
       <section className="border-line grid grid-cols-2 gap-6 border-t pt-6 sm:grid-cols-4">
-        <Stat label="Sharpe" value={formatRatio(metrics?.sharpe)} tone={behind ? "down" : "up"} />
-        <Stat label="Sortino" value={formatRatio(metrics?.sortino)} />
-        <Stat label="Calmar" value={formatRatio(metrics?.calmar)} />
-        <Stat label="Volatility" value={formatPercent(metrics?.volatility)} />
-        <Stat label="VaR 95" value={formatPercent(metrics?.value_at_risk_95)} />
+        <Stat label="Sharpe" help="sharpe" value={formatRatio(metrics?.sharpe)} tone={behind ? "down" : "up"} />
+        <Stat label="Sortino" help="sortino" value={formatRatio(metrics?.sortino)} />
+        <Stat label="Calmar" help="calmar" value={formatRatio(metrics?.calmar)} />
+        <Stat label="Volatility" help="volatility" value={formatPercent(metrics?.volatility)} />
+        <Stat label="VaR 95" help="value_at_risk_95" value={formatPercent(metrics?.value_at_risk_95)} />
         <Stat
-          label="Worst day"
+          label="Worst day" help="worst_period"
           value={metrics?.worst_period ? formatPercent(metrics.worst_period.return) : UNDEFINED_METRIC}
         />
         <Stat label="Fills" value={String(run.fills)} />
@@ -189,7 +252,10 @@ export default function BacktestReportPage() {
       {drawdownLine ? (
         <section className="border-line flex flex-col gap-3 border-t pt-6">
           <div className="flex flex-wrap items-baseline gap-x-3">
-            <h2 className="font-display text-lg">Drawdown</h2>
+            <h2 className="font-display flex items-center text-lg">
+              Drawdown
+              <MetricHelp metric="max_drawdown" />
+            </h2>
             <span className="num text-muted text-sm">{drawdownLine}</span>
           </div>
           {underwater.length > 0 ? (
@@ -201,7 +267,10 @@ export default function BacktestReportPage() {
       {metrics?.cost_drag && metrics.trades ? (
         <section className="border-line flex flex-col gap-4 border-t pt-6">
           <div className="flex flex-wrap items-baseline gap-x-3">
-            <h2 className="font-display text-lg">What it cost</h2>
+            <h2 className="font-display flex items-center text-lg">
+              What it cost
+              <MetricHelp metric="cost_drag" />
+            </h2>
             {/* The tested sentence, not a re-typing of it. */}
             <span className="text-muted text-sm">{describeCostDrag(metrics.cost_drag)}</span>
           </div>
@@ -210,8 +279,8 @@ export default function BacktestReportPage() {
             <Stat label="Charges" value={metrics.cost_drag.total_charges} tone="down" />
             <Stat label="Net P&L" value={metrics.cost_drag.net_pnl} />
             <Stat label="Trades" value={String(metrics.trades.trades)} />
-            <Stat label="Win rate" value={formatPercent(metrics.trades.win_rate)} />
-            <Stat label="Profit factor" value={formatRatio(metrics.trades.profit_factor)} />
+            <Stat label="Win rate" help="win_rate" value={formatPercent(metrics.trades.win_rate)} />
+            <Stat label="Profit factor" help="profit_factor" value={formatRatio(metrics.trades.profit_factor)} />
             <Stat label="Average win" value={metrics.trades.average_win ?? UNDEFINED_METRIC} />
             <Stat label="Average loss" value={metrics.trades.average_loss ?? UNDEFINED_METRIC} />
           </div>
@@ -225,7 +294,10 @@ export default function BacktestReportPage() {
 
       {run.stress || run.reshuffle ? (
         <section className="border-line flex flex-col gap-4 border-t pt-6">
-          <h2 className="font-display text-lg">How fragile is this</h2>
+          <h2 className="font-display flex items-center text-lg">
+            How fragile is this
+            <MetricHelp metric="reshuffle" />
+          </h2>
           {run.stress ? (
             <p className="text-muted text-sm">
               {describeStress(run.stress, run.final_equity)}. If the edge dies at{" "}
@@ -261,6 +333,55 @@ export default function BacktestReportPage() {
               </p>
             </>
           ) : null}
+        </section>
+      ) : null}
+
+      {run.fills_ledger.length > 0 ? (
+        <section className="border-line flex flex-col gap-3 border-t pt-6">
+          <div className="flex flex-wrap items-baseline gap-x-3">
+            <h2 className="font-display text-lg">Every trade</h2>
+            <span className="text-muted text-sm">
+              {run.fills_ledger.length.toLocaleString("en-IN")} fills
+              {run.fills_ledger.length > MAX_TRADE_ROWS
+                ? `, showing the first ${MAX_TRADE_ROWS}`
+                : ""}
+            </span>
+          </div>
+          <div className="max-h-96 overflow-auto">
+            <table className="w-full text-xs">
+              <thead className="bg-surface sticky top-0">
+                <tr className="text-muted text-left uppercase">
+                  <th className="px-2 py-2 font-normal">When</th>
+                  <th className="px-2 py-2 font-normal">Side</th>
+                  <th className="px-2 py-2 text-right font-normal">Qty</th>
+                  <th className="px-2 py-2 text-right font-normal">Price</th>
+                  <th className="px-2 py-2 text-right font-normal">Charges</th>
+                  <th className="px-2 py-2 font-normal">Why</th>
+                </tr>
+              </thead>
+              <tbody>
+                {run.fills_ledger.slice(0, MAX_TRADE_ROWS).map((fill) => (
+                  <tr key={fill.ordinal} className="border-line/50 border-t">
+                    <td className="num text-muted px-2 py-1.5">{fill.ts.slice(0, 10)}</td>
+                    <td
+                      className={`px-2 py-1.5 ${fill.side === "BUY" ? "text-up" : "text-down"}`}
+                    >
+                      {fill.side}
+                    </td>
+                    <td className="num px-2 py-1.5 text-right">{Number(fill.quantity)}</td>
+                    <td className="num px-2 py-1.5 text-right">{fill.price}</td>
+                    <td className="num text-muted px-2 py-1.5 text-right">
+                      {fill.total_charges}
+                    </td>
+                    {/* The strategy's own words. The contract requires a
+                        rationale on every order and this is the only place
+                        a reader ever sees one. */}
+                    <td className="text-muted px-2 py-1.5">{fill.rationale ?? "--"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </section>
       ) : null}
 

@@ -24,6 +24,7 @@ export default function StrategyPage() {
 
   const [start, setStart] = useState("2020-01-01");
   const [end, setEnd] = useState("2026-08-21");
+  const [capital, setCapital] = useState("");
   const [running, setRunning] = useState(false);
   const [refusal, setRefusal] = useState<StrategyFinding[]>([]);
 
@@ -42,7 +43,13 @@ export default function StrategyPage() {
     setRefusal([]);
     setError(null);
     try {
-      const result = await runBacktest(strategyId, { start, end });
+      const result = await runBacktest(strategyId, {
+        start,
+        end,
+        // Blank means "use what the strategy declared" -- an empty field is
+        // not a request for zero capital.
+        ...(capital.trim() === "" ? {} : { starting_cash: capital.trim() }),
+      });
       if (result.backtest_run_id !== null) {
         router.push(`/backtests/${result.backtest_run_id}`);
         return;
@@ -85,7 +92,8 @@ export default function StrategyPage() {
         ) : (
           <p className="text-muted text-xs">
             Daily bars only. Data runs to 2026-08-21; a window past that is refused rather
-            than run on nothing.
+            than run on nothing. Leave starting equity blank to use what the strategy
+            declared.
           </p>
         )}
         <form onSubmit={onRun} className="flex flex-wrap items-end gap-3">
@@ -105,6 +113,17 @@ export default function StrategyPage() {
               value={end}
               onChange={(e) => setEnd(e.target.value)}
               className="border-line bg-raised num rounded border px-2 py-1 text-sm"
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-muted text-xs tracking-wide uppercase">Starting equity</span>
+            <input
+              type="text"
+              inputMode="decimal"
+              value={capital}
+              placeholder="as declared"
+              onChange={(e) => setCapital(e.target.value)}
+              className="border-line bg-raised num w-36 rounded border px-2 py-1 text-sm"
             />
           </label>
           <button

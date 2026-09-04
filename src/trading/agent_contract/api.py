@@ -64,6 +64,8 @@ from trading.agent_contract.smoke import (
     BacktestVerdict,
     SmokeVerdict,
     backtest,
+    charge_lookup_date,
+    earliest_schedule_date,
     record_smoke_run,
     smoke_test,
 )
@@ -71,6 +73,7 @@ from trading.agent_contract.validation import Finding, ValidationReport, validat
 from trading.metrics.curve import summarize
 from trading.metrics.robustness import reshuffle
 from trading.metrics.trades import cost_drag, round_trips, trade_metrics
+from trading.paper.enums import Product
 from trading.streaming.db import get_db_connection
 
 router = APIRouter()
@@ -272,6 +275,11 @@ class BacktestRequest(BaseModel):
 
     start: date
     end: date
+    # An operator asking "what would this have done with 50,000?" is asking
+    # a different question from the one the manifest answers. Overriding it
+    # here rather than editing the strategy keeps that from creating a new
+    # version whose results are attributed separately.
+    starting_cash: Decimal | None = None
 
 
 class BacktestResponse(BaseModel):
@@ -304,6 +312,10 @@ class BacktestResponse(BaseModel):
     # this nor the curve, for the same reason.
     fills_ledger: list[dict[str, Any]] = []
     findings: list[FindingOut] = []
+    # Approximations worth knowing about -- a charge schedule that does
+    # not reach back to the window's start, say. Not refusals: the run
+    # happened, and the reader should know what was assumed.
+    notes: list[str] = []
     runtime: str | None = None
     kernel_isolated: bool | None = None
 
@@ -331,6 +343,7 @@ def _backtest_response(
         breaker_reason=outcome.get("breaker_reason"),
         equity_curve=list(outcome.get("equity_curve") or []),
         findings=_findings_of(verdict.report),
+        notes=list(getattr(verdict, "notes", ())),
         runtime=verdict.runtime,
         kernel_isolated=verdict.kernel_isolated,
     )
@@ -353,7 +366,13 @@ def run_backtest(
     Plain `def`: psycopg is synchronous, and this shells out to Docker.
     """
     try:
-        verdict = backtest(conn, strategy_id, start=request.start, end=request.end)
+        verdict = backtest(
+            conn,
+            strategy_id,
+            start=request.start,
+            end=request.end,
+            starting_cash=request.starting_cash,
+        )
     except KeyError:
         raise HTTPException(
             status_code=404, detail=f"no strategy with strategy_id={strategy_id}"
@@ -425,6 +444,11 @@ class BacktestDetail(BacktestSummary):
     # and recomputing means a corrected metric applies retroactively to
     # every run rather than only to runs computed after the fix.
     metrics: dict[str, Any] | None = None
+    # Approximations worth knowing about. Recomputed on read rather than
+    # stored: the charge-schedule note is a pure function of the window's
+    # end and the earliest schedule date, so storing it would be a second
+    # source of truth that could drift from the schedules themselves.
+    notes: list[str] = []
     # The 2x cost-and-slippage rerun, as executed and stored. An
     # observation: doubling slippage changes which fills happen, so it
     # cannot be re-derived from this run's output.
@@ -497,6 +521,16 @@ def get_backtest(
             starting_equity=points[0][1],
         )
     run["metrics"] = metrics
+
+    # Same derivation the run itself used, so the page and the POST response
+    # cannot disagree about what was assumed.
+    from datetime import date as _date
+
+    requested_end = _date.fromisoformat(run["requested_end"])
+    earliest = earliest_schedule_date(conn, "UPSTOX", "NSE", "EQUITY", Product.DELIVERY)
+    _, note = charge_lookup_date(requested_end, earliest)
+    run["notes"] = [] if note is None else [note]
+
     return BacktestDetail(**run)
 
 

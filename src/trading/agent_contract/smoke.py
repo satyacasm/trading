@@ -1115,6 +1115,48 @@ def plan_backtest(
 # 2x, it was never an edge)."
 STRESS_MULTIPLIER = Decimal("2")
 
+_EARLIEST_SCHEDULE_SQL = """
+    SELECT min(effective_from) FROM charge_schedules
+    WHERE broker = %s AND exchange = %s AND asset_class = %s AND product = %s
+"""
+
+
+def earliest_schedule_date(
+    conn: Connection, broker: str, exchange: str, asset_class: str, product: Product
+) -> date | None:
+    """The first date any charge rule exists for this combination."""
+    row = conn.execute(
+        _EARLIEST_SCHEDULE_SQL, (broker, exchange, asset_class, product.value)
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def charge_lookup_date(window_end: date, earliest: date | None) -> tuple[date, str | None]:
+    """Which date to price this run's charges at, and what to say about it.
+
+    `load_schedules` filters `effective_from <= on`, so a window ending
+    before any schedule exists finds none and `compute_charges` refuses --
+    correctly, since a silently-zero cost is the one thing it must never
+    produce. But it refused *inside the container*, after two container
+    runs, for a condition answerable by one query beforehand.
+
+    It was also inconsistent. A 2020-2026 window already prices its 2020
+    fills at rates effective from 2024-10-01, because the lookup uses the
+    window's end; only the short window crashed. Clamping to the earliest
+    available schedule makes both cases work and makes the approximation
+    visible in both -- the alternative is a platform that silently
+    backdates rates on long windows and crashes on short ones.
+    """
+    if earliest is None or window_end >= earliest:
+        return window_end, None
+    return earliest, (
+        f"this window ends {window_end.isoformat()}, before any charge schedule exists "
+        f"({earliest.isoformat()} is the earliest). Charges are computed at the "
+        f"{earliest.isoformat()} rates, so costs for this period are approximate. "
+        "A window that ends after that date already prices its early fills the same "
+        "way -- the lookup uses the window's end."
+    )
+
 
 def stress_schedules(
     schedules: Sequence[ChargeSchedule], *, multiplier: Decimal = STRESS_MULTIPLIER
@@ -1163,6 +1205,10 @@ class BacktestVerdict:
     # doubling slippage changes which fills happen, so it cannot be
     # re-derived from the base run's output and has to be executed.
     stress: dict[str, Any] | None = None
+    # Warnings that do not make a run wrong -- an approximation the reader
+    # should know about, not a refusal. Separate from `findings`, which
+    # mean the run did not happen.
+    notes: tuple[str, ...] = ()
 
 
 def _refused(*findings: Finding, plan: BacktestPlan | None = None) -> BacktestVerdict:
@@ -1182,6 +1228,7 @@ def backtest(
     start: date,
     end: date,
     limits: SandboxLimits | None = None,
+    starting_cash: Decimal | None = None,
 ) -> BacktestVerdict:
     """Run a registered strategy over an operator-chosen window.
 
@@ -1293,7 +1340,9 @@ def backtest(
             plan=plan,
         )
 
-    schedules = load_schedules(conn, broker, exchange, asset_class, Product.DELIVERY, end)
+    earliest = earliest_schedule_date(conn, broker, exchange, asset_class, Product.DELIVERY)
+    priced_on, charge_note = charge_lookup_date(end, earliest)
+    schedules = load_schedules(conn, broker, exchange, asset_class, Product.DELIVERY, priced_on)
     payload = SmokePayload(
         mode=MODE_SMOKE,
         source=record.source,
@@ -1301,7 +1350,14 @@ def backtest(
         window=window,
         bars=bars,
         charge_schedules=tuple(schedules),
-        starting_cash=Decimal(str(manifest.get("capital", "0"))),
+        # The caller's capital when given, else what the strategy declared.
+        # An operator asking "what would this have done with 50,000?" is
+        # asking a different question from the one the manifest answers, and
+        # editing the strategy to ask it would create a new version whose
+        # results are attributed separately.
+        starting_cash=(
+            Decimal(str(manifest.get("capital", "0"))) if starting_cash is None else starting_cash
+        ),
         slippage_bps=Decimal("0"),
         # Warm-up bars were fetched above; dispatch still begins where the
         # caller asked.
@@ -1367,4 +1423,5 @@ def backtest(
         kernel_isolated=result.kernel_isolated,
         instrument_ids=tuple(instrument_ids),
         stress=stress,
+        notes=() if charge_note is None else (charge_note,),
     )

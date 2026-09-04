@@ -546,8 +546,22 @@ def _session_close_utc(session_date: date, session_close: time) -> datetime:
     return datetime.combine(session_date, session_close, tzinfo=_IST).astimezone(UTC)
 
 
-def _is_session_closed(conn: Connection, exchange: str, segment: str, now: datetime) -> bool:
-    """Whether `exchange`/`segment`'s session, as of `now`, is over.
+def _is_session_closed(
+    conn: Connection,
+    exchange: str,
+    segment: str,
+    now: datetime,
+    session_date: date,
+) -> bool:
+    """Whether `exchange`/`segment`'s `session_date` session is over as of `now`.
+
+    `session_date` is the session the *order* belongs to, not the one
+    `now` falls in. Deriving it from `now` instead answers "is today's
+    session closed?", which is a different question and the wrong one:
+    a DAY order that outlived its own session close -- because nothing
+    swept it at the time, the engine having been down -- would then
+    survive every sweep until the *current* session closes, silently
+    behaving as GTC and staying fillable at a later session's prices.
 
     No `trading_calendar` row at all is treated as "not closed" -- an
     unknown calendar state must never be silently assumed to justify
@@ -555,7 +569,6 @@ def _is_session_closed(conn: Connection, exchange: str, segment: str, now: datet
     treating a missing row as closed-for-submission (the conservative
     direction differs because the actions differ: refusing a *new* order
     is safe to over-trigger, expiring an *existing* one is not)."""
-    session_date = now.astimezone(_IST).date()
     row = conn.execute(
         "SELECT is_trading_day, session_close FROM trading_calendar"
         " WHERE exchange = %s AND segment = %s AND session_date = %s",
@@ -585,10 +598,14 @@ def sweep_expired_day_orders(conn: Connection, book: OpenOrderBook, now: datetim
         asset_class, exchange, segment = book.instrument_meta[instrument_id]
         if asset_class == "CRYPTO":
             continue
-        if not _is_session_closed(conn, exchange, segment, now):
-            continue
         for order in list(book.open_orders.get(instrument_id, [])):
             if order.time_in_force is not TimeInForce.DAY:
+                continue
+            # Per order, not per instrument: two resting orders on the same
+            # instrument can belong to different sessions.
+            if not _is_session_closed(
+                conn, exchange, segment, now, order.submitted_at.astimezone(_IST).date()
+            ):
                 continue
             conn.execute(
                 "UPDATE orders SET status = %s, updated_at = now() WHERE order_id = %s",

@@ -74,6 +74,7 @@ _FILL_COLUMNS = (
     "dp_charges",
     "tds",
     "total_charges",
+    "rationale",
 )
 
 _INSERT_FILL = f"""
@@ -174,7 +175,7 @@ def record_backtest_run(
             cur.executemany(
                 _INSERT_FILL,
                 [
-                    (run_id, index, *(fill[column] for column in _FILL_COLUMNS))
+                    (run_id, index, *(fill.get(column) for column in _FILL_COLUMNS))
                     for index, fill in enumerate(ledger)
                 ],
             )

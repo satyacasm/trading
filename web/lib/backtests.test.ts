@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   UNDEFINED_METRIC,
   backtestBlockedReason,
+  METRIC_HELP,
+  describeBreakerHalt,
   describeCostDrag,
   describeDrawdown,
   describeStress,
@@ -269,5 +271,43 @@ describe("describeStress", () => {
     expect(describeStress(stress({ ok: false, error: "[SMOKE_OOM] killed" }), "1")).toContain(
       "did not complete",
     );
+  });
+});
+
+
+describe("describeBreakerHalt", () => {
+  it("explains a chart that ends mid-window", () => {
+    // The actual bug: "the graph only shows till 2021" for a run that had
+    // tripped max_daily_loss at bar 444 of 1,647 and stopped by design.
+    const said = describeBreakerHalt("max_daily_loss: loss of 27746.45 exceeds 20000", 444, 1647);
+    expect(said).toContain("444 of 1,647 sessions");
+    expect(said).toContain("circuit breaker");
+    expect(said).toContain("The chart ends where the run ended.");
+  });
+
+  it("says nothing when the run completed", () => {
+    expect(describeBreakerHalt(null, 1647, 1647)).toBe(null);
+  });
+
+  it("omits the session count when the run was not cut short", () => {
+    expect(describeBreakerHalt("max_drawdown: ...", 1647, 1647)).not.toContain("sessions");
+  });
+});
+
+describe("METRIC_HELP", () => {
+  it("gives every entry both a definition and a direction", () => {
+    // A number without a direction is trivia. Each entry must say what it
+    // measures AND how to read it.
+    for (const [key, help] of Object.entries(METRIC_HELP)) {
+      expect(help.what.length, key).toBeGreaterThan(20);
+      expect(help.good.length, key).toBeGreaterThan(20);
+    }
+  });
+
+  it("covers the metrics the report actually shows", () => {
+    for (const key of ["cagr", "sharpe", "sortino", "calmar", "volatility", "max_drawdown",
+      "win_rate", "profit_factor", "cost_drag", "reshuffle", "stress"]) {
+      expect(METRIC_HELP[key], key).toBeDefined();
+    }
   });
 });

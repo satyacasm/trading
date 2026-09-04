@@ -418,6 +418,8 @@ export type Fill = {
   dp_charges: string;
   tds: string;
   total_charges: string;
+  /** The strategy's own words for why it traded. */
+  rationale: string | null;
 };
 
 export type BacktestMetrics = {
@@ -484,6 +486,7 @@ export type Stress = {
 };
 
 export type BacktestDetail = BacktestSummary & {
+  notes?: string[];
   equity_curve: EquityPoint[];
   fills_ledger: Fill[];
   stress: Stress | null;
@@ -495,6 +498,7 @@ export type BacktestDetail = BacktestSummary & {
 export type BacktestRunResult = {
   strategy_id: number;
   status: string;
+  notes?: string[];
   backtest_run_id: number | null;
   bars: string | null;
   bar_calls: number | null;
@@ -533,7 +537,7 @@ export async function fetchBacktest(
 
 export async function runBacktest(
   strategyId: number,
-  body: { start: string; end: string },
+  body: { start: string; end: string; starting_cash?: string },
 ): Promise<BacktestRunResult> {
   const res = await fetch(`${API_URL}/strategies/${strategyId}/backtests`, {
     method: "POST",

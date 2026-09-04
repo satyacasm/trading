@@ -200,3 +200,96 @@ export function describeStress(stress: Stress, baseFinalEquity: string | null): 
     String(stressed - base),
   )}, ending at ${formatMoney(stress.final_equity ?? "0")}`;
 }
+
+
+/**
+ * Why a run stopped short, when it did.
+ *
+ * A backtest halted by its own circuit breaker produces a curve that ends
+ * mid-window, and a report that does not say so looks like a broken chart.
+ * That is exactly how it was read: "the graph only shows till 2021" for a
+ * run that had tripped `max_daily_loss` at bar 444 of 1,647 and stopped by
+ * design.
+ */
+export function describeBreakerHalt(
+  breakerReason: string | null,
+  barCalls: number | null,
+  sessions: number | null,
+): string | null {
+  if (!breakerReason) return null;
+  const where =
+    barCalls !== null && sessions !== null && barCalls < sessions
+      ? ` after ${barCalls.toLocaleString("en-IN")} of ${sessions.toLocaleString("en-IN")} sessions`
+      : "";
+  return `This run stopped${where} because the strategy's circuit breaker tripped: ${breakerReason}. The chart ends where the run ended.`;
+}
+
+/**
+ * What each metric means, and which direction is good.
+ *
+ * Written for someone who has not read a finance textbook, because that is
+ * who a personal research lab is for. Each entry says what it measures and
+ * how to read it -- a number without a direction is trivia.
+ */
+export const METRIC_HELP: Record<string, { what: string; good: string }> = {
+  cagr: {
+    what: "The rate of return per year, compounded, over the whole window.",
+    good: "Compare it to the risk-free rate shown beside it, not to zero. Beating zero is easy; beating a government bond is the bar.",
+  },
+  total_return: {
+    what: "How much the portfolio grew in total, start to finish.",
+    good: "Higher is better, but a big number over many years can still be a poor annual rate. CAGR is the fairer figure.",
+  },
+  sharpe: {
+    what: "Return above the risk-free rate, divided by how much the returns bounced around.",
+    good: "Above 1 is good, above 2 is excellent, below 0 means you did worse than a risk-free asset. Negative here is a real verdict, not a rounding error.",
+  },
+  sortino: {
+    what: "Like Sharpe, but it only counts downside moves as risk — upside volatility is not punished.",
+    good: "Higher is better. It is usually above Sharpe; if it is not, the losses are the volatile part.",
+  },
+  calmar: {
+    what: "Annual return divided by the worst peak-to-trough fall.",
+    good: "Above 1 means a year of returns exceeds the worst drawdown. Below 0 means the strategy lost money.",
+  },
+  volatility: {
+    what: "How much returns swing about, annualised.",
+    good: "Lower is calmer. On its own it is neither good nor bad — it only matters next to the return it bought.",
+  },
+  value_at_risk_95: {
+    what: "On the worst 1 day in 20, the return was at least this bad.",
+    good: "Closer to zero is calmer. It describes a normal bad day, not a crisis — the worst day is usually worse.",
+  },
+  worst_period: {
+    what: "The single worst day in the whole run.",
+    good: "Closer to zero is better. Compare it to VaR: a worst day far beyond VaR means fat tails.",
+  },
+  max_drawdown: {
+    what: "The deepest fall from a peak, and how long it lasted before recovering.",
+    good: "Shallower and shorter is better. 'Not recovered' means the strategy was still underwater when the run ended.",
+  },
+  win_rate: {
+    what: "The share of round-trip trades that made money after charges.",
+    good: "High is not automatically good: a strategy can win often and lose more on the rare losses. Read it with profit factor.",
+  },
+  profit_factor: {
+    what: "Money made on winners divided by money lost on losers.",
+    good: "Above 1 means the winners outweigh the losers. Below 1 means the strategy loses money however often it wins.",
+  },
+  expectancy: {
+    what: "The average profit or loss per trade, after charges.",
+    good: "Must be positive for the strategy to make money. Multiply by trade count to get the total.",
+  },
+  cost_drag: {
+    what: "How much of the gross result went to brokerage, taxes and fees.",
+    good: "Lower is better. Frequent trading makes this dominant — it is the difference between a strategy that works on paper and one that works.",
+  },
+  reshuffle: {
+    what: "The same trades in 1,000 different orders, showing how deep the drawdown could have been.",
+    good: "If the actual drawdown sits near the best 5%, the run was lucky in its ordering and the real risk is worse than reported.",
+  },
+  stress: {
+    what: "The same strategy re-run with double the costs and slippage.",
+    good: "If the result survives, the edge is real. If it dies at 2x, it was never an edge.",
+  },
+};

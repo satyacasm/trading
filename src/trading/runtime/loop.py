@@ -345,6 +345,12 @@ def run_loop(
                             "instrument_id": str(order.instrument_id),
                             "side": order.side.value,
                             "product": order.product.value,
+                            # The strategy's own words for why it traded.
+                            # The contract already requires a non-empty
+                            # rationale on every order; carrying it here is
+                            # what lets a chart marker say WHY, which is the
+                            # only part of a trade a chart cannot infer.
+                            "rationale": order.rationale,
                             # Quantized to the scales the columns that will
                             # store these declare -- quantity 8 dp, money
                             # 4 dp. `str(Decimal)` preserves whatever scale

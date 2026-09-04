@@ -1455,3 +1455,46 @@ def test_stressing_leaves_an_uncapped_schedule_uncapped() -> None:
     stressed = stress_schedules((flat,), multiplier=_Decimal("2"))
     assert stressed[0].rate == _Decimal("40.00")
     assert stressed[0].cap is None
+
+
+@pytest.mark.db
+def test_a_window_ending_before_any_charge_schedule_is_named_not_crashed(db_conn) -> None:  # noqa: ANN001
+    """Found by a real user run, three times.
+
+    NSE equity charge schedules begin 2024-10-01, and `load_schedules`
+    filters `effective_from <= on`. A backtest ending 2023-08-21 therefore
+    found no schedules and died inside the container with
+    `MissingChargeSchedule` -- a stack trace, after two container runs, for
+    a condition knowable from a single query before either.
+
+    Worse, it was inconsistent: a 2020-2026 window already applies
+    2024-10-01 rates to its 2020 fills, so refusing the short window while
+    silently approximating the long one made no sense. The fix clamps the
+    lookup to the earliest schedule and says so, which makes the
+    approximation visible in BOTH cases rather than only crashing in one.
+    """
+    from datetime import date
+
+    from trading.agent_contract.smoke import charge_lookup_date
+
+    earliest = date(2024, 10, 1)
+    # After the schedules exist: use the window's own end.
+    resolved, note = charge_lookup_date(date(2026, 8, 21), earliest)
+    assert resolved == date(2026, 8, 21)
+    assert note is None
+
+    # Before they exist: clamp, and say so rather than crashing.
+    resolved, note = charge_lookup_date(date(2023, 8, 21), earliest)
+    assert resolved == earliest
+    assert note is not None
+    assert "2024-10-01" in note
+    assert "2023-08-21" in note
+
+
+@pytest.mark.db
+def test_charge_lookup_needs_no_note_when_the_window_is_covered(db_conn) -> None:  # noqa: ANN001
+    from datetime import date
+
+    from trading.agent_contract.smoke import charge_lookup_date
+
+    assert charge_lookup_date(date(2025, 1, 1), date(2024, 10, 1))[1] is None

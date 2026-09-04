@@ -14,6 +14,15 @@ import type { RegisteredStrategy, RunSummary, StrategyWindow } from "@/lib/api";
  * upload finding out.
  */
 export const SERVED_BARS = ["1m", "1d"];
+/**
+ * Backtests are daily-only, while smoke runs also serve 1m.
+ *
+ * Stating only the first half is what made the two rules look like a
+ * contradiction: "1m is served" on the upload page, then
+ * BACKTEST_INTERVAL_UNSUPPORTED on the strategy page, with nothing
+ * connecting them.
+ */
+export const BACKTEST_BARS = ["1d"];
 export const UNSERVED_BARS = ["5m", "15m", "1h"];
 
 /**

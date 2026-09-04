@@ -787,3 +787,60 @@ def test_the_curve_carries_the_loop_clock_so_a_daily_run_is_dated_by_session() -
         slippage_bps=Decimal("0"),
     )
     assert [point["ts"] for point in outcome.equity_curve] == [ts.isoformat() for ts in closes]
+
+
+def test_warm_up_populates_history_without_dispatching_early() -> None:
+    """`DataRequest.history_bars` is declared in `platform_sdk.py`,
+    constrained in `schema.json`, documented in the contract -- and read by
+    no code. A strategy declaring `history_bars=200` and calling
+    `ctx.data.bars(id, count=200)` in its first `on_bar` got whatever
+    happened to exist, which for a run starting at the window's first bar is
+    nothing.
+
+    Warm-up does not mean dispatching `on_bar` early. It means the lookback
+    API is already populated when the first `on_bar` fires. Both halves are
+    asserted here because either one passing alone while the other breaks is
+    the failure mode: history without a moved start looks identical to a
+    correct run until you check `bar_calls`.
+    """
+    first = datetime(2026, 3, 2, 10, 0, tzinfo=UTC)
+    warm = [_daily_bar(1, first + timedelta(days=i), "100") for i in range(10)]
+    live = [_daily_bar(1, first + timedelta(days=10 + i), "101") for i in range(3)]
+
+    class RecordsFirstDispatch:
+        def __init__(self) -> None:
+            self.first_ts: datetime | None = None
+            self.history_len: int | None = None
+
+        def on_bar(self, ctx, bars) -> None:  # noqa: ANN001, ARG002
+            if self.first_ts is None:
+                self.first_ts = ctx.now
+                self.history_len = len(ctx.data.bars(1, count=50))
+
+    strategy = RecordsFirstDispatch()
+    outcome = run_loop(
+        strategy=strategy,
+        bars=InMemoryBars({1: tuple(warm + live)}),
+        schedules=(),
+        starting_cash=Decimal("100000"),
+        slippage_bps=Decimal("0"),
+        dispatch_from=live[0].close_ts,
+    )
+
+    assert outcome.ok, outcome.error
+    # Dispatch began at the requested start, not 10 bars earlier.
+    assert strategy.first_ts == live[0].close_ts
+    assert outcome.bar_calls == 3
+    # ...and the warm-up bars were already closed history at that first call.
+    assert strategy.history_len == 10
+    # The curve describes the dispatched run only -- warm-up is not the
+    # experiment, and equity before the run started is not a data point.
+    assert len(outcome.equity_curve) == 3
+
+
+def test_without_dispatch_from_every_bar_is_dispatched_as_before() -> None:
+    """The vacuity guard: `dispatch_from=None` must leave every existing run
+    behaving exactly as it did, warm-up being opt-in."""
+    outcome = _run(_Recorder(), InMemoryBars({1: _series(1, ["10", "11", "12"])}))
+    assert outcome.bar_calls == 3
+    assert len(outcome.equity_curve) == 3

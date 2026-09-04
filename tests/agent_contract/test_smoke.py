@@ -1067,3 +1067,82 @@ def test_daily_fetch_stamps_knowable_at_with_the_session_close(db_conn) -> None:
     # The clock the strategy actually runs on: the session close itself,
     # never ts + 86400 (which would be the NEXT session's close).
     assert [b.close_ts for b in fetched] == closes
+
+
+@pytest.mark.db
+def test_plan_backtest_widens_the_window_by_the_history_the_manifest_asked_for(db_conn) -> None:  # noqa: ANN001
+    """`history_bars` was declared in `platform_sdk.py`, constrained in
+    `schema.json`, documented in the contract -- and read by no code. A
+    strategy asking for 200 bars of warm-up got whatever happened to exist,
+    which at a window's first bar is nothing.
+
+    Warm-up is served by widening the *fetch* while leaving dispatch at the
+    caller's `start`, so the plan carries both: the widened `start` the bars
+    come from, and the `dispatch_from` the run actually begins at.
+    """
+    from datetime import UTC, date, datetime
+
+    from trading.agent_contract.smoke import plan_backtest
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','WARMUP','INR',"
+        "'ACTIVE','NSE:CM:WARMUP') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    # 6 sessions before the requested start, 3 within it.
+    for day in range(1, 10):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, datetime(2024, 1, day, 10, 0, tzinfo=UTC)),
+        )
+
+    plan = plan_backtest(
+        db_conn,
+        {"data": {"bars": "1d", "history_bars": 4}},
+        [instrument_id],
+        start=date(2024, 1, 7),
+        end=date(2024, 1, 9),
+    )
+
+    # Dispatch begins where the caller asked, never at the widened start.
+    assert plan.dispatch_from.date() == date(2024, 1, 7)
+    # ...and the fetch reaches back the requested number of SESSIONS.
+    assert plan.start.date() == date(2024, 1, 3)
+    assert plan.history_bars_requested == 4
+    assert plan.history_bars_available == 4
+
+
+@pytest.mark.db
+def test_plan_backtest_reports_a_history_shortfall_rather_than_running_quietly(db_conn) -> None:  # noqa: ANN001
+    """A strategy warmed on 2 of the 200 bars it asked for is a different
+    experiment from the one requested, and must not be reported as the one
+    requested."""
+    from datetime import UTC, date, datetime
+
+    from trading.agent_contract.smoke import plan_backtest
+
+    row = db_conn.execute(
+        "INSERT INTO instruments (asset_class, exchange, segment, symbol, currency, "
+        "status, canonical_key) VALUES ('EQUITY','NSE','CM','SHORTHIST','INR',"
+        "'ACTIVE','NSE:CM:SHORTHIST') RETURNING instrument_id"
+    ).fetchone()
+    instrument_id = row[0]
+    for day in (5, 6, 7, 8):
+        db_conn.execute(
+            "INSERT INTO bars_daily (instrument_id, ts, open, high, low, close, "
+            "volume, source) VALUES (%s,%s,100,100,100,100,10,1)",
+            (instrument_id, datetime(2024, 1, day, 10, 0, tzinfo=UTC)),
+        )
+
+    plan = plan_backtest(
+        db_conn,
+        {"data": {"bars": "1d", "history_bars": 200}},
+        [instrument_id],
+        start=date(2024, 1, 7),
+        end=date(2024, 1, 8),
+    )
+
+    assert plan.history_bars_requested == 200
+    assert plan.history_bars_available == 2

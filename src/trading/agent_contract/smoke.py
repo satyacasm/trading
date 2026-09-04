@@ -905,3 +905,76 @@ def record_smoke_run(conn: Connection, strategy_id: int, verdict: SmokeVerdict) 
     if row is None:  # pragma: no cover - RETURNING on INSERT always yields a row
         raise RuntimeError("the smoke run insert returned no row")
     return int(row[0])
+
+
+_HISTORY_SESSIONS_SQL = """
+    SELECT DISTINCT ts::date AS session_date
+    FROM bars_daily
+    WHERE instrument_id = ANY(%s) AND ts::date < %s
+    ORDER BY session_date DESC
+    LIMIT %s
+"""
+
+
+@dataclass(frozen=True)
+class BacktestPlan:
+    """Everything decided about a backtest *before* a single bar is fetched.
+
+    One object rather than three functions because widening for warm-up,
+    estimating size, and checking coverage are all facts about the same
+    request, established by queries over the same window -- three callers
+    would each re-ask it.
+
+    `start` is where bars are fetched from; `dispatch_from` is where the run
+    begins. They differ by exactly the warm-up the manifest asked for, which
+    is the whole of D3b-3: warm-up populates the lookback, it does not move
+    the experiment.
+    """
+
+    start: datetime
+    end: datetime
+    dispatch_from: datetime
+    history_bars_requested: int
+    history_bars_available: int
+    findings: tuple[Finding, ...] = ()
+
+
+def plan_backtest(
+    conn: Connection,
+    manifest: dict[str, Any],
+    instrument_ids: Sequence[int],
+    *,
+    start: date,
+    end: date,
+) -> BacktestPlan:
+    """Pre-flight a backtest: widen for warm-up, and report any shortfall.
+
+    `history_bars` is counted in **sessions**, not calendar days -- a
+    strategy asking for 200 bars wants 200 prints, and subtracting 200 days
+    would hand it roughly 138 over a weekend-bearing window.
+
+    A shortfall is reported rather than silently accepted: a strategy warmed
+    on 40 of the 200 bars it asked for is a different experiment from the one
+    requested, and reporting it as the requested one is the same class of
+    silent-wrong-data failure that 3a exists to eliminate.
+    """
+    data = manifest.get("data")
+    requested = data.get("history_bars", 100) if isinstance(data, dict) else 100
+    requested = int(requested)
+
+    rows = conn.execute(_HISTORY_SESSIONS_SQL, (list(instrument_ids), start, requested)).fetchall()
+    available_days = sorted(row[0] for row in rows)
+
+    dispatch_from = datetime.combine(start, time.min, tzinfo=UTC)
+    fetch_start = (
+        datetime.combine(available_days[0], time.min, tzinfo=UTC)
+        if available_days
+        else dispatch_from
+    )
+    return BacktestPlan(
+        start=fetch_start,
+        end=datetime.combine(end, time.max, tzinfo=UTC),
+        dispatch_from=dispatch_from,
+        history_bars_requested=requested,
+        history_bars_available=len(available_days),
+    )

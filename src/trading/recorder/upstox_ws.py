@@ -103,6 +103,7 @@ async def run_recording_loop(
     universe: list[str],
     until: datetime,
     heartbeat_interval: timedelta = timedelta(minutes=1),
+    idle_poll_seconds: float = 1.0,
     initial_backoff_seconds: float = 1.0,
     max_backoff_seconds: float = 30.0,
     clock: Clock = _utcnow,
@@ -114,6 +115,15 @@ async def run_recording_loop(
     any failure — auth, subscribe, or a broken stream — and records each
     such failure as a gap in the session manifest. Exits cleanly, calling
     `session.close()`, once `clock()` reaches `until`.
+
+    The wait for each frame is bounded by `idle_poll_seconds` so the
+    deadline is honoured by the clock rather than by traffic. Iterating the
+    feed directly checks `until` only when a frame arrives, which is fine on
+    a busy trading day and holds the process open forever on a quiet one —
+    a recorder started daily by a scheduler then leaks a stuck process per
+    day. A poll that expires is silence, not a gap: it neither reconnects
+    nor records a disconnect, because telling three minutes of quiet apart
+    from three minutes of outage is the whole point of the manifest.
     """
     backoff = initial_backoff_seconds
     last_heartbeat = clock()
@@ -128,8 +138,21 @@ async def run_recording_loop(
             acknowledged = await feed.subscribe(universe)
             session.record_subscriptions(requested=universe, acknowledged=acknowledged)
 
-            async for message in feed:
+            frames = feed.__aiter__()
+            while True:
                 if clock() >= until:
+                    break
+                try:
+                    message = await asyncio.wait_for(frames.__anext__(), timeout=idle_poll_seconds)
+                except TimeoutError:
+                    # No frame this interval. Loop, re-check the clock, and
+                    # let the heartbeat below record that we were listening.
+                    now = clock()
+                    if now - last_heartbeat >= heartbeat_interval:
+                        session.heartbeat()
+                        last_heartbeat = now
+                    continue
+                except StopAsyncIteration:
                     break
 
                 raw, anomaly_reason = _coerce_frame(message)

@@ -270,3 +270,66 @@ def test_subscribe_sends_the_control_message_as_a_binary_frame_not_text() -> Non
     assert payload["method"] == "sub"
     assert payload["data"] == {"mode": "full", "instrumentKeys": instrument_keys}
     assert isinstance(payload["guid"], str) and payload["guid"]
+
+
+class SilentFeed:
+    """A feed that connects, subscribes, and then says nothing at all.
+
+    Exactly what the real feed does outside market hours, on a holiday, or
+    when the socket is alive but the far end has stopped sending.
+    """
+
+    def __init__(self, acknowledged: list[str] | None = None) -> None:
+        self.acknowledged = acknowledged if acknowledged is not None else []
+        self.closed = False
+
+    async def authorize(self) -> None:
+        return None
+
+    async def subscribe(self, instrument_keys: list[str]) -> list[str]:
+        return self.acknowledged
+
+    async def __aiter__(self) -> AsyncIterator[Frame]:
+        # Never yields. `asyncio.sleep` rather than a bare loop so control
+        # returns to the event loop, which is what a real socket read does.
+        while True:
+            await asyncio.sleep(0.01)
+        yield b""  # pragma: no cover - unreachable, present to type this as a generator
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_a_silent_feed_still_reaches_its_deadline(tmp_path: Path) -> None:
+    """The deadline used to be checked only when a frame arrived, so a feed
+    that went quiet held the loop open forever. On a trading day frames
+    arrive constantly and it never showed; on a holiday, after hours, or
+    during a stall the process simply never exited -- and a recorder fired
+    daily by a scheduler leaks one stuck process per day.
+    """
+    session = _new_session(tmp_path)
+    feed = SilentFeed(acknowledged=["NIFTY"])
+    start = datetime(2026, 8, 13, 9, 15, tzinfo=UTC)
+
+    asyncio.run(
+        asyncio.wait_for(
+            run_recording_loop(
+                session,
+                lambda: feed,
+                universe=["NIFTY"],
+                until=start + timedelta(seconds=2),
+                clock=FakeClock(start=start, step=timedelta(seconds=1)),
+                sleep=_no_sleep,
+                idle_poll_seconds=0.01,
+            ),
+            timeout=10,
+        )
+    )
+
+    manifest = _manifest(tmp_path)
+    assert manifest["frame_count"] == 0
+    # Silence is not a gap. Recording one here would make a quiet market
+    # indistinguishable from a dropped connection, which is the single
+    # distinction this manifest exists to preserve.
+    assert manifest["gaps"] == []
+    assert feed.closed is True

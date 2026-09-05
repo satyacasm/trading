@@ -34,7 +34,9 @@ class DataSource(IntEnum):
     UPSTOX_HISTORICAL_CANDLE = 7
     UPSTOX_WS = 8
     BINANCE_FUTURES_KLINE = 9
-    BINANCE_FUTURES_WS = 10
+    # Reserved for the persisted mark series liquidation will need: the
+    # mark is index-derived, not a traded price, so it is its own series.
+    BINANCE_FUTURES_MARK = 10
 
 
 class JobStatus(StrEnum):

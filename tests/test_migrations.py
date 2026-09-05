@@ -209,7 +209,7 @@ def test_data_source_values_are_pinned():
         "UPSTOX_HISTORICAL_CANDLE": 7,
         "UPSTOX_WS": 8,
         "BINANCE_FUTURES_KLINE": 9,
-        "BINANCE_FUTURES_WS": 10,
+        "BINANCE_FUTURES_MARK": 10,
     }
 
 

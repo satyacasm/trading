@@ -1,18 +1,25 @@
 # Strategy Contract
 
-**Version 0.1 — DRAFT. The runtime described here does not exist yet.**
+**Version 0.1 — the runtime described here is live.**
 
-> Read this before generating anything: this document describes a platform
-> whose data layer, cost model, fill engine, and order lifecycle are built and
-> tested, but whose **strategy runtime is not**. There is currently no sandbox,
-> no uploader, and no `Context` implementation. A strategy written against this
-> draft cannot be run today.
+> Read this before generating anything. A strategy written against this
+> document can be uploaded today: it is statically validated, run twice in a
+> gVisor-isolated container against real bars, registered on a pass,
+> backtested over multi-year windows, and run forward against live prices
+> into a simulated portfolio. All of that is built and in use.
 >
-> It is published in this state deliberately. The contract is the platform's
-> interface to the outside world, and the cheapest time to find out that it is
-> confusing is before the runtime is built around it. Most of the interface is
-> settled; what is not is listed under [Open decisions](#open-decisions) with
-> its reasoning, rather than papered over.
+> Two interfaces in here are **not** implemented, and are marked where they
+> appear: `ctx.intel` (§4, Phase 2.5) and `on_tick` (§2). Everything else
+> described below runs.
+>
+> What the platform has data for is a different question from what this
+> document permits, and it is the most common cause of a rejection. §3 has
+> the table; read it before writing a universe.
+>
+> Remaining interface questions are listed under
+> [Open decisions](#open-decisions) with their reasoning rather than papered
+> over. The version stays 0.1 because none of the interface has changed —
+> what changed is that it is now real.
 
 ---
 
@@ -79,9 +86,10 @@ class MyStrategy(Strategy):          # your own name, subclassing Strategy
         `ctx.data.last()` when you want the last known price regardless."""
 
     def on_tick(self, ctx: Context, tick: Tick) -> None:
-        """Called per trade for tick-subscribed instruments. Optional, and
-        expensive: prefer on_bar unless the strategy genuinely needs
-        sub-bar granularity."""
+        """NOT ROUTED YET. Declaring `ticks=True` does not make this fire;
+        the runtime dispatches bars only. Defining it is harmless and it
+        will never be called, so a strategy that depends on it does
+        nothing. Use on_bar."""
 
     def on_order_update(self, ctx: Context, update: OrderUpdate) -> None:
         """Called on EVERY state change -- including each partial fill, not
@@ -92,7 +100,7 @@ class MyStrategy(Strategy):          # your own name, subclassing Strategy
         A rejection arrives here too, and is a normal outcome rather than
         an exception. Your strategy must survive one."""
 
-    def on_expiry(self, ctx: Context, event: ExpiryEvent) -> None:
+    def on_expiry(self, ctx: Context, event: ExpiryEvent) -> None:  # NOT ROUTED YET
         """F&O only. Called at settlement for a position in an expiring
         contract."""
 ```
@@ -164,6 +172,34 @@ tests a portfolio of companies selected *for having survived to 2026* — one of
 the classic ways a retail backtest lies to its author. A query cannot make that
 mistake.
 
+### What the platform actually has bars for
+
+A manifest naming an instrument with no bars is rejected after three
+containers have already run, so check this table before you write the
+universe. It is the state of the database, not an aspiration.
+
+| Asset class | Daily bars | 1-minute bars | Can be traded |
+|---|---|---|---|
+| NSE equity | ✅ ~8.4M rows, 2016→ | ✅ 5 symbols only (RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK) | ✅ |
+| Crypto spot (Binance) | ❌ **none** | ✅ 26 USDT pairs | ✅ |
+| Crypto perpetual | ✅ 2019→ | ❌ | ❌ no cost model yet |
+| NSE options, futures | ✅ EOD | ❌ | ❌ no cost model yet |
+| Mutual funds | ✅ NAVs | ❌ | ❌ |
+
+Three consequences worth stating plainly, because each one has cost
+somebody a rejection:
+
+- **A crypto strategy cannot be backtested.** Backtests run on daily bars
+  (see §9), and crypto spot has none. Crypto runs forward, live, and smoke-
+  tests on 1-minute bars — it just has no history in the shape a backtest
+  reads.
+- **A `bars="1m"` equity strategy is limited to those five symbols.** The
+  daily universe is the whole bhavcopy — thousands of instruments — but the
+  1-minute universe is only what this platform has recorded.
+- **Options, futures and perpetuals have data but cannot be ordered.** They
+  have no charge schedule, and an order in an asset class with no cost
+  model is refused at submission rather than filled at a cost of zero.
+
 ### Circuit breaker
 
 If `max_daily_loss` or `max_drawdown_pct` is declared and breached, the
@@ -174,6 +210,13 @@ strategy that malfunctions cannot dig indefinitely.
 Both are evaluated against equity (cash plus positions marked to last traded
 price), quantized to 4 decimal places, and the comparison is strict — a loss
 landing *exactly* on `max_daily_loss` does not breach.
+
+**A backtest may override both**, per run, without touching your code. What
+the manifest declares is the strategy's own stated risk appetite; what a run
+passes is the operator asking "what would this have done under a different
+limit". A run that halted early says so in its report, and names the limit
+that stopped it — a strategy whose equity curve simply stops in 2021 has
+usually tripped a breaker, not run out of data.
 
 ---
 
@@ -602,6 +645,69 @@ last three pass with warnings.
 
 Fix, resubmit, repeat. Closing that loop is the point.
 
+### 9.1 Backtesting a registered strategy
+
+Registration is not the end of the pipeline. A registered `(name, version)`
+can be backtested over a window you choose, and that is where the numbers
+worth reading come from.
+
+**Backtests run on daily bars.** A strategy declaring `data.bars="1m"` is
+refused with `BACKTEST_INTERVAL_UNSUPPORTED` rather than quietly served
+daily bars it did not ask for: a multi-year intraday run is millions of
+bars, and the sandbox receives a run's data as one payload. This is the
+most common surprise in the pipeline, so it is worth internalising early —
+**if you want the strategy backtested, declare `bars="1d"`.** A `1m`
+strategy is still smoke-tested and can still run forward against live
+prices; it simply has no backtest path today.
+
+Backtest findings, all stable and branchable:
+
+| Code | Means |
+|---|---|
+| `BACKTEST_INTERVAL_UNSUPPORTED` | the manifest declares an interval backtests cannot serve |
+| `BACKTEST_WINDOW_UNCOVERED` | the requested window runs past the data, or before it |
+| `BACKTEST_TOO_LARGE` | the window would exceed the payload the sandbox accepts |
+| `BACKTEST_RUN_FAILED` | the container crashed; the traceback is in the report |
+
+A completed run stores, and its report shows: the equity curve, per-period
+returns, CAGR, volatility, Sharpe, Sortino, Calmar, drawdown depth **and
+duration**, VaR, monthly returns, rolling Sharpe, win rate, profit factor,
+expectancy, a cost-drag report (gross versus net of every Indian charge),
+a 2× cost-and-slippage stress rerun, a Monte Carlo reshuffle of trade
+order, and **a per-fill ledger with every charge itemised and the rationale
+your strategy gave**. That last one is why §4 makes `rationale` mandatory:
+it is read back months later, next to what the trade actually did.
+
+### 9.2 Running forward against live prices
+
+A registered strategy can also be run **forward**, in the same sandbox
+image, against live closed bars, placing simulated orders into a portfolio
+you pick. Backtest and forward run share one dispatcher, which is what
+makes the two comparable.
+
+Four things differ from a backtest, and a strategy that ignores them
+behaves worse live than its backtest suggested:
+
+- **Dispatch is 1-minute closed bars, whatever `data.bars` declares.** A
+  `1d` strategy runs forward, but it will see a bar a minute rather than a
+  bar a day. If your logic counts bars to mean days, it is wrong live.
+- **One live run per portfolio.** A second start against a busy portfolio
+  is refused by the database, not by a check that could race.
+- **The portfolio is single-currency.** An order for a USDT instrument from
+  an INR portfolio is refused — there is no FX conversion anywhere.
+- **Refusals are normal and are counted.** The gateway checks a strategy's
+  order exactly as it checks a human's: currency, market hours, sufficient
+  cash or position, and a charge schedule for the asset class. The run
+  continues; the refusal and its reason are recorded on the run. A strategy
+  refused on every bar sits at zero fills, which looks identical to one
+  that decided to sit still unless you read the reason.
+
+**A forward run does not survive a supervisor restart with its memory
+intact.** The row keeps running and a fresh container is launched, so
+whatever your strategy held in `self` is gone and its next bar looks like
+its first. Keep durable state in `ctx.state`, which is persisted, not in
+instance attributes.
+
 ### Static validation is not the sandbox
 
 Worth stating plainly, because a checker that greps for `eval` and `socket`
@@ -623,12 +729,21 @@ on equity, an iron condor on NIFTY weeklies, BTC momentum, and a multi-asset
 rebalancer.
 
 They are deliberately **not** written yet. An example in a contract is a
-promise that the code runs, and none of these can be executed until the runtime
-exists. Writing four plausible-looking examples now would mean shipping four
-untested claims in the most load-bearing part of the document — and an agent
-copying a broken example produces broken strategies with full confidence.
+promise that the code runs, and writing four plausible-looking examples would
+mean shipping four untested claims in the most load-bearing part of the
+document — an agent copying a broken example produces broken strategies with
+full confidence.
 
-They get written, and **run**, as the runtime lands.
+**The blocker has cleared.** The runtime exists, strategies have been
+registered, smoke-tested, backtested over multi-year windows and run forward
+against live prices. Two of the four are now writable and executable today: an
+SMA crossover on a daily-bar NSE equity, and a multi-asset rebalancer within
+one asset class. The other two are still blocked, and on data rather than on
+runtime: an iron condor needs an options cost model, and BTC momentum needs
+daily crypto bars, which this platform does not have (see §3).
+
+Writing and running the two that are unblocked is the next task on this
+document.
 
 ---
 
@@ -667,7 +782,7 @@ like, so each is worth settling deliberately.
 | **D1** | Universe: explicit list, query, or both? | **Settled — both.** An explicit `InstrumentRef` list for a handful of named instruments; a `Query` when the universe is dynamic. Resolution is point-in-time either way, which is where the survivorship guarantee lives. The query form exists because hardcoding today's index constituents into a 2022 backtest silently selects for survival. |
 | **D2** | How dated lot size reaches `ctx`. | **Settled.** `ctx.data.lot_size(instrument_id)`, resolved at `ctx.now`, `None` where there is no lot concept. A method on `ctx.data`, not a field on the instrument, so a 2026 lot size cannot be cached into a 2022 backtest. |
 | **D3** | Sandbox limits and the import allowlist. | **Settled** — see §8 for the enforced table. The runtime is configurable and every result records which one confined it. A first attempt concluded gVisor was unavailable here; that was an error about the local Docker backend (Colima, not Docker Desktop), corrected 2026-09-03 — `runsc` is verified working on arm64 in a dedicated Colima VM. gVisor becomes a requirement before Phase 4, not before V1, and is now available rather than hypothetical. |
-| **D4** | Worked examples. | **Open, deliberately.** Blocked on the runtime — each must be *executed* before publication, because an example is a promise the code runs. |
+| **D4** | Worked examples. | **Open; the runtime blocker has cleared.** Strategies are now registered, backtested and run forward, so an example can be executed before publication as this decision requires. Two of the four are writable today; the iron condor is blocked on an options cost model and BTC momentum on daily crypto bars (§3). |
 | **D5** | Does `on_bar` fire for an instrument that did not trade? | **Settled — absent from the dict.** Carrying the previous close forward invents a trade that did not happen and lets a strategy act on liquidity that was not there. `ctx.data.last()` covers the "last known price" need. |
 | **D6** | Can one strategy hold more than one portfolio? | **Settled — no.** One strategy, one portfolio, one currency. This matches the platform: the currency gate is enforced at order submission and there is no FX mark model. **Consequence, stated plainly:** a single strategy cannot trade NSE equities and crypto together in V1. Revisit when multi-currency portfolios exist. |
 | **D7** | How partial fills surface. | **Settled.** `on_order_update` fires on every state change, each partial included. A GTC limit can rest partially filled indefinitely; only firing at terminal state would make that invisible to a strategy sizing from `filled_quantity`. |

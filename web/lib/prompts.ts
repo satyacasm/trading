@@ -30,6 +30,10 @@ export type PromptVariation = {
  * Symbols the platform has 1-minute bars for. A manifest naming anything
  * else is rejected with NO_DATA after three containers have already run,
  * so it is worth telling the agent up front.
+ *
+ * The daily universe is far larger -- the whole NSE bhavcopy, thousands of
+ * instruments back to 2016 -- but a `bars="1m"` strategy is confined to
+ * what this platform has actually recorded minute by minute.
  */
 export const INSTRUMENTS_WITH_BARS = [
   "NSE/CM RELIANCE",
@@ -48,9 +52,17 @@ above; they are repeated here because each one costs a round trip:
 - Import nothing outside the allowlist. There is no network and no
   filesystem inside the sandbox.
 - Every order needs a non-empty \`rationale\`.
-- Your universe must name instruments this platform has 1-minute bars
-  for: ${INSTRUMENTS_WITH_BARS.join(", ")}. One asset class per strategy --
-  equities and crypto cannot be mixed.`;
+- Your universe must name instruments this platform has bars for. With
+  \`bars="1m"\`, that is: ${INSTRUMENTS_WITH_BARS.join(", ")}. With
+  \`bars="1d"\`, any NSE equity in the bhavcopy back to 2016.
+- One asset class per strategy -- equities and crypto cannot be mixed,
+  because a portfolio is single-currency.
+- Declare \`bars="1d"\` if you want the strategy backtested. Backtests run
+  on daily bars only, and a \`1m\` manifest is refused with
+  BACKTEST_INTERVAL_UNSUPPORTED. A \`1m\` strategy still smoke-tests and
+  still runs forward against live prices.`;
+
+export const CUSTOM_VARIATION_ID = "custom";
 
 export const VARIATIONS: PromptVariation[] = [
   {
@@ -141,6 +153,14 @@ instead of \`ctx.now\`, and passes a float as an order quantity.
 I expect the platform to refuse this. Do not correct any of it.`,
   },
   {
+    id: CUSTOM_VARIATION_ID,
+    group: "Archetype",
+    label: "Your own idea",
+    blurb:
+      "Describe the strategy in your own words. The contract and the house rules are attached for you -- write the idea, not the boilerplate.",
+    task: "",
+  },
+  {
     id: "fix-rejection",
     group: "Follow-up",
     label: "Fix a rejection",
@@ -151,6 +171,37 @@ I expect the platform to refuse this. Do not correct any of it.`,
 ];
 
 export const FIX_VARIATION_ID = "fix-rejection";
+
+/**
+ * Placeholder task for an empty box.
+ *
+ * An empty custom prompt must not end mid-sentence and silently ask an
+ * agent for nothing -- it should still read as a request, so a prompt
+ * copied before the idea was typed produces a question rather than
+ * confident nonsense.
+ */
+const CUSTOM_FALLBACK = `The operator has not written the strategy yet. Ask them what they want,
+in one short question, and describe the strategy you would write once they
+answer. Do not write code yet.`;
+
+/**
+ * A prompt built from the operator's own words.
+ *
+ * The presets cover the archetypes worth testing a contract against; this
+ * covers the reason somebody opened the page, which is usually an idea the
+ * presets do not have. The house rules stay attached, and matter more here
+ * than anywhere else: a preset was written against the contract's
+ * constraints, and something typed in a hurry was not.
+ */
+export function customVariation(task: string): PromptVariation {
+  return {
+    id: CUSTOM_VARIATION_ID,
+    group: "Archetype",
+    label: "Your own idea",
+    blurb: "Describe the strategy in your own words. The contract and the house rules go with it.",
+    task: task.trim() === "" ? CUSTOM_FALLBACK : task.trim(),
+  };
+}
 
 function preamble(contractVersion: string): string {
   return `You have just read the complete strategy contract for a trading platform

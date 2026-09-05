@@ -33,6 +33,8 @@ class DataSource(IntEnum):
     BINANCE_WS = 6
     UPSTOX_HISTORICAL_CANDLE = 7
     UPSTOX_WS = 8
+    BINANCE_FUTURES_KLINE = 9
+    BINANCE_FUTURES_WS = 10
 
 
 class JobStatus(StrEnum):

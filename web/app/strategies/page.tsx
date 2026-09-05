@@ -23,10 +23,12 @@ import {
   orderForDisplay,
 } from "@/lib/strategies";
 import {
+  CUSTOM_VARIATION_ID,
   FIX_VARIATION_ID,
   VARIATIONS,
   composeFixPrompt,
   composePrompt,
+  customVariation,
   type PromptVariation,
 } from "@/lib/prompts";
 
@@ -169,6 +171,7 @@ export default function StrategiesPage() {
   const [running, setRunning] = useState(false);
   const [copied, setCopied] = useState(false);
   const [variationId, setVariationId] = useState(VARIATIONS[0].id);
+  const [customTask, setCustomTask] = useState("");
   const [kitOpen, setKitOpen] = useState(true);
   const [kitCopied, setKitCopied] = useState<CopyTarget | null>(null);
   const [kitError, setKitError] = useState<string | null>(null);
@@ -226,7 +229,11 @@ export default function StrategiesPage() {
         const bundle = await ensureBundle();
         if (target === "contract") text = bundle.contract;
         else if (target === "sdk") text = bundle.sdk_stub;
-        else text = composePrompt(bundle.contract, bundle.contract_version, variation);
+        else {
+          const asked =
+            variation.id === CUSTOM_VARIATION_ID ? customVariation(customTask) : variation;
+          text = composePrompt(bundle.contract, bundle.contract_version, asked);
+        }
       }
       await navigator.clipboard.writeText(text);
       setKitCopied(target);
@@ -345,6 +352,33 @@ export default function StrategiesPage() {
             <p className="text-muted text-xs max-w-prose">
               <span className="text-text">{variation.group}.</span> {variation.blurb}
             </p>
+
+            {variation.id === CUSTOM_VARIATION_ID && (
+              <div className="flex flex-col gap-1">
+                <label htmlFor="custom-task" className="text-muted text-xs">
+                  What should the strategy do?
+                </label>
+                <textarea
+                  id="custom-task"
+                  value={customTask}
+                  onChange={(e) => {
+                    setCustomTask(e.target.value);
+                    setKitCopied(null);
+                  }}
+                  rows={4}
+                  placeholder={
+                    "Buy RELIANCE when its 20-bar RSI drops below 30, sell when it " +
+                    "goes above 70, one position at a time."
+                  }
+                  className="border-line bg-raised text-text w-full rounded border px-3 py-2 text-sm"
+                />
+                <p className="text-muted text-xs max-w-prose">
+                  Plain English is enough — the contract and the rules generated strategies
+                  break most often are copied along with it. Say what to trade, what triggers
+                  a buy, what closes the position, and how much.
+                </p>
+              </div>
+            )}
 
             <div className="flex flex-wrap items-center gap-3">
               <button

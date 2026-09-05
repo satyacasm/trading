@@ -1,13 +1,19 @@
 # Where this project stands
 
-**Updated:** 2026-09-04, ~22:10 IST. Keep this file current — it is the
+**Updated:** 2026-09-05, ~10:05 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
 
 ## The one thing to do next
 
-**Restart/resume across supervisor death.** A supervisor restart relaunches
+**Regenerate the Upstox access token, then prove an NSE live run.** The
+bar-delivery fix below is verified by tests and by a container test, but
+never by real NSE data: the feed has produced nothing since 15:28 IST on
+2026-09-04, so no `bars:*` message has exercised the new publish in
+production. Until a token is in place that cannot be checked.
+
+Then: **restart/resume across supervisor death.** A supervisor restart relaunches
 every `RUNNING` row, which is right for the row and wrong for the strategy:
 the container is new, so whatever the strategy held in memory is gone and
 its next bar looks like its first. Nothing in `live_runs` records that this
@@ -15,6 +21,43 @@ happened, so the run's own history reads as continuous when it is not.
 
 Then: tick-level dispatch, if ever wanted (it would need a contract
 change), and the post-tax P&L lens.
+
+---
+
+## Live bar delivery — fixed 2026-09-05 (merged)
+
+Two defects that each made live runs unusable.
+
+**NSE strategies could never receive a bar.** The supervisor learns that a
+minute closed from `closed_bars:*` and nowhere else, and the aggregator
+published that channel only for bars it built from ticks. Upstox-bound
+instruments are deliberately *excluded* from tick aggregation, so their
+already-complete I1 bars went to `bars_intraday` and were announced to
+nobody — an NSE run could sit `RUNNING` all session on zero bars. Both
+kinds are announced now; `source` carries the distinction the separate
+channel used to.
+
+**A repeated bar killed a run that had been trading for hours.** Run 1
+died at 01:32 IST on a bar it had already seen. The root cause is in
+`BarAggregator`: `flush_stale` deletes the bucket it closes, so a late
+tick found nothing open, started a fresh bar for a minute already
+published, and had it closed a second time. A host that sleeps and wakes
+with a backlog does this routinely — which is why a 7-minute watch of the
+live stream found 169 messages, 169 distinct, 0 duplicates and proved
+nothing. `_closed_through` remembers what has closed; dropped late ticks
+are counted and logged.
+
+Fixed at the runtime too, since transport is not the only way a bar can
+repeat. `InMemoryBars.append` now has three cases where it had two: an
+older bar is still refused, the same minute with *different* prices is
+refused as a feed disagreeing with itself, and an identical bar returns
+`None` — already known. The runner skips dispatch but still writes an
+orders frame, because the supervisor reads exactly one per bar it feeds.
+
+**Worth not relearning:** a "pure, no I/O" class that drops data needs a
+counter, or the drop is invisible. And `sandbox/build.sh` must be re-run
+after touching `runner.py` or anything under `src/trading/runtime/` — the
+image carries its own copy.
 
 ---
 

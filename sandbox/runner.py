@@ -358,6 +358,7 @@ def _run_live(payload, instance, manifest, strategy_cls):  # noqa: ANN001, ANN20
 
     initialised = False
     submitted_before = 0
+    alive = True
 
     for raw in sys.stdin:
         frame = decode_frame(raw)
@@ -382,7 +383,25 @@ def _run_live(payload, instance, manifest, strategy_cls):  # noqa: ANN001, ANN20
                 if frame.get("knowable_at") is None
                 else _parse_ts(frame["knowable_at"]),
             )
-            bar, index = bars.append(record)
+            appended = bars.append(record)
+            if appended is None:
+                # A redelivery of a bar the strategy has already acted on.
+                # Dispatching it again would place the same orders twice.
+                # The supervisor reads exactly one orders frame per bar it
+                # feeds, so the frame is still written -- staying silent
+                # here would stall it until its read timed out.
+                _write(
+                    encode_frame(
+                        FRAME_ORDERS,
+                        ts=record.close_ts.isoformat(),
+                        orders=[],
+                        breaker_reason=session.state.breaker_reason,
+                        alive=alive,
+                        duplicate=True,
+                    )
+                )
+                continue
+            bar, index = appended
             if not initialised:
                 session.initialize(bar.close_ts)
                 initialised = True

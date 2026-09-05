@@ -89,9 +89,9 @@ class InMemoryBars:
         flat.sort(key=lambda pair: (pair[0].close_ts, pair[0].instrument_id))
         self._flat = flat
 
-    def append(self, bar: BarRecord) -> tuple[BarRecord, int]:
+    def append(self, bar: BarRecord) -> tuple[BarRecord, int] | None:
         """Add one newly-closed bar, returning it with its index in its own
-        instrument's series.
+        instrument's series, or `None` if it was already known.
 
         A forward run learns its bars one at a time, where a backtest is
         handed all of them up front. The index is what the loop's cursor
@@ -99,18 +99,34 @@ class InMemoryBars:
         that dispatched it has finished -- the same anti-lookahead rule the
         backtest enforces, by the same mechanism.
 
-        A bar older than the instrument's latest is refused rather than
-        sorted into place. Reordering would change history a strategy has
-        already read, leaving its lookback silently different from what it
-        saw a moment ago; a late bar is a feed problem and must surface as
-        one.
+        Three cases, and only one of them is an error:
+
+        - A bar *older* than the instrument's latest is refused. Sorting it
+          into place would change history a strategy has already read,
+          leaving its lookback silently different from what it saw a moment
+          ago; a late bar is a feed problem and must surface as one.
+        - A bar identical to the latest is a **redelivery** and returns
+          `None`. It changes nothing, and a live run that died on one --
+          which is how this case was found -- died over a non-event. The
+          caller skips dispatch; it must not re-dispatch a bar the strategy
+          has already acted on.
+        - The same minute carrying *different* prices is a feed disagreeing
+          with itself. Keeping the first silently would hide that, so it is
+          refused like a late bar.
 
         `_flat` is deliberately not maintained here: it exists for
         `groups()`, which is the backtest's whole-run iteration and has no
         meaning for a run that has not finished.
         """
         series = self._bars.get(bar.instrument_id, ())
-        if series and bar.ts <= series[-1].ts:
+        if series and bar.ts == series[-1].ts:
+            if bar == series[-1]:
+                return None
+            raise ValueError(
+                f"bar for instrument {bar.instrument_id} at {bar.ts.isoformat()} disagrees "
+                f"with the one already recorded for that minute"
+            )
+        if series and bar.ts < series[-1].ts:
             raise ValueError(
                 f"bar for instrument {bar.instrument_id} at {bar.ts.isoformat()} arrived "
                 f"out of order -- the latest is {series[-1].ts.isoformat()}"

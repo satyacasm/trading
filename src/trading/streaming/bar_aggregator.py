@@ -79,19 +79,38 @@ class BarAggregator:
     """Pure in-memory minute-bucketing -- no I/O. `ingest()`/`flush_stale()`
     are synchronous and return any bars that just closed as a result.
 
-    Assumes ticks arrive in non-decreasing timestamp order per instrument
-    (true for one ordered Binance WS connection feeding one ordered Redis
-    subscription): an out-of-order tick updates the currently-open bucket
-    rather than reopening an already-closed one. An acknowledged
-    simplification for this proof-of-shape tier, not a silent bug.
+    Ticks are assumed to arrive in non-decreasing timestamp order per
+    instrument (true for one ordered Binance WS connection feeding one
+    ordered Redis subscription), so an out-of-order tick updates the
+    currently-open bucket rather than reopening an already-closed one.
+
+    That held only while the bucket was still open. `flush_stale` deletes
+    the bucket it closes, so a late tick for that minute found nothing open,
+    started a fresh bar for a minute already written and announced, and had
+    it closed and published a second time. A host that sleeps and wakes with
+    a backlog of buffered ticks does this routinely, and the duplicate
+    killed a live strategy that refused a bar it had already seen.
+    `_closed_through` is the memory that makes the assumption true: a bucket
+    is closed once, and a tick for it afterwards is dropped and counted.
     """
 
     def __init__(self, interval_seconds: int = INTERVAL_SECONDS) -> None:
         self._interval_seconds = interval_seconds
         self._open: dict[int, tuple[datetime, OpenBar]] = {}
+        # The last bucket closed per instrument. One datetime each, so this
+        # is bounded by the instrument count, not by uptime.
+        self._closed_through: dict[int, datetime] = {}
+        # Late ticks are rare and their rate is the interesting part -- a
+        # steady trickle is a feed that reorders, a burst is a host that
+        # slept. The loop logs this; the class stays free of I/O.
+        self.late_ticks_dropped = 0
 
     def ingest(self, tick: Tick) -> list[ClosedBar]:
         bucket = bucket_start(tick.ts, self._interval_seconds)
+        closed_through = self._closed_through.get(tick.instrument_id)
+        if closed_through is not None and bucket <= closed_through:
+            self.late_ticks_dropped += 1
+            return []
         current = self._open.get(tick.instrument_id)
         if current is None:
             self._open[tick.instrument_id] = (bucket, OpenBar.start(tick))
@@ -101,6 +120,7 @@ class BarAggregator:
             bar.update(tick)
             return []
         self._open[tick.instrument_id] = (bucket, OpenBar.start(tick))
+        self._closed_through[tick.instrument_id] = current_bucket
         return [ClosedBar(instrument_id=tick.instrument_id, bucket=current_bucket, bar=bar)]
 
     def flush_stale(self, now: datetime) -> list[ClosedBar]:
@@ -113,6 +133,7 @@ class BarAggregator:
             if now >= bucket + timedelta(seconds=self._interval_seconds):
                 closed.append(ClosedBar(instrument_id=instrument_id, bucket=bucket, bar=bar))
                 del self._open[instrument_id]
+                self._closed_through[instrument_id] = bucket
         return closed
 
 
@@ -238,16 +259,33 @@ def write_upstox_bar(
 _CLOSED_BAR_CHANNEL = "closed_bars"
 
 
-async def _publish_closed_bar(
-    redis: Redis, closed: ClosedBar, interval_seconds: int, source: DataSource
+async def _announce_bar(
+    redis: Redis,
+    *,
+    instrument_id: int,
+    ts: datetime,
+    open_: Decimal,
+    high: Decimal,
+    low: Decimal,
+    close: Decimal,
+    volume: Decimal | None,
+    interval_seconds: int,
+    source: DataSource,
 ) -> None:
-    """Announce a bar that just closed.
+    """Announce a bar that is final, whoever produced it.
 
-    A separate channel from `bars:*`, which carries Upstox's already-complete
-    I1 bars straight off the feed. These are the aggregator's own output, and
-    conflating the two would make a subscriber unable to tell a bar that was
-    received from one that was computed -- a distinction that matters when
-    the two disagree.
+    Both kinds go here: the ones this process bucketed out of ticks, and
+    Upstox's already-complete I1 bars, which arrive whole on `bars:*`. This
+    channel used to carry only the first, on the reasoning that conflating
+    them would leave a subscriber unable to tell a bar that was received
+    from one that was computed. That distinction is real, but `source`
+    already carries it -- and paying for it with a channel meant a live
+    strategy on an NSE instrument could be RUNNING all session and never be
+    handed a bar, because its bars were written to the database and
+    announced to nobody.
+
+    What a subscriber actually asks this channel is "has a minute closed for
+    this instrument", and the answer is the same either way.
 
     Money as strings, like everywhere it crosses a process boundary. A
     publish failure is logged and swallowed: a subscriber being absent or
@@ -258,17 +296,17 @@ async def _publish_closed_bar(
 
     try:
         await redis.publish(
-            f"{_CLOSED_BAR_CHANNEL}:{closed.instrument_id}",
+            f"{_CLOSED_BAR_CHANNEL}:{instrument_id}",
             json.dumps(
                 {
-                    "instrument_id": closed.instrument_id,
-                    "ts": closed.bucket.isoformat(),
+                    "instrument_id": instrument_id,
+                    "ts": ts.isoformat(),
                     "interval_sec": interval_seconds,
-                    "open": str(closed.bar.open),
-                    "high": str(closed.bar.high),
-                    "low": str(closed.bar.low),
-                    "close": str(closed.bar.close),
-                    "volume": None if closed.bar.volume is None else str(closed.bar.volume),
+                    "open": str(open_),
+                    "high": str(high),
+                    "low": str(low),
+                    "close": str(close),
+                    "volume": None if volume is None else str(volume),
                     "source": source.value,
                 }
             ),
@@ -276,9 +314,27 @@ async def _publish_closed_bar(
     except Exception as exc:  # noqa: BLE001 - the database write is the durable record
         log.warning(
             "bar_aggregator.publish_failed",
-            instrument_id=closed.instrument_id,
+            instrument_id=instrument_id,
             reason=str(exc),
         )
+
+
+async def _publish_closed_bar(
+    redis: Redis, closed: ClosedBar, interval_seconds: int, source: DataSource
+) -> None:
+    """Announce a bar this process built out of ticks."""
+    await _announce_bar(
+        redis,
+        instrument_id=closed.instrument_id,
+        ts=closed.bucket,
+        open_=closed.bar.open,
+        high=closed.bar.high,
+        low=closed.bar.low,
+        close=closed.bar.close,
+        volume=closed.bar.volume,
+        interval_seconds=interval_seconds,
+        source=source,
+    )
 
 
 async def run_aggregation_loop(
@@ -382,7 +438,7 @@ async def run_aggregation_loop(
         if max_bars_written is not None and written >= max_bars_written:
             done.set()
 
-    def _write_upstox_bar(bar: Bar) -> None:
+    async def _write_upstox_bar(bar: Bar) -> None:
         nonlocal written
         try:
             write_upstox_bar(conn, bar, interval_seconds=interval_seconds)
@@ -398,11 +454,30 @@ async def run_aggregation_loop(
                 reason=str(exc),
             )
             return
+        # Announced for the same reason a tick-built bar is: the live
+        # supervisor learns that a minute closed from this channel and from
+        # nowhere else. Without it an NSE strategy runs a whole session on
+        # zero bars while its data sits in `bars_intraday`. After the write,
+        # so a subscriber that reacts by querying finds the row already
+        # there.
+        await _announce_bar(
+            redis,
+            instrument_id=bar.instrument_id,
+            ts=bar.ts,
+            open_=bar.open,
+            high=bar.high,
+            low=bar.low,
+            close=bar.close,
+            volume=bar.volume,
+            interval_seconds=interval_seconds,
+            source=DataSource.UPSTOX_WS,
+        )
         written += 1
         if max_bars_written is not None and written >= max_bars_written:
             done.set()
 
     async def _consume_ticks(pubsub: PubSub) -> None:
+        dropped_before = 0
         async for message in pubsub.listen():
             if message["type"] != "pmessage":
                 continue
@@ -412,6 +487,17 @@ async def run_aggregation_loop(
             if tick.instrument_id in excluded_instrument_ids:
                 continue
             await _write_all(aggregator.ingest(tick))
+            # A tick for a minute already closed and announced. Dropping it
+            # is right -- see `BarAggregator` -- but silently dropping data
+            # is how a feed problem goes unnoticed for a week.
+            if aggregator.late_ticks_dropped != dropped_before:
+                log.warning(
+                    "bar_aggregator.late_tick_dropped",
+                    instrument_id=tick.instrument_id,
+                    ts=tick.ts.isoformat(),
+                    total=aggregator.late_ticks_dropped,
+                )
+                dropped_before = aggregator.late_ticks_dropped
             if done.is_set():
                 return
 
@@ -422,7 +508,7 @@ async def run_aggregation_loop(
             bar = _parse_bar(message["data"])
             if bar is None:
                 continue
-            _write_upstox_bar(bar)
+            await _write_upstox_bar(bar)
             if done.is_set():
                 return
 

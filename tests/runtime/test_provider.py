@@ -116,3 +116,54 @@ def test_a_late_bar_is_refused_rather_than_silently_reordered() -> None:
     store.append(bar(5))
     with _pytest.raises(ValueError, match="out of order"):
         store.append(bar(4))
+
+
+def _bar_at(minute: int, close: str = "1") -> object:
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from trading.runtime.provider import BarRecord
+
+    return BarRecord(
+        instrument_id=1,
+        ts=datetime(2026, 9, 4, 10, minute, tzinfo=UTC),
+        interval_sec=60,
+        open=Decimal("1"),
+        high=Decimal("1"),
+        low=Decimal("1"),
+        close=Decimal(close),
+    )
+
+
+def test_an_identical_redelivered_bar_is_ignored_rather_than_refused() -> None:
+    """A bar that repeats one already appended changes nothing, so refusing
+    it kills a live run over a non-event. This is not hypothetical: a late
+    tick reopened an already-flushed minute upstream, the same bar was
+    published twice, and a run that had been trading for hours died on the
+    second copy.
+
+    `None` means "already known" -- distinct from a bar that was appended,
+    which the caller must dispatch.
+    """
+    from trading.runtime.provider import InMemoryBars
+
+    store = InMemoryBars({})
+    store.append(_bar_at(5))
+    assert store.append(_bar_at(5)) is None
+    # Ignored, not appended twice: the strategy's lookback must be the same
+    # length whether or not the transport hiccuped.
+    assert len(store.history(1, 2)) == 1
+
+
+def test_the_same_minute_with_different_prices_is_still_refused() -> None:
+    """Two different bars claiming the same minute is a feed disagreeing
+    with itself, not a redelivery, and silently keeping the first would
+    hide it."""
+    import pytest as _pytest
+
+    from trading.runtime.provider import InMemoryBars
+
+    store = InMemoryBars({})
+    store.append(_bar_at(5, close="1"))
+    with _pytest.raises(ValueError, match="disagrees"):
+        store.append(_bar_at(5, close="2"))

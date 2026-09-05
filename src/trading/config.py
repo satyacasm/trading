@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     upstox_api_secret: str | None = None
     upstox_analytics_token: str | None = None
     upstox_access_token: str | None = None
+    # Read-only is enough: the only signed endpoint this platform calls is
+    # `leverageBracket`, which reads maintenance-margin tiers. No trading
+    # permission, no withdrawal permission, no funds at risk.
+    binance_api_key: str | None = None
+    binance_api_secret: str | None = None
     dhan_client_id: str | None = None
     dhan_access_token: str | None = None
 

@@ -10,6 +10,10 @@ class AssetClass(StrEnum):
     OPTION = "OPTION"
     MF = "MF"
     CRYPTO = "CRYPTO"
+    # A perpetual is not a CRYPTO row with a flag: `load_schedules` and
+    # `_BROKER_BY_ASSET_CLASS` both key on asset_class, so sharing CRYPTO
+    # would silently apply spot's brokerage to a perpetual fill.
+    PERP = "PERP"
     COMMODITY = "COMMODITY"
 
 

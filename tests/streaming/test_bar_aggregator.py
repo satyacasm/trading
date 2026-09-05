@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Coroutine
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -831,3 +832,125 @@ def test_run_aggregation_loop_logs_the_excluded_instrument_set_once_at_startup(
     assert len(events) == 1
     assert excluded_iid in events[0]["instrument_ids"]
     assert events[0]["count"] == len(events[0]["instrument_ids"])
+
+
+def _flat_bar_json(instrument_id: int, ts: str, close: str) -> str:
+    import json
+
+    return json.dumps(
+        {
+            "instrument_id": instrument_id,
+            "ts": ts,
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume": "10",
+        }
+    )
+
+
+def test_an_upstox_bar_is_announced_on_the_closed_bar_channel(
+    db_conn, redis_client: redis.Redis
+) -> None:
+    """A live run subscribes to `closed_bars:*` and nothing else. Upstox's
+    already-complete I1 bars went to the database and were announced to
+    nobody, so an NSE strategy could be RUNNING for a whole session and
+    never receive a bar -- the aggregator's own tick-built bars were the
+    only ones that reached the supervisor."""
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    bars_channel = f"test-bars:{iid}:{iid}"
+    bars_pattern = f"test-bars:{iid}:*"
+    ts = (datetime.now(UTC) + timedelta(minutes=3)).replace(second=0, microsecond=0)
+
+    listener = redis_client.pubsub()
+    listener.subscribe(f"closed_bars:{iid}")
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(
+            async_redis,
+            db_conn,
+            sleep=_no_sleep,
+            max_bars_written=1,
+            pattern=f"test-ticks:{iid}:*",
+            bars_pattern=bars_pattern,
+        )
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)
+            redis_client.publish(bars_channel, _flat_bar_json(iid, ts.isoformat(), "65000.00"))
+
+        asyncio.run(_run_both(loop_task, _publish_after_subscribed()))
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    announced = _drain_for_closed_bar(listener)
+    listener.close()
+    assert announced is not None, "the Upstox bar reached the database but was never announced"
+    assert announced["instrument_id"] == iid
+    assert announced["ts"] == ts.isoformat()
+    # The feed's own precision, not the database's numeric(18,4): a bar is
+    # announced with the value this process holds, exactly as a tick-built
+    # bar is. The two compare equal as Decimals either way.
+    assert announced["close"] == "65000.00"
+    # The channel now carries both kinds of bar. `source` is what keeps a
+    # subscriber able to tell a bar that was received from one this process
+    # computed -- the distinction the separate channel used to carry.
+    assert announced["source"] == DataSource.UPSTOX_WS.value
+
+
+def _drain_for_closed_bar(listener: redis.client.PubSub) -> dict[str, Any] | None:
+    import json
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        message = listener.get_message(timeout=1.0)
+        if not message or message["type"] != "message":
+            continue
+        return dict(json.loads(message["data"]))
+    return None
+
+
+def test_a_tick_for_an_already_flushed_bucket_does_not_reopen_it() -> None:
+    """`flush_stale` deletes the bucket it closed, so a tick arriving for
+    that same minute afterwards used to find no open bar, start a fresh one
+    for a minute that had already been published, and have it closed and
+    published a second time.
+
+    That is not a theoretical race. The host slept, woke with a backlog of
+    buffered ticks, and the duplicate reached a live strategy whose runtime
+    refused a bar it had already seen -- killing a run that had been
+    trading for hours.
+    """
+    aggregator = BarAggregator()
+    base = datetime(2026, 9, 4, 20, 2, tzinfo=UTC)
+
+    aggregator.ingest(_tick(base, price="65000.00"))
+    closed = aggregator.flush_stale(base + timedelta(seconds=61))
+    assert [c.bucket for c in closed] == [base]
+
+    # The late tick belongs to a minute that has already been announced.
+    aggregator.ingest(_tick(base + timedelta(seconds=30), price="66000.00"))
+
+    assert aggregator.flush_stale(base + timedelta(minutes=5)) == [], (
+        "the already-closed 20:02 bucket was reopened and closed a second time"
+    )
+    assert aggregator.late_ticks_dropped == 1
+
+
+def test_a_tick_for_a_new_bucket_still_opens_one_after_a_flush() -> None:
+    """The guard must not wedge the instrument: the very next minute is
+    still ordinary business."""
+    aggregator = BarAggregator()
+    base = datetime(2026, 9, 4, 20, 2, tzinfo=UTC)
+
+    aggregator.ingest(_tick(base))
+    aggregator.flush_stale(base + timedelta(seconds=61))
+    aggregator.ingest(_tick(base + timedelta(minutes=1)))
+
+    closed = aggregator.flush_stale(base + timedelta(minutes=5))
+    assert [c.bucket for c in closed] == [base + timedelta(minutes=1)]
+    assert aggregator.late_ticks_dropped == 0

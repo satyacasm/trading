@@ -17,6 +17,7 @@ import pytest
 from trading.agent_contract.sandbox import SandboxLimits, _docker_args
 from trading.live.protocol import (
     FRAME_BAR,
+    FRAME_ERROR,
     FRAME_ORDERS,
     FRAME_READY,
     FRAME_STOP,
@@ -118,3 +119,60 @@ def test_a_live_container_takes_bars_on_stdin_and_returns_order_intents() -> Non
     assert first[0]["side"] == "BUY"
     assert first[0]["quantity"] == "1"
     assert "Live probe" in first[0]["rationale"]
+
+
+def test_a_redelivered_bar_neither_kills_the_run_nor_trades_twice() -> None:
+    """The failure this fixes, end to end in the real image.
+
+    A run that had been trading for hours died at 01:32 on a bar it had
+    already seen -- the host slept, woke with a backlog, and a late tick
+    reopened an already-closed minute upstream. The runtime refused the
+    repeat as a history violation and the container exited.
+
+    Two things have to hold. The run survives, and the strategy does not
+    act on the bar twice: this strategy buys on every bar, so a
+    re-dispatched duplicate would place a second order against a minute
+    that only happened once.
+    """
+    payload = encode_payload(
+        SmokePayload(
+            mode=MODE_LIVE,
+            source=LIVE_STRATEGY,
+            starting_cash=Decimal("100000"),
+            slippage_bps=Decimal("0"),
+        )
+    )
+    stream = (
+        b"%d\n" % len(payload)
+        + payload
+        + _bar_frame(0, "100").encode()
+        + _bar_frame(1, "101").encode()
+        + _bar_frame(1, "101").encode()  # the same minute, again
+        + _bar_frame(2, "102").encode()
+        + encode_frame(FRAME_STOP).encode()
+    )
+    proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        _docker_args(SandboxLimits(), "live-duplicate-test"),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = proc.communicate(input=stream, timeout=90)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    frames = [f for f in (decode_frame(line) for line in stdout.decode().splitlines()) if f]
+    assert not [f for f in frames if f["type"] == FRAME_ERROR], stdout.decode()[:2000]
+
+    order_frames = [f for f in frames if f["type"] == FRAME_ORDERS]
+    # One frame per bar fed, duplicate included: the supervisor reads
+    # exactly one per bar it writes, so a silent skip would stall it.
+    assert len(order_frames) == 4, [f["ts"] for f in order_frames]
+    duplicate = order_frames[2]
+    assert duplicate.get("duplicate") is True
+    assert duplicate["orders"] == []
+    assert duplicate["alive"] is True
+    # Three distinct minutes, three buys -- not four.
+    assert sum(len(f["orders"]) for f in order_frames) == 3

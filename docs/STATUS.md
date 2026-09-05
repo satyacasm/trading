@@ -1,11 +1,22 @@
 # Where this project stands
 
-**Updated:** 2026-09-05, ~10:55 IST. Keep this file current — it is the
+**Updated:** 2026-09-05, ~11:40 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
 
 ## The one thing to do next
+
+**Phase 3.5 task 3 — signed positions and margin** — which is blocked on
+one operator action: a **read-only Binance API key**
+(`BINANCE_API_KEY` / `BINANCE_API_SECRET` in `.env`, no trading or
+withdrawal permission). Maintenance-margin tiers come from a signed
+endpoint, and they are deliberately not hardcoded: an invented maintenance
+rate liquidates at the wrong price, which is the failure
+`MissingChargeSchedule` exists to refuse. `seed_perp_margin_tiers` says so
+and writes nothing.
+
+Also still true:
 
 **Watch Monday morning.** Two things run unattended for the first time on
 2026-09-07: the chain recorder at 09:10 (launchd), and the NSE half of
@@ -28,6 +39,38 @@ happened, so the run's own history reads as continuous when it is not.
 
 Then: tick-level dispatch, if ever wanted (it would need a contract
 change), and the post-tax P&L lens.
+
+---
+
+## Phase 3.5 — crypto perpetuals (tasks 1 and 2 shipped 2026-09-05)
+
+Design: `docs/superpowers/specs/2026-09-05-crypto-perpetuals-design.md`.
+A separate derivative core beside spot, not a flag on it: spot keeps its
+`ck_no_negative_position`, its notional cash model and its charge model,
+all untouched.
+
+**Task 1 — contracts.** Eight USDT-margined perpetuals seeded as
+`PERP / BINANCE_FUTURES / PERP` with fetched filters. `AssetClass.PERP` is
+distinct because `load_schedules` and `_BROKER_BY_ASSET_CLASS` key on it —
+reusing CRYPTO would silently apply spot's 10 bps to a perpetual fill.
+`perp_contract_specs` is dated like `charge_schedules`. Filters vary far
+more than anyone would guess: DOGE steps by a whole coin, BTC by 0.001,
+min notionals run 5 / 20 / 50.
+
+**Task 2 — data.** 18,895 daily bars from 2019-09-08 and 56,734 funding
+settlements. Live marks and closed 1-minute bars by **polling**, because
+the futures WebSocket is gated here: it connects, acks a SUBSCRIBE, and
+sends nothing, while spot streams instantly and futures REST answers 200.
+One `premiumIndex` call covers all 898 contracts.
+
+**Worth not relearning:** BTC's mean funding over seven years is
+0.0001059 per settlement — about **11.6% a year a long pays a short**.
+That is the number whose omission makes every carry strategy backtest as
+free money. And Binance's last kline is the interval still open: taking it
+is lookahead arriving through the live feed.
+
+**Not tradeable yet.** No charge schedule and no margin tiers, so an order
+is refused at submission. That is task 3 onward.
 
 ---
 

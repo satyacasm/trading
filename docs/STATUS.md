@@ -1,19 +1,26 @@
 # Where this project stands
 
-**Updated:** 2026-09-05, ~10:05 IST. Keep this file current — it is the
+**Updated:** 2026-09-05, ~10:55 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
 
 ## The one thing to do next
 
-**Regenerate the Upstox access token, then prove an NSE live run.** The
-bar-delivery fix below is verified by tests and by a container test, but
-never by real NSE data: the feed has produced nothing since 15:28 IST on
-2026-09-04, so no `bars:*` message has exercised the new publish in
-production. Until a token is in place that cannot be checked.
+**Watch Monday morning.** Two things run unattended for the first time on
+2026-09-07: the chain recorder at 09:10 (launchd), and the NSE half of
+live bar delivery once real `bars:*` messages start flowing. Both are
+verified by tests and by an out-of-hours smoke run; neither has yet seen a
+trading session.
 
-Then: **restart/resume across supervisor death.** A supervisor restart relaunches
+Then: **the news/announcements recorder**, which is on the same
+irrecoverable clock as the chain recorder and has never been built at all.
+Then **restart/resume across supervisor death**.
+
+**Not a blocker, but wrong:** EOD bhavcopy ingestion last wrote on
+2026-08-21. Nothing is scheduled to run it. The chain recorder no longer
+depends on it (it anchors on Upstox's index close instead), but every
+backtest is running against a database two weeks stale. A supervisor restart relaunches
 every `RUNNING` row, which is right for the row and wrong for the strategy:
 the container is new, so whatever the strategy held in memory is gone and
 its next bar looks like its first. Nothing in `live_runs` records that this
@@ -21,6 +28,47 @@ happened, so the run's own history reads as continuous when it is not.
 
 Then: tick-level dispatch, if ever wanted (it would need a contract
 change), and the post-tax P&L lens.
+
+---
+
+## The option-chain recorder — running daily from 2026-09-05 (merged)
+
+Fires 09:10 on weekdays via launchd
+(`deploy/install-chain-recorder.sh`); the exchange calendar decides
+whether to record, so holidays are a quiet exit-0 rather than a second
+copy of the holiday list. Records raw frames to `data/recordings` for
+NIFTY and BANKNIFTY, 2 expiries, ±20 strikes -- 330 keys, well inside the
+feed's cap.
+
+**Why it had never run:** it demanded a literal list of Upstox instrument
+keys, and nothing here could produce one. Our options carry symbols,
+strikes and expiries; the feed speaks `NSE_FO|50917`. It now resolves its
+own universe from Upstox's public instrument dump (no auth, archived like
+any other source).
+
+**The ATM anchor is Upstox's index close**, with the nearest futures close
+as fallback. Those differed by 493 NIFTY points -- ten strikes -- the day
+this was written, because EOD ingestion is stale; a window centred on the
+futures close would have covered only ten strikes below the money. A stale
+anchor is logged as a warning.
+
+**Two bugs it only found by running.** The loop checked its deadline only
+when a frame arrived, so a quiet feed held it open forever -- invisible on
+a trading day, a stuck process per day under a scheduler. And a run
+starting after 15:30 recorded five minutes of a shut market, which is what
+a laptop opened in the evening would do every single night.
+
+**Worth not relearning:** measure the strike step from the data. NIFTY
+steps 50 and BANKNIFTY 100 *today*; an assumed constant does not fail
+loudly when that changes, it silently records a narrower window. And
+launchd, not cron, on a laptop: a missed `StartCalendarInterval` job runs
+on wake, so a morning spent asleep is a partial recording rather than
+none.
+
+**Verified:** 45 seconds against the live feed on a closed Saturday
+captured 70 frames, no gaps, no anomalies, clean exit on deadline; and
+launchd fired the agent end-to-end (venv, `.env`, database, calendar,
+exit 0).
 
 ---
 

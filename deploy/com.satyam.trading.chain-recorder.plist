@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Daily option-chain recorder (macOS).
+
+  launchd rather than cron because this runs on a laptop that sleeps: a
+  StartCalendarInterval job missed while asleep runs when the machine wakes,
+  where a cron job simply never happens. A morning spent shut is then a
+  partial recording instead of no recording.
+
+  Fired every weekday. The exchange calendar decides whether today is
+  actually a trading day -- encoding holidays here as well would be a second
+  copy of that knowledge, and it would drift.
+
+  Install with deploy/install-chain-recorder.sh, which substitutes __REPO__.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.satyam.trading.chain-recorder</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO__/.venv/bin/python</string>
+    <string>-m</string>
+    <string>trading.recorder</string>
+  </array>
+
+  <!-- The token, the database URL and the archive roots all come from
+       .env, which pydantic-settings reads relative to the working
+       directory. No secret is duplicated into this file. -->
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>10</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>10</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>10</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>10</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>10</integer></dict>
+  </array>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>__REPO__/logs/chain_recorder.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO__/logs/chain_recorder.log</string>
+
+  <!-- The session runs to 15:30 IST; nothing here should be killed for
+       being idle during a quiet hour. -->
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
+</dict>
+</plist>

@@ -1,0 +1,103 @@
+[
+  {
+    "symbol": "BTCUSDT",
+    "brackets": [
+      {
+        "bracket": 1,
+        "initialLeverage": 150,
+        "notionalCap": 300000,
+        "notionalFloor": 0,
+        "maintMarginRatio": 0.004,
+        "cum": 0.0
+      },
+      {
+        "bracket": 2,
+        "initialLeverage": 100,
+        "notionalCap": 800000,
+        "notionalFloor": 300000,
+        "maintMarginRatio": 0.005,
+        "cum": 300.0
+      },
+      {
+        "bracket": 3,
+        "initialLeverage": 75,
+        "notionalCap": 3000000,
+        "notionalFloor": 800000,
+        "maintMarginRatio": 0.0065,
+        "cum": 1500.0
+      },
+      {
+        "bracket": 4,
+        "initialLeverage": 50,
+        "notionalCap": 12000000,
+        "notionalFloor": 3000000,
+        "maintMarginRatio": 0.01,
+        "cum": 12000.0
+      },
+      {
+        "bracket": 5,
+        "initialLeverage": 25,
+        "notionalCap": 70000000,
+        "notionalFloor": 12000000,
+        "maintMarginRatio": 0.02,
+        "cum": 132000.0
+      },
+      {
+        "bracket": 6,
+        "initialLeverage": 20,
+        "notionalCap": 100000000,
+        "notionalFloor": 70000000,
+        "maintMarginRatio": 0.025,
+        "cum": 482000.0
+      },
+      {
+        "bracket": 7,
+        "initialLeverage": 10,
+        "notionalCap": 230000000,
+        "notionalFloor": 100000000,
+        "maintMarginRatio": 0.05,
+        "cum": 2982000.0
+      },
+      {
+        "bracket": 8,
+        "initialLeverage": 5,
+        "notionalCap": 480000000,
+        "notionalFloor": 230000000,
+        "maintMarginRatio": 0.1,
+        "cum": 14482000.0
+      },
+      {
+        "bracket": 9,
+        "initialLeverage": 4,
+        "notionalCap": 600000000,
+        "notionalFloor": 480000000,
+        "maintMarginRatio": 0.125,
+        "cum": 26482000.0
+      },
+      {
+        "bracket": 10,
+        "initialLeverage": 3,
+        "notionalCap": 800000000,
+        "notionalFloor": 600000000,
+        "maintMarginRatio": 0.15,
+        "cum": 41482000.0
+      },
+      {
+        "bracket": 11,
+        "initialLeverage": 2,
+        "notionalCap": 1200000000,
+        "notionalFloor": 800000000,
+        "maintMarginRatio": 0.25,
+        "cum": 121482000.0
+      },
+      {
+        "bracket": 12,
+        "initialLeverage": 1,
+        "notionalCap": 1800000000,
+        "notionalFloor": 1200000000,
+        "maintMarginRatio": 0.5,
+        "cum": 421482000.0
+      }
+    ]
+  }
+]

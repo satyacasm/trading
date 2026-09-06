@@ -1,6 +1,6 @@
 # Where this project stands
 
-**Updated:** 2026-09-06, ~14:30 IST. Keep this file current — it is the
+**Updated:** 2026-09-06, ~16:35 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
@@ -98,11 +98,32 @@ bankruptcy cap, not liquidation.
 the way Task 12 graded charges against Upstox's. Internal consistency is
 necessary, not sufficient.
 
-**Left in the phase:** task 6 (contract and runtime -- manifest leverage,
-short orders from a strategy, `ctx.data` funding series) and task 7
-(perp-aware backtesting, funding and liquidation in the report). Nothing
-perpetual reaches a strategy yet; everything so far is the engine and the
-manual order path.
+**Task 6 — contract and runtime.** `StrategyManifest.leverage`, declared
+once per strategy, travelling manifest -> payload -> `LiveRun` -> order
+body. `None` when absent, never 1: defaulting would make every
+pre-existing strategy a perpetual trader.
+
+**Task 7 — perpetuals can be backtested, with carry.** A strategy that
+shorts BTC-USDT perpetual on daily bars at 3x passes smoke, registers,
+and backtests over 964 sessions. The runtime models perpetual money:
+cash moves on realised P&L rather than notional, equity counts
+`qty x (mark - entry)`, and funding settles at every eight-hour boundary
+a step crosses, each at its own published rate.
+
+**The number that justifies the phase:** the same 2024-2026 short, run
+with and without funding, differs by **+5,268.98 on 100,000 -- 5.27% of
+the book over 2.6 years.** Without it the backtest understates a short's
+return by that much, and overstates a long's by the same.
+
+**Worth not relearning:** three `SmokePayload`s are constructed in
+`smoke.py` -- smoke, backtest, and the stress rerun -- and wiring one is
+wiring none. The first attempt applied funding in the smoke path only,
+so the backtest ran against 2,889 published settlements and used zero of
+them, producing a number identical to funding being switched off.
+
+**Still open in task 7:** liquidation inside a backtest (the arithmetic
+and the per-bar check exist; the tiers are not yet in the payload), and
+the report surfacing funding P&L and liquidation events beside cost drag.
 
 ---
 

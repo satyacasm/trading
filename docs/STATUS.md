@@ -1,6 +1,6 @@
 # Where this project stands
 
-**Updated:** 2026-09-06, ~17:30 IST. Keep this file current — it is the
+**Updated:** 2026-09-06, ~18:05 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
@@ -148,9 +148,29 @@ listeners, with a gateway from hours earlier still answering.
 failed to bind and been ignored. Check what owns the port before
 doubting the code.
 
-**Still open in task 7:** the report surfacing funding P&L and
-liquidation events beside cost drag. The numbers are computed and carried
-on `RunOutcome`; persistence, the API and the UI do not yet show them.
+**The report shows both** (0024). Funding lives apart from charges
+because it is not one -- inside a cost total it could only read as an
+expense, erasing the income half of every carry strategy. The column
+negates the stored sign for display: the database stores what the run
+*paid*, and a reader of a P&L column expects a gain to be positive.
+
+A liquidation names what was left of the margin and the requirement it
+fell below, and says when the fill was capped at the bankruptcy price.
+"Liquidated" alone says something happened; the two numbers say why,
+which is the question somebody has in March about a position that
+vanished in January. The section renders only for runs that have them, so
+every equity backtest looks exactly as it did.
+
+**Phase 3.5 is complete.** All seven tasks shipped.
+
+**The lesson of the phase, five times over:** an additive field only
+exists where somebody remembers to add it. `perp` missing from the
+sandbox copy list, `leverage` missing from `_describe_manifest`, funding
+wired into one of three payload sites, and API fields landing on
+`BacktestResponse` because `fills_ledger` appears in two models and the
+edit matched the first. Every one passed the whole unit suite. The guards
+that now catch these are the transitive image check and comparing two
+runs numerically rather than trusting that code is called.
 
 ---
 

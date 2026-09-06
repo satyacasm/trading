@@ -1417,6 +1417,9 @@ def backtest(
         window=window,
         bars=bars,
         charge_schedules=tuple(schedules),
+        perp_instruments=_perp_instruments(conn, instrument_ids),
+        funding_rates=_funding_rates(conn, instrument_ids, window),
+        leverage=_manifest_leverage(record.manifest or {}),
         # The caller's capital when given, else what the strategy declared.
         # An operator asking "what would this have done with 50,000?" is
         # asking a different question from the one the manifest answers, and
@@ -1451,6 +1454,12 @@ def backtest(
                 window=window,
                 bars=bars,
                 charge_schedules=stress_schedules(schedules),
+                # The same perpetuals and the same carry: the stress pass
+                # changes costs and slippage, and changing what the position
+                # *is* would measure two things at once.
+                perp_instruments=payload.perp_instruments,
+                funding_rates=payload.funding_rates,
+                leverage=payload.leverage,
                 starting_cash=payload.starting_cash,
                 slippage_bps=payload.slippage_bps * STRESS_MULTIPLIER,
                 dispatch_from=plan.dispatch_from,

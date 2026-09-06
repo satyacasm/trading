@@ -99,6 +99,21 @@ def quantize_money(value: Decimal) -> Decimal:
     return value.quantize(_MONEY_DP, rounding=ROUND_HALF_UP)
 
 
+class ConflictingLeverage(Exception):
+    """An order would add to an open perpetual at a different leverage.
+
+    Refused rather than resolved. Keeping the position's leverage would
+    reserve an amount this order's own leverage never implied; adopting
+    the order's would move the liquidation price of exposure the trader
+    took under different terms; averaging the two would invent a number
+    no exchange uses and neither order asked for.
+
+    Closing is exempt -- releasing margin does not need to agree about
+    leverage, and refusing there would leave a trader unable to exit
+    because of a value in a box that no longer matters.
+    """
+
+
 class MissingLeverage(Exception):
     """A perpetual fill reached the ledger with no leverage on its order.
 
@@ -253,11 +268,30 @@ def _perp_state(conn: Connection, order: Order) -> tuple[PerpPosition, Decimal, 
         (order.portfolio_id, order.instrument_id),
     ).fetchone()
     leverage = _order_leverage(conn, order)
-    if row is None:
+    if row is None or row[0] == 0:
+        # No open position -- a flat row is not one. This order opens a new
+        # position and brings its own leverage.
         return PerpPosition(Decimal("0"), Decimal("0"), leverage), Decimal("0"), leverage
-    # An existing position keeps the leverage it was opened at; a later
-    # order cannot silently re-lever exposure already taken.
-    return PerpPosition(row[0], row[1], row[2]), row[3], row[2]
+
+    held, entry, open_leverage, realised = row
+    signed = order.quantity if order.side is Side.BUY else -order.quantity
+    increasing = (held > 0) == (signed > 0)
+    if increasing and leverage != open_leverage:
+        raise ConflictingLeverage(
+            f"this order is at {leverage}x and the open {order.instrument_id} position is at "
+            f"{open_leverage}x. A position has one leverage: close it first, or place this "
+            f"order at {open_leverage}x."
+        )
+    # Reducing or reversing. The leverage that governs the *result* is the
+    # open position's while any of it survives, and this order's once the
+    # fill crosses through flat -- what is left then is new exposure at
+    # this order's price, so it is margined on this order's terms.
+    crosses = not increasing and abs(signed) > abs(held)
+    return (
+        PerpPosition(held, entry, open_leverage),
+        realised,
+        leverage if crosses else open_leverage,
+    )
 
 
 def _order_leverage(conn: Connection, order: Order) -> Decimal:
@@ -312,6 +346,11 @@ def _apply_perp_position(conn: Connection, order: Order, decision: FillDecision)
         " VALUES (%s,%s,%s,%s,%s,%s,%s)"
         " ON CONFLICT (portfolio_id, instrument_id) DO UPDATE SET"
         "   quantity = EXCLUDED.quantity, entry_price = EXCLUDED.entry_price,"
+        # Updated, not left alone: a fill that crosses through flat opens a
+        # new position at this order's leverage, and a row that kept the
+        # old one would margin the new exposure on terms the trader chose
+        # for a position that no longer exists.
+        "   leverage = EXCLUDED.leverage,"
         "   reserved_margin = EXCLUDED.reserved_margin,"
         "   realised_pnl = perp_positions.realised_pnl + %s",
         (

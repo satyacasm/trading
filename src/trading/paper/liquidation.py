@@ -27,6 +27,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 from uuid import uuid4
 
 import structlog
@@ -44,6 +45,7 @@ from trading.paper.perp import (
     PerpPosition,
     Tier,
     bankruptcy_price,
+    cross_margin_breach,
     liquidation_price,
     maintenance_margin,
     position_equity,
@@ -55,6 +57,7 @@ log = structlog.get_logger(__name__)
 
 __all__ = [
     "Liquidated",
+    "cross_margin_breach",
     "bankruptcy_price",
     "liquidate_open_positions",
     "liquidation_price",
@@ -81,7 +84,7 @@ class Liquidated:
 
 _OPEN_PERPS = """
     SELECT p.portfolio_id, p.instrument_id, p.quantity, p.entry_price, p.leverage,
-           p.reserved_margin, f.cash_balance
+           p.reserved_margin, f.cash_balance, f.margin_mode
     FROM perp_positions p
     JOIN portfolios f ON f.portfolio_id = p.portfolio_id
     WHERE p.quantity <> 0 AND f.status = 'ACTIVE'
@@ -91,6 +94,45 @@ _TIERS = """
     SELECT notional_floor, notional_cap, maintenance_rate, maintenance_amount
     FROM perp_margin_tiers WHERE instrument_id = %s ORDER BY notional_floor
 """
+
+
+def _cross_breaches(
+    conn: Connection,
+    rows: Sequence[tuple[Any, ...]],
+    marks: Mapping[int, Decimal],
+) -> set[int]:
+    """Which cross-margined accounts can no longer cover their positions.
+
+    Their equity is cash plus every position's unrealised, because in
+    cross the whole balance stands behind everything. When that falls
+    below the summed maintenance, every position in the account is
+    liquidated -- which is the risk cross buys its extra room with.
+    """
+    by_account: dict[int, list[tuple[PerpPosition, Decimal, Sequence[Tier]]]] = {}
+    cash_by_account: dict[int, Decimal] = {}
+    for row in rows:
+        portfolio_id, instrument_id, quantity, entry, leverage, _margin, cash, mode = row
+        if mode != "CROSS":
+            continue
+        mark = marks.get(instrument_id)
+        if mark is None:
+            continue
+        tiers = [tuple(t) for t in conn.execute(_TIERS, (instrument_id,)).fetchall()]
+        if not tiers:
+            continue
+        by_account.setdefault(portfolio_id, []).append(
+            (PerpPosition(quantity, entry, leverage), mark, tiers)
+        )
+        cash_by_account[portfolio_id] = Decimal(cash)
+
+    breached: set[int] = set()
+    for portfolio_id, positions in by_account.items():
+        equity = cash_by_account[portfolio_id] + sum(
+            (unrealised_pnl(p, mark=m) for p, m, _t in positions), Decimal("0")
+        )
+        if cross_margin_breach(account_equity=equity, positions=positions):
+            breached.add(portfolio_id)
+    return breached
 
 
 def _liquidation_fee_rate(conn: Connection, instrument_id: int) -> Decimal:
@@ -124,16 +166,28 @@ def liquidate_open_positions(
     """
     from trading.paper.ledger import apply_fill  # circular at module scope
 
+    open_rows = conn.execute(_OPEN_PERPS).fetchall()
+    # Cross-margined accounts are judged whole: the account's equity against
+    # the sum of every position's maintenance. A per-position check cannot
+    # see the case that actually kills a cross account, which is meeting
+    # each requirement separately and none of them together.
+    breached_accounts = _cross_breaches(conn, open_rows, marks)
+
     closed: list[Liquidated] = []
-    for row in conn.execute(_OPEN_PERPS).fetchall():
-        portfolio_id, instrument_id, quantity, entry_price, leverage, margin, cash = row
+    for row in open_rows:
+        portfolio_id, instrument_id, quantity, entry_price, leverage, margin, cash, mode = row
         mark = marks.get(instrument_id)
         if mark is None:
             continue
 
         position = PerpPosition(quantity, entry_price, leverage)
         tiers = [tuple(t) for t in conn.execute(_TIERS, (instrument_id,)).fetchall()]
-        if not tiers or not should_liquidate(position, margin=margin, mark=mark, tiers=tiers):
+        if not tiers:
+            continue
+        if mode == "CROSS":
+            if portfolio_id not in breached_accounts:
+                continue
+        elif not should_liquidate(position, margin=margin, mark=mark, tiers=tiers):
             continue
 
         # Cap the fill at bankruptcy: past it the position has consumed

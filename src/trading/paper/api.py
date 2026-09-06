@@ -63,7 +63,7 @@ import json
 from collections.abc import Sequence
 from datetime import date
 from decimal import Decimal
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import redis
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -103,7 +103,7 @@ _TERMINAL_ORDER_STATUSES = frozenset(
 
 _PORTFOLIO_COLUMNS = (
     "portfolio_id, user_id, name, base_currency, initial_capital,"
-    " cash_balance, status, max_daily_loss, max_drawdown_pct"
+    " cash_balance, status, max_daily_loss, max_drawdown_pct, margin_mode"
 )
 _ORDER_COLUMNS = (
     "order_id, portfolio_id, instrument_id, side, order_type, quantity,"
@@ -119,6 +119,11 @@ class CreatePortfolioRequest(BaseModel):
     base_currency: str = "INR"
     max_daily_loss: Decimal | None = None
     max_drawdown_pct: Decimal | None = None
+    # ISOLATED backs each perpetual with the margin posted for it and
+    # nothing else; CROSS backs every position with the whole balance.
+    # Isolated is the default because the most it can cost is what was put
+    # behind one position, which is the safer thing to learn on.
+    margin_mode: Literal["ISOLATED", "CROSS"] = "ISOLATED"
 
 
 class CreateOrderRequest(BaseModel):
@@ -167,6 +172,7 @@ def _portfolio_from_row(row: Sequence[Any]) -> Portfolio:
         portfolio_status,
         max_daily_loss,
         max_drawdown_pct,
+        margin_mode,
     ) = row
     return Portfolio(
         portfolio_id=portfolio_id,
@@ -178,6 +184,7 @@ def _portfolio_from_row(row: Sequence[Any]) -> Portfolio:
         status=portfolio_status,
         max_daily_loss=max_daily_loss,
         max_drawdown_pct=max_drawdown_pct,
+        margin_mode=margin_mode,
     )
 
 
@@ -372,6 +379,28 @@ def _require_perp_order_is_tradable(
             detail=f"notional {notional} is below the contract minimum of {min_notional}",
         )
 
+    # Refused at submission rather than at fill time. The engine raises the
+    # same conflict, but by then the order is in the book and the trader
+    # learns about it from a rejection reason instead of from the ticket
+    # they are still looking at.
+    open_row = conn.execute(
+        "SELECT quantity, leverage FROM perp_positions"
+        " WHERE portfolio_id = %s AND instrument_id = %s",
+        (body.portfolio_id, body.instrument_id),
+    ).fetchone()
+    if open_row is not None and open_row[0] != 0:
+        held, open_leverage = open_row
+        increasing = (held > 0) == (body.side is Side.BUY)
+        if increasing and body.leverage != open_leverage:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"this order is at {body.leverage}x and the open position is at "
+                    f"{open_leverage}x. A position has one leverage: close it first, or "
+                    f"place this order at {open_leverage}x."
+                ),
+            )
+
     tiers = conn.execute(_MAX_LEVERAGE, (body.instrument_id,)).fetchall()
     if not tiers:
         raise HTTPException(
@@ -446,8 +475,8 @@ def create_portfolio(
         row = conn.execute(
             "INSERT INTO portfolios"
             " (user_id, name, base_currency, initial_capital, cash_balance,"
-            "  max_daily_loss, max_drawdown_pct)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            "  max_daily_loss, max_drawdown_pct, margin_mode)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
             f" RETURNING {_PORTFOLIO_COLUMNS}",
             (
                 body.user_id,
@@ -457,6 +486,7 @@ def create_portfolio(
                 body.initial_capital,
                 body.max_daily_loss,
                 body.max_drawdown_pct,
+                body.margin_mode,
             ),
         ).fetchone()
     except UniqueViolation as exc:
@@ -730,9 +760,7 @@ def perp_positions(
                 realised_pnl=str(realised),
                 funding_paid=str(funding),
                 mark=None if mark is None else str(mark),
-                unrealised_pnl=(
-                    None if mark is None else str(unrealised_pnl(position, mark=mark))
-                ),
+                unrealised_pnl=(None if mark is None else str(unrealised_pnl(position, mark=mark))),
                 liquidation_price=None if liquidation is None else str(liquidation),
             )
         )

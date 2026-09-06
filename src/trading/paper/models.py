@@ -200,6 +200,10 @@ class Portfolio(BaseModel):
     status: str
     max_daily_loss: Decimal | None
     max_drawdown_pct: Decimal | None
+    # How perpetuals in this portfolio are margined. Defaulted so every
+    # caller that builds a Portfolio by hand keeps working, and so a row
+    # written before 0025 reads as what it actually was.
+    margin_mode: str = "ISOLATED"
 
     @field_serializer("initial_capital", "cash_balance")
     def _money_as_number(self, v: Decimal) -> float:

@@ -317,15 +317,6 @@ class BacktestResponse(BaseModel):
     # Every fill with its charges itemised. The list route carries neither
     # this nor the curve, for the same reason.
     fills_ledger: list[dict[str, Any]] = []
-    # What the run paid (positive) or was paid (negative) in funding, per
-    # instrument. Separate from the cost report on purpose: funding is a
-    # signed transfer, not a charge, and folding it into cost drag would
-    # make an income stream read as an expense.
-    funding: list[dict[str, Any]] = []
-    # Positions the exchange closed, each naming the mark and the
-    # maintenance requirement its equity fell below. Empty for every
-    # non-perpetual run, which is most of them.
-    liquidations: list[dict[str, Any]] = []
     findings: list[FindingOut] = []
     # Approximations worth knowing about -- a charge schedule that does
     # not reach back to the window's start, say. Not refusals: the run
@@ -460,6 +451,15 @@ class BacktestDetail(BacktestSummary):
     # this nor the curve, for the same reason: a history table would drag
     # every fill of every run behind it.
     fills_ledger: list[dict[str, Any]] = []
+    # What the run paid (positive) or was paid (negative) in funding, per
+    # instrument. Separate from the cost report on purpose: funding is a
+    # signed transfer, not a charge, and folding it into cost drag would
+    # make an income stream read as an expense.
+    funding: list[dict[str, Any]] = []
+    # Positions the exchange closed, each naming the mark and the
+    # maintenance requirement its equity fell below. Empty for every
+    # non-perpetual run, which is most of them.
+    liquidations: list[dict[str, Any]] = []
     # Computed on read from the curve, never stored: a stored metric is a
     # second source of truth that can drift from the series it came from,
     # and recomputing means a corrected metric applies retroactively to

@@ -15,7 +15,11 @@ set -euo pipefail
 rm -rf sandbox/trading
 mkdir -p sandbox/trading/paper sandbox/trading/runtime sandbox/trading/agent_contract sandbox/trading/live
 touch sandbox/trading/__init__.py sandbox/trading/agent_contract/__init__.py
-cp src/trading/paper/{__init__,enums,models,fills,charges,breaker}.py sandbox/trading/paper/
+# `perp` is here because `breaker` imports it: equity now has a perpetual
+# term, and a module the image is missing fails at import time inside the
+# container, where the default test run cannot see it (the sandbox suite is
+# marker-excluded). That is how this list silently went stale once already.
+cp src/trading/paper/{__init__,enums,models,fills,charges,breaker,perp}.py sandbox/trading/paper/
 cp src/trading/runtime/*.py sandbox/trading/runtime/
 # The live wire protocol: the runner's live mode speaks it, and it must
 # be the same file the supervisor speaks so the two cannot drift.

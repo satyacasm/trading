@@ -200,6 +200,58 @@ somebody a rejection:
   have no charge schedule, and an order in an asset class with no cost
   model is refused at submission rather than filled at a cost of zero.
 
+### Perpetual futures (leverage and shorting)
+
+The one place this platform lets a strategy hold a **negative** position.
+Everything else here is long-only by construction: a spot sell can only
+reduce something already held, and the database refuses a negative
+quantity. A perpetual inverts that -- the sell *is* the position.
+
+```python
+StrategyManifest(
+    name="funding-carry",
+    version="1.0.0",
+    universe=[InstrumentRef(exchange="BINANCE_FUTURES", segment="PERP", symbol="BTC-USDT")],
+    data=DataRequest(bars="1m", history_bars=20),
+    capital=Decimal("100000"),
+    base_currency="USDT",
+    leverage=Decimal("5"),        # REQUIRED for a perpetual, forbidden otherwise
+)
+```
+
+`leverage` is declared once for the strategy, not per order and not per
+instrument: one strategy holds one portfolio in one currency and one asset
+class (D6). Omit it and every perpetual order is refused -- the platform
+will not assume one, because leverage decides how much margin the position
+locks up.
+
+Four things a perpetual does that nothing else here does:
+
+- **A sell with no position opens a short.** `ctx.order(..., side="SELL")`
+  is how you go short; there is no separate call and no "short" flag.
+- **Opening costs no cash.** Margin is *reserved*, not spent. Cash moves
+  on realised P&L, fees, and funding. Your equity reflects
+  `quantity x (mark - entry)`, signed -- a short gains as the mark falls.
+- **Funding settles every eight hours**, at 00:00, 08:00 and 16:00 UTC.
+  When the rate is positive longs pay shorts; when it is negative the flow
+  reverses. It is charged on notional, not on margin, so leverage
+  multiplies it. BTC-USDT's mean rate across 2019-2026 is 0.0001059 per
+  settlement -- roughly 11.6% a year that a long pays. A strategy that
+  holds a levered long through a bull market pays this three times a day.
+- **A position can be liquidated.** If what is left of the margin falls
+  below the exchange's maintenance requirement, the position is closed at
+  the mark, a 1.25% fee is charged, and the run continues. At 20x,
+  bankruptcy is 5% from entry and liquidation about 0.4% inside that.
+  Liquidation is **not** a circuit-breaker halt: the breaker pauses your
+  portfolio, a liquidation closes one position.
+
+**What is not yet wired.** `ctx.portfolio` does not report perpetual
+positions -- the runtime's own position model is still spot-only, so a
+strategy must track its own exposure in `ctx.state`. Perpetuals also
+cannot be backtested yet, for the same reason and because crypto has no
+daily bars (§3). Both land together. Until then a perpetual strategy is a
+forward-running one.
+
 ### Circuit breaker
 
 If `max_daily_loss` or `max_drawdown_pct` is declared and breached, the

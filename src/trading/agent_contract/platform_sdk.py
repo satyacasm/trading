@@ -68,6 +68,19 @@ def _stub(what: str) -> NotOnThisPlatform:
     )
 
 
+def _require_positive(name: str, value: object) -> Decimal:
+    """A Decimal that is also above zero.
+
+    Leverage of zero is not "no leverage", it is a division by zero in the
+    margin calculation; negative leverage is not a direction, the sign of
+    the position is.
+    """
+    number = _require_decimal(name, value)
+    if number <= 0:
+        raise ValueError(f"{name} must be greater than zero, got {number}")
+    return number
+
+
 def _require_decimal(name: str, value: object) -> Decimal:
     """Money and quantities are Decimal end to end, never float.
 
@@ -215,6 +228,7 @@ class StrategyManifest:
         params: dict[str, Param] | None = None,
         max_daily_loss: Decimal | None = None,
         max_drawdown_pct: Decimal | None = None,
+        leverage: Decimal | None = None,
     ) -> None:
         self.name = name
         self.version = version
@@ -226,6 +240,16 @@ class StrategyManifest:
         self.max_daily_loss = (
             None if max_daily_loss is None else _require_decimal("max_daily_loss", max_daily_loss)
         )
+        # Declared once for the strategy, not per instrument: one strategy
+        # holds one portfolio in one currency and one asset class (D6), so
+        # a per-instrument mapping would be precise about something the
+        # platform will not let a strategy do anyway.
+        #
+        # None, never 1, when absent. `None` means "this strategy trades
+        # nothing levered", which is true of every strategy written before
+        # perpetuals existed; defaulting to 1 would quietly make each of
+        # them a perpetual trader.
+        self.leverage = None if leverage is None else _require_positive("leverage", leverage)
         self.max_drawdown_pct = (
             None
             if max_drawdown_pct is None

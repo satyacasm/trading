@@ -67,6 +67,11 @@ class SmokePayload:
     # certainly not zero, which would halt on the first loss.
     max_daily_loss: Decimal | None = None
     max_drawdown_pct: Decimal | None = None
+    # What the manifest declared. Carried through the payload because the
+    # supervisor needs it to place an order the gateway will accept, and a
+    # field the codec drops is a field the strategy declared and the
+    # platform never saw.
+    leverage: Decimal | None = None
 
 
 def _money(value: Decimal | None) -> str | None:
@@ -151,6 +156,7 @@ def encode_payload(payload: SmokePayload) -> bytes:
         ),
         "max_daily_loss": _money(payload.max_daily_loss),
         "max_drawdown_pct": _money(payload.max_drawdown_pct),
+        "leverage": _money(payload.leverage),
     }
     return gzip.compress(json.dumps(document, separators=(",", ":")).encode("utf-8"))
 
@@ -185,6 +191,7 @@ def decode_payload(raw: bytes) -> SmokePayload:
         max_daily_loss=(
             None if document.get("max_daily_loss") is None else Decimal(document["max_daily_loss"])
         ),
+        leverage=(None if document.get("leverage") is None else Decimal(document["leverage"])),
         max_drawdown_pct=(
             None
             if document.get("max_drawdown_pct") is None

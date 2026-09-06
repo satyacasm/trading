@@ -117,6 +117,11 @@ def _describe_manifest(manifest: Any) -> dict[str, Any] | None:
         "capital",
         "max_daily_loss",
         "max_drawdown_pct",
+        # Without this the platform never learns what leverage a strategy
+        # declared: it reaches `configure()` and stops there, so margin is
+        # reserved at 1x and a position that should have been liquidated
+        # runs to the end of the backtest untouched.
+        "leverage",
     ):
         value = getattr(manifest, name, None)
         if value is not None:

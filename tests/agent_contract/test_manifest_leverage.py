@@ -77,3 +77,26 @@ def test_an_absent_leverage_survives_the_round_trip_as_none() -> None:
         mode="smoke", source="x = 1\n", starting_cash=D("1"), slippage_bps=D("0")
     )
     assert decode_payload(encode_payload(payload)).leverage is None
+
+
+def test_the_serialised_manifest_carries_leverage() -> None:
+    """The manifest crosses back out of the container as a dict, and the
+    platform stores that. A field the serialiser drops is a field the
+    strategy declared and nothing downstream ever sees -- margin is then
+    reserved at 1x and a position that should have been liquidated runs
+    to the end of the backtest untouched, with no error anywhere.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location("_runner", root / "sandbox" / "runner.py")
+    assert spec is not None and spec.loader is not None
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+
+    serialised = runner._describe_manifest(_manifest(leverage=D("20")))
+    assert serialised is not None
+    assert serialised["leverage"] == "20"
+
+    assert "leverage" not in (runner._describe_manifest(_manifest()) or {})

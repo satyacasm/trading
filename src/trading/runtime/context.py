@@ -85,12 +85,28 @@ class LivePortfolioView(platform_sdk.PortfolioView):
 
     @property
     def equity(self) -> Decimal:
+        """Cash, plus spot marked to market, plus perpetual profit.
+
+            cash + SUM spot_qty x mark + SUM perp_qty x (mark - entry)
+
+        The two terms differ because the cash already did. Buying spot
+        moved cash by the full notional, so the position is worth
+        `quantity x mark`. Opening a perpetual moved no cash -- margin was
+        reserved, not spent -- so only the change since entry belongs
+        here. Using the spot formula on a perpetual would credit the run
+        with the whole position value out of nowhere, and for a short
+        subtract it from a book that is up.
+        """
         total = self._state.cash
         for position in self._state.positions.values():
             if position.quantity == 0:
                 continue
             mark = self._state.marks.get(position.instrument_id)
-            if mark is not None:
+            if mark is None:
+                continue
+            if position.instrument_id in self._state.perp_instruments:
+                total += position.quantity * (mark - position.avg_cost)
+            else:
                 total += position.quantity * mark
         return total
 

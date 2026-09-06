@@ -37,6 +37,22 @@ class RunState:
     # strictly below this, which is the whole anti-lookahead mechanism.
     cursor: dict[int, int] = field(default_factory=dict)
     marks: dict[int, Decimal] = field(default_factory=dict)
+    # Which instruments settle as derivatives. A set rather than a lookup,
+    # because the runtime has no database: the manifest resolution that
+    # built this run already knows, and passing it in keeps every money
+    # decision in here a pure function of state.
+    perp_instruments: set[int] = field(default_factory=set)
+    # Margin locked up per perpetual position. Not subtracted from `cash`
+    # -- reserved is not spent, and treating it as spent would make an
+    # open position look like a withdrawal.
+    reserved_margin: dict[int, Decimal] = field(default_factory=dict)
+    # What funding has cost (positive) or paid (negative) so far, per
+    # instrument. Kept apart from realised P&L because a carry strategy's
+    # whole return is this number and burying it in trading P&L would
+    # make the two indistinguishable in the report.
+    funding_paid: dict[int, Decimal] = field(default_factory=dict)
+    # Positions the exchange closed, for the report to name.
+    liquidations: list[dict[str, str]] = field(default_factory=list)
     bar_calls: int = 0
     next_order_id: int = 1
     day_open_equity: Decimal | None = None

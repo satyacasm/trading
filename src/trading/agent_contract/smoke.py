@@ -609,7 +609,39 @@ def resolve_universe(conn: Connection, manifest: dict[str, Any], as_of: date) ->
     return [row[0] for row in rows]
 
 
-_BROKER_FOR_ASSET_CLASS = {"EQUITY": "UPSTOX", "CRYPTO": "BINANCE"}
+_BROKER_FOR_ASSET_CLASS = {"EQUITY": "UPSTOX", "CRYPTO": "BINANCE", "PERP": "BINANCE"}
+
+
+def _perp_instruments(conn: Connection, instrument_ids: Sequence[int]) -> tuple[int, ...]:
+    """Which of this run's instruments settle as derivatives.
+
+    Resolved here, where there is a database, because the container has
+    none -- and whether an instrument is a perpetual decides how its fills
+    move cash.
+    """
+    rows = conn.execute(
+        "SELECT instrument_id FROM instruments"
+        " WHERE instrument_id = ANY(%s) AND asset_class = 'PERP'",
+        (list(instrument_ids),),
+    ).fetchall()
+    return tuple(int(r[0]) for r in rows)
+
+
+def _manifest_leverage(manifest: dict[str, Any]) -> Decimal | None:
+    raw = manifest.get("leverage")
+    return None if raw is None else Decimal(str(raw))
+
+
+def product_for_asset_class(asset_class: str) -> Product:
+    """Which product's charges price this asset class.
+
+    A perpetual is never delivered -- it has no expiry to deliver at -- so
+    its schedule is seeded under INTRADAY. Asking for DELIVERY finds
+    nothing and refuses a run the platform could have priced perfectly
+    well, which is a confusing way to learn that a contract has no
+    settlement date.
+    """
+    return Product.INTRADAY if asset_class == "PERP" else Product.DELIVERY
 
 
 class _MixedUniverse(Exception):
@@ -825,7 +857,7 @@ def smoke_test(
         broker,
         exchange,
         asset_class,
-        Product.DELIVERY,
+        product_for_asset_class(asset_class),
         datetime.fromisoformat(window["end"]).date(),
     )
     payload = SmokePayload(
@@ -837,6 +869,8 @@ def smoke_test(
         charge_schedules=tuple(schedules),
         starting_cash=Decimal(str(manifest.get("capital", "0"))),
         slippage_bps=Decimal("0"),
+        perp_instruments=_perp_instruments(conn, instrument_ids),
+        leverage=_manifest_leverage(manifest),
     )
     first = run_smoke_in_sandbox(payload, limits)
     second = run_smoke_in_sandbox(payload, limits)
@@ -1352,9 +1386,10 @@ def backtest(
             plan=plan,
         )
 
-    earliest = earliest_schedule_date(conn, broker, exchange, asset_class, Product.DELIVERY)
+    product = product_for_asset_class(asset_class)
+    earliest = earliest_schedule_date(conn, broker, exchange, asset_class, product)
     priced_on, charge_note = charge_lookup_date(end, earliest)
-    schedules = load_schedules(conn, broker, exchange, asset_class, Product.DELIVERY, priced_on)
+    schedules = load_schedules(conn, broker, exchange, asset_class, product, priced_on)
     payload = SmokePayload(
         mode=MODE_SMOKE,
         source=record.source,

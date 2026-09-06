@@ -70,3 +70,6 @@ class EntryType(StrEnum):
     # A perpetual's eight-hourly carry. Its own type, not a CHARGE: a
     # charge always costs the holder, and funding pays one side.
     FUNDING = "FUNDING"
+    # A perpetual the exchange closed. Distinct from a breaker halt: the
+    # breaker pauses a portfolio, this closes one position.
+    LIQUIDATION = "LIQUIDATION"

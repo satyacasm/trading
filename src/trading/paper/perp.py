@@ -28,6 +28,7 @@ __all__ = [
     "initial_margin",
     "maintenance_margin",
     "bankruptcy_price",
+    "cross_margin_breach",
     "liquidation_price",
     "position_equity",
     "settlements_between",
@@ -293,3 +294,31 @@ def bankruptcy_price(position: PerpPosition, *, margin: Decimal) -> Decimal | No
     if position.quantity > 0:
         return position.entry_price - per_unit
     return position.entry_price + per_unit
+
+
+def cross_margin_breach(
+    *,
+    account_equity: Decimal,
+    positions: Sequence[tuple[PerpPosition, Decimal, Sequence[Tier]]],
+) -> bool:
+    """Whether a cross-margined account can still meet its positions.
+
+    Cross margin backs every position with the whole balance rather than
+    with what was posted for each, so the test is one sum against one
+    number: total maintenance required, against the account's equity.
+
+    Summed, not checked per position, and that is the distinction. An
+    account can meet each position's requirement separately and still be
+    unable to meet them together -- exactly the case an isolated check
+    cannot see, and exactly how a cross account dies: not from one
+    position, from all of them at once.
+
+    Positions survive far deeper drawdowns this way. The price is that
+    when it does breach, everything is exposed rather than one position.
+    """
+    required = Decimal("0")
+    for position, mark, tiers in positions:
+        if position.is_flat:
+            continue
+        required += maintenance_margin(position.quantity, mark=mark, tiers=tiers)
+    return account_equity < required

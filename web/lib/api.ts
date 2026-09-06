@@ -84,6 +84,8 @@ export type Portfolio = {
   status: string;
   max_daily_loss: number | null;
   max_drawdown_pct: number | null;
+  /** How perpetuals here are margined. Spot is unaffected either way. */
+  margin_mode?: "ISOLATED" | "CROSS";
 };
 
 export type Position = {
@@ -186,6 +188,7 @@ export async function createPortfolio(body: {
   base_currency: string;
   max_daily_loss: string | null;
   max_drawdown_pct: string | null;
+  margin_mode?: "ISOLATED" | "CROSS";
 }): Promise<Portfolio> {
   const res = await fetch(`${API_URL}/portfolios`, {
     method: "POST",

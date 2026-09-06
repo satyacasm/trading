@@ -465,6 +465,7 @@ function NewPortfolioForm({
   const [currency, setCurrency] = useState("INR");
   const [maxDailyLoss, setMaxDailyLoss] = useState("");
   const [maxDrawdown, setMaxDrawdown] = useState("");
+  const [marginMode, setMarginMode] = useState<"ISOLATED" | "CROSS">("ISOLATED");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -485,6 +486,7 @@ function NewPortfolioForm({
         base_currency: currency,
         max_daily_loss: maxDailyLoss.trim() === "" ? null : maxDailyLoss,
         max_drawdown_pct: maxDrawdown.trim() === "" ? null : maxDrawdown,
+        margin_mode: marginMode,
       });
       setName("");
       onCreated(created);
@@ -565,7 +567,27 @@ function NewPortfolioForm({
             className="num bg-raised border border-line rounded px-2 py-1.5 text-sm"
           />
         </label>
+        <label className="col-span-2 flex flex-col gap-1.5 sm:col-span-1">
+          <span className="text-muted text-xs tracking-wide uppercase">Margin</span>
+          <select
+            value={marginMode}
+            onChange={(e) => setMarginMode(e.target.value as "ISOLATED" | "CROSS")}
+            className="bg-raised border-line rounded border px-2 py-1.5 text-sm"
+          >
+            <option value="ISOLATED">Isolated</option>
+            <option value="CROSS">Cross</option>
+          </select>
+        </label>
       </div>
+
+      <p className="text-muted text-xs">
+        <span className="text-text">Isolated</span> backs each perpetual with only the margin
+        posted for it: one position can be liquidated while the rest of the account carries on,
+        and the most it can cost is what was put behind it.{" "}
+        <span className="text-text">Cross</span> backs every position with the whole balance —
+        positions survive much deeper drawdowns, and when the account finally cannot cover its
+        total maintenance, all of them go at once. Spot is unaffected either way.
+      </p>
 
       <p className="text-muted text-xs">
         A portfolio holds one currency. The breaker pauses it and cancels resting orders if either

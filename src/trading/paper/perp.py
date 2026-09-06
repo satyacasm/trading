@@ -17,15 +17,22 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 __all__ = [
+    "SETTLEMENT_HOURS",
     "PerpPosition",
+    "funding_payment",
     "apply_perp_fill",
     "initial_margin",
     "maintenance_margin",
+    "settlements_between",
     "unrealised_pnl",
 ]
+
+# Binance settles funding at 00:00, 08:00 and 16:00 UTC.
+SETTLEMENT_HOURS = (0, 8, 16)
 
 # A maintenance tier: (notional_floor, notional_cap, rate, deduction).
 Tier = tuple[Decimal, Decimal, Decimal, Decimal]
@@ -147,3 +154,40 @@ def apply_perp_fill(
         return replace(position, quantity=remaining), realised
     # Crossed through flat: what is left is new exposure at the fill price.
     return replace(position, quantity=remaining, entry_price=price), realised
+
+
+def funding_payment(quantity: Decimal, *, mark: Decimal, rate: Decimal) -> Decimal:
+    """What the holder of `quantity` pays at this settlement.
+
+    Positive means the holder pays; negative means the holder is paid. One
+    signed expression covers all four cases -- long or short, rate positive
+    or negative -- because the sign of the position and the sign of the
+    rate multiply out exactly as the transfer does.
+
+    Charged on notional, not on margin. That is why leverage compounds a
+    carry cost: the same collateral carries a far larger funding bill.
+    """
+    return quantity * mark * rate
+
+
+def settlements_between(since: datetime, until: datetime) -> list[datetime]:
+    """Every settlement boundary in the half-open window `(since, until]`.
+
+    Half-open on purpose. A poll landing exactly on 08:00 must not settle a
+    boundary the previous poll's window already closed, and only
+    `(since, until]` makes a sequence of adjacent windows partition the
+    timeline rather than overlap at every edge.
+    """
+    if until < since:
+        raise ValueError(
+            f"funding window runs backwards: {since.isoformat()} to {until.isoformat()}; "
+            "a clock that moved back is worth hearing about, not silently settling nothing"
+        )
+    found: list[datetime] = []
+    cursor = since.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+    end = until.astimezone(UTC)
+    while cursor <= end:
+        if cursor.hour in SETTLEMENT_HOURS and cursor > since:
+            found.append(cursor)
+        cursor += timedelta(hours=1)
+    return found

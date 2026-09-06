@@ -52,7 +52,7 @@ stops -- no further bar is dispatched, no further fill occurs.
 from __future__ import annotations
 
 import traceback
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -64,6 +64,7 @@ from trading.paper.charges import compute_charges
 from trading.paper.enums import OrderStatus, Product, Side
 from trading.paper.fills import decide_fill
 from trading.paper.models import ChargeSchedule, Order, Position
+from trading.paper.perp import funding_payment, settlements_between
 from trading.runtime.context import SMOKE_PORTFOLIO_ID, LiveContext
 from trading.runtime.outcome import OrderSnapshot, RunOutcome
 from trading.runtime.provider import BarRecord, InMemoryBars
@@ -130,6 +131,74 @@ def _snapshot(order: Order) -> OrderSnapshot:
         status=str(order.status),
         submitted_at=order.submitted_at.isoformat(),
     )
+
+
+def settle_funding_for_step(
+    state: RunState,
+    *,
+    previous: datetime,
+    now: datetime,
+    rates: Mapping[int, Decimal],
+) -> None:
+    """Settle every funding boundary the step from `previous` to `now`
+    crossed.
+
+    Per step, not per bar, because a bar and a settlement are unrelated
+    clocks: a daily bar crosses three boundaries and a one-minute bar
+    crosses none most of the time. Settling once per bar would undercharge
+    daily carry by two thirds and overcharge minute carry by four hundred
+    and eighty.
+
+    The rate is charged on notional at the current mark, which is what the
+    exchange does -- funding is not a function of entry price, so a
+    position deep in profit pays on what it is worth now.
+    """
+    boundaries = settlements_between(previous, now)
+    if not boundaries:
+        return
+    for instrument_id, position in state.positions.items():
+        if instrument_id not in state.perp_instruments or position.quantity == 0:
+            continue
+        rate = rates.get(instrument_id)
+        mark = state.marks.get(instrument_id)
+        if rate is None or mark is None:
+            continue
+        paid = funding_payment(position.quantity, mark=mark, rate=rate) * len(boundaries)
+        state.cash -= paid
+        state.funding_paid[instrument_id] = (
+            state.funding_paid.get(instrument_id, Decimal("0")) + paid
+        )
+
+
+def apply_fill_cash(
+    state: RunState,
+    *,
+    instrument_id: int,
+    side: str,
+    quantity: Decimal,
+    price: Decimal,
+    charges: Decimal,
+    realised: Decimal,
+) -> None:
+    """Move cash for one fill, by the rule its asset class actually follows.
+
+    Spot moves by notional: buying hands over the money and selling
+    receives it. A perpetual moves by neither -- opening one reserves
+    margin rather than spending it, so cash changes only on what the fill
+    realised and what it cost. Crediting a perpetual short with its
+    notional would hand the run money it never received, which is the
+    single most flattering error available in this file.
+
+    Charges always leave, whichever side and whichever asset class.
+    """
+    if instrument_id in state.perp_instruments:
+        state.cash += realised - charges
+        return
+    notional = quantity * price
+    if side == "BUY":
+        state.cash -= notional + charges
+    else:
+        state.cash += notional - charges
 
 
 def _apply_position(state: RunState, order: Order, quantity: Decimal, price: Decimal) -> None:
@@ -349,11 +418,21 @@ def open_session(
                 )
                 if order.product is Product.DELIVERY and order.side is Side.SELL:
                     scrip_days.add(key)
-                notional = decision.quantity * decision.price
-                if order.side is Side.BUY:
-                    state.cash -= notional + breakdown.total
-                else:
-                    state.cash += notional - breakdown.total
+                before = state.positions.get(order.instrument_id)
+                _apply_position(state, order, decision.quantity, decision.price)
+                after = state.positions[order.instrument_id]
+                realised = after.realised_pnl - (
+                    Decimal("0") if before is None else before.realised_pnl
+                )
+                apply_fill_cash(
+                    state,
+                    instrument_id=order.instrument_id,
+                    side=order.side.value,
+                    quantity=decision.quantity,
+                    price=decision.price,
+                    charges=breakdown.total,
+                    realised=realised,
+                )
                 # Recorded here, where the breakdown still exists. One
                 # line later only `breakdown.total` survives, and the
                 # itemisation cannot be recovered from it.
@@ -391,7 +470,9 @@ def open_session(
                         "total_charges": str(breakdown.total.quantize(_MONEY_SCALE)),
                     }
                 )
-                _apply_position(state, order, decision.quantity, decision.price)
+                # The position was applied above, before the cash move --
+                # the realised amount a perpetual's cash depends on can
+                # only be known by applying it first.
                 filled = order.filled_quantity + decision.quantity
                 state.orders[order_id] = order.model_copy(
                     update={

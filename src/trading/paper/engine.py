@@ -125,6 +125,7 @@ from trading.paper.charges import (
 )
 from trading.paper.enums import OrderStatus, OrderType, Product, Side, TimeInForce
 from trading.paper.fills import decide_fill
+from trading.paper.funding import rates_at, settle_funding, settlements_between
 from trading.paper.ledger import OrderNoLongerFillable, apply_fill
 from trading.paper.ledger import quantize_money as quantize_fill_price
 from trading.paper.models import FillDecision, Order, Position
@@ -943,6 +944,7 @@ async def run_engine(
     sweep_check_seconds: float = 30.0,
     breaker_check_seconds: float = 5.0,
     reconcile_check_seconds: float = 5.0,
+    funding_check_seconds: float = 60.0,
     sleep: Sleeper = _default_sleep,
     max_ticks: int | None = None,
     pattern: str = _TICK_PATTERN,
@@ -1015,6 +1017,52 @@ async def run_engine(
             finally:
                 sweep_conn.close()
 
+    async def _periodic_funding() -> None:
+        """Settle every eight-hourly boundary this loop's window crossed.
+
+        Driven by the clock rather than by a bar, because a settlement
+        happens whether or not anything traded, and a position held
+        through a quiet night still owes it.
+
+        The window is `(last_checked, now]`, so a process that was asleep
+        across two boundaries settles both on waking rather than losing
+        one -- and adjacent windows never settle the same boundary twice.
+        """
+        last_checked = datetime.now(UTC)
+        while not done.is_set():
+            await sleep(funding_check_seconds)
+            now = datetime.now(UTC)
+            boundaries = settlements_between(last_checked, now)
+            last_checked = now
+            if not boundaries:
+                continue
+            funding_conn = conn_factory()
+            try:
+                for boundary in boundaries:
+                    instrument_ids = [
+                        row[0]
+                        for row in funding_conn.execute(
+                            "SELECT DISTINCT instrument_id FROM perp_positions WHERE quantity <> 0"
+                        ).fetchall()
+                    ]
+                    if not instrument_ids:
+                        continue
+                    settled = settle_funding(
+                        funding_conn, boundary, rates_at(funding_conn, boundary, instrument_ids)
+                    )
+                    funding_conn.commit()
+                    if settled.positions:
+                        log.info(
+                            "paper_engine.funding_settled",
+                            at=boundary.isoformat(),
+                            positions=settled.positions,
+                            total_paid=str(settled.total_paid),
+                        )
+            except Exception as exc:  # noqa: BLE001 - a funding failure must never kill the loop
+                log.warning("paper_engine.funding_failed", reason=str(exc))
+            finally:
+                funding_conn.close()
+
     async def _periodic_breaker_check() -> None:
         while not done.is_set():
             await sleep(breaker_check_seconds)
@@ -1046,9 +1094,12 @@ async def run_engine(
     sweep_task = asyncio.create_task(_periodic_sweep())
     breaker_task = asyncio.create_task(_periodic_breaker_check())
     reconcile_task = asyncio.create_task(_periodic_reconcile())
+    funding_task = asyncio.create_task(_periodic_funding())
     try:
         if max_ticks is None:
-            await asyncio.gather(tick_task, control_task, sweep_task, breaker_task, reconcile_task)
+            await asyncio.gather(
+                tick_task, control_task, sweep_task, breaker_task, reconcile_task, funding_task
+            )
         else:
             await done.wait()
     finally:
@@ -1057,6 +1108,7 @@ async def run_engine(
         sweep_task.cancel()
         breaker_task.cancel()
         reconcile_task.cancel()
+        funding_task.cancel()
         try:
             await tick_pubsub.punsubscribe()
             await tick_pubsub.aclose()  # type: ignore[no-untyped-call]

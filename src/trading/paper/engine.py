@@ -128,6 +128,7 @@ from trading.paper.fills import decide_fill
 from trading.paper.funding import rates_at, settle_funding, settlements_between
 from trading.paper.ledger import OrderNoLongerFillable, apply_fill
 from trading.paper.ledger import quantize_money as quantize_fill_price
+from trading.paper.liquidation import liquidate_open_positions
 from trading.paper.models import FillDecision, Order, Position
 from trading.streaming.models import Tick
 
@@ -936,6 +937,34 @@ def _handle_control_message(conn_factory: ConnFactory, book: OpenOrderBook, raw:
     book.add(order, meta)
 
 
+async def _current_marks(redis: Redis, conn: Connection) -> dict[int, Decimal]:
+    """The last mark the perpetual ingestor published, per open position.
+
+    Read from Redis rather than from a bar: the mark is not a traded price
+    and has no bar. `perp_ingestor` leaves the latest at `perp_mark:{id}`
+    precisely so a check waking between publishes has something to read --
+    pub/sub cannot answer "what is it now".
+
+    An instrument with no stored mark is absent from the result, and
+    `liquidate_open_positions` skips it: liquidating on a stale price is
+    worse than waiting for the next one, which is seconds away.
+    """
+    marks: dict[int, Decimal] = {}
+    rows = conn.execute(
+        "SELECT DISTINCT instrument_id FROM perp_positions WHERE quantity <> 0"
+    ).fetchall()
+    for (instrument_id,) in rows:
+        raw = await redis.get(f"perp_mark:{instrument_id}")
+        if raw is None:
+            continue
+        try:
+            payload = json.loads(raw)
+            marks[int(instrument_id)] = Decimal(str(payload["mark_price"]))
+        except (ValueError, KeyError, TypeError):
+            log.warning("paper_engine.mark_unreadable", instrument_id=instrument_id)
+    return marks
+
+
 async def run_engine(
     redis: Redis,
     conn_factory: ConnFactory,
@@ -945,6 +974,7 @@ async def run_engine(
     breaker_check_seconds: float = 5.0,
     reconcile_check_seconds: float = 5.0,
     funding_check_seconds: float = 60.0,
+    liquidation_check_seconds: float = 5.0,
     sleep: Sleeper = _default_sleep,
     max_ticks: int | None = None,
     pattern: str = _TICK_PATTERN,
@@ -1063,6 +1093,41 @@ async def run_engine(
             finally:
                 funding_conn.close()
 
+    async def _periodic_liquidation_check() -> None:
+        """Close positions the exchange would have closed.
+
+        On the mark, read from where the perpetual ingestor leaves it --
+        never on last traded price. The mark is index-derived and
+        deliberately resistant to one venue's wick; liquidating on a print
+        the mark never reached would report blow-ups that did not happen.
+
+        Runs on the breaker's cadence but is emphatically not the breaker:
+        that pauses a portfolio the platform is protecting from its own
+        strategy, this closes one position that ran out of collateral.
+        """
+        while not done.is_set():
+            await sleep(liquidation_check_seconds)
+            liquidation_conn = conn_factory()
+            try:
+                marks = await _current_marks(redis, liquidation_conn)
+                if not marks:
+                    continue
+                closed = liquidate_open_positions(liquidation_conn, marks, now=datetime.now(UTC))
+                liquidation_conn.commit()
+                for one in closed:
+                    log.warning(
+                        "paper_engine.liquidated",
+                        portfolio_id=one.portfolio_id,
+                        instrument_id=one.instrument_id,
+                        quantity=str(one.quantity),
+                        fill_price=str(one.fill_price),
+                        shortfall=str(one.shortfall),
+                    )
+            except Exception as exc:  # noqa: BLE001 - must never kill the loop
+                log.warning("paper_engine.liquidation_failed", reason=str(exc))
+            finally:
+                liquidation_conn.close()
+
     async def _periodic_breaker_check() -> None:
         while not done.is_set():
             await sleep(breaker_check_seconds)
@@ -1095,10 +1160,17 @@ async def run_engine(
     breaker_task = asyncio.create_task(_periodic_breaker_check())
     reconcile_task = asyncio.create_task(_periodic_reconcile())
     funding_task = asyncio.create_task(_periodic_funding())
+    liquidation_task = asyncio.create_task(_periodic_liquidation_check())
     try:
         if max_ticks is None:
             await asyncio.gather(
-                tick_task, control_task, sweep_task, breaker_task, reconcile_task, funding_task
+                tick_task,
+                control_task,
+                sweep_task,
+                breaker_task,
+                reconcile_task,
+                funding_task,
+                liquidation_task,
             )
         else:
             await done.wait()
@@ -1109,6 +1181,7 @@ async def run_engine(
         breaker_task.cancel()
         reconcile_task.cancel()
         funding_task.cancel()
+        liquidation_task.cancel()
         try:
             await tick_pubsub.punsubscribe()
             await tick_pubsub.aclose()  # type: ignore[no-untyped-call]

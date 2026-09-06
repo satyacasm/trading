@@ -130,6 +130,12 @@ from trading.paper.ledger import quantize_money as quantize_fill_price
 from trading.paper.models import FillDecision, Order, Position
 from trading.streaming.models import Tick
 
+# Instruments with no session to close: a DAY order on one has nothing to
+# expire at. Perpetuals join crypto here for the same reason -- they trade
+# around the clock, and sweeping one at an NSE close would cancel a live
+# order in the middle of its own market.
+_ALWAYS_OPEN = frozenset({"CRYPTO", "PERP"})
+
 log = structlog.get_logger(__name__)
 
 ConnFactory = Callable[[], Connection]
@@ -596,7 +602,7 @@ def sweep_expired_day_orders(conn: Connection, book: OpenOrderBook, now: datetim
     swept: list[int] = []
     for instrument_id in list(book.open_orders):
         asset_class, exchange, segment = book.instrument_meta[instrument_id]
-        if asset_class == "CRYPTO":
+        if asset_class in _ALWAYS_OPEN:
             continue
         for order in list(book.open_orders.get(instrument_id, [])):
             if order.time_in_force is not TimeInForce.DAY:

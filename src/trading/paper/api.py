@@ -72,6 +72,7 @@ from psycopg.errors import UniqueViolation
 from pydantic import BaseModel, Field, model_validator
 
 from trading.config import get_settings
+from trading.contracts import AssetClass
 from trading.paper.charges import AmbiguousChargeSchedule, MissingChargeSchedule, load_schedules
 from trading.paper.enums import OrderStatus, OrderType, Product, Side, TimeInForce
 from trading.paper.models import Order, Portfolio, Position
@@ -88,7 +89,12 @@ _ORDERS_CONTROL_CHANNEL = "orders:control"
 _BROKER_BY_ASSET_CLASS: dict[str, str] = {
     "EQUITY": "UPSTOX",
     "CRYPTO": "BINANCE",
+    "PERP": "BINANCE",
 }
+
+# Instruments that trade around the clock, so a DAY order on one has no
+# session to expire at.
+_ALWAYS_OPEN = frozenset({"CRYPTO", "PERP"})
 
 _TERMINAL_ORDER_STATUSES = frozenset(
     {OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED}
@@ -101,7 +107,7 @@ _PORTFOLIO_COLUMNS = (
 _ORDER_COLUMNS = (
     "order_id, portfolio_id, instrument_id, side, order_type, quantity,"
     " filled_quantity, limit_price, product, time_in_force, status,"
-    " rationale, submitted_at, rejection_reason"
+    " rationale, submitted_at, rejection_reason, leverage"
 )
 
 
@@ -124,6 +130,10 @@ class CreateOrderRequest(BaseModel):
     product: Product
     time_in_force: TimeInForce = TimeInForce.DAY
     rationale: str
+    # Required for a perpetual, meaningless otherwise. Not defaulted:
+    # leverage decides how much margin the position locks up, and assuming
+    # one would reserve an amount the trader never chose.
+    leverage: Annotated[Decimal, Field(gt=0)] | None = None
     idempotency_key: str = Field(min_length=1)
     # Set by the live supervisor, never by a human. Null means a
     # person placed this order; it is the only thing distinguishing a
@@ -186,6 +196,7 @@ def _order_from_row(row: Sequence[Any]) -> Order:
         rationale,
         submitted_at,
         rejection_reason,
+        leverage,
     ) = row
     return Order(
         order_id=order_id,
@@ -202,6 +213,7 @@ def _order_from_row(row: Sequence[Any]) -> Order:
         rationale=rationale,
         submitted_at=submitted_at,
         rejection_reason=rejection_reason,
+        leverage=leverage,
     )
 
 
@@ -273,6 +285,138 @@ def _require_sufficient_cash(
             status_code=400,
             detail=f"insufficient cash: order needs {needed}, portfolio has {cash_balance}",
         )
+
+
+_CONTRACT_SPEC = """
+    SELECT step_size, min_qty, min_notional FROM perp_contract_specs
+    WHERE instrument_id = %s AND effective_to IS NULL
+"""
+
+_MAX_LEVERAGE = """
+    SELECT max_leverage, notional_cap FROM perp_margin_tiers
+    WHERE instrument_id = %s ORDER BY notional_floor
+"""
+
+_RESERVED_MARGIN = """
+    SELECT coalesce(sum(reserved_margin), 0) FROM perp_positions WHERE portfolio_id = %s
+"""
+
+
+def _require_perp_order_is_tradable(
+    conn: Connection, body: CreateOrderRequest, cash_balance: Decimal
+) -> None:
+    """Everything a perpetual order must satisfy that a spot order need not.
+
+    Four checks, and each one refuses a fill the venue itself would never
+    have given:
+
+    - **Leverage is declared.** Assuming one would reserve margin the
+      trader never chose.
+    - **The quantity is on the contract's step and above its floors.**
+      Binance rejects 0.0005 BTC outright; filling it here would invent a
+      trade that could not have happened.
+    - **The leverage is inside the tier's ceiling** for the notional being
+      opened. Tiers exist because size costs leverage.
+    - **The margin is there.** Leverage is not free money: the exposure is
+      still collateralised, out of cash not already reserved against
+      another position.
+    """
+    if body.leverage is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "a perpetual order must declare its leverage; refusing to assume one, "
+                "since it decides how much margin the position locks up"
+            ),
+        )
+
+    spec = conn.execute(_CONTRACT_SPEC, (body.instrument_id,)).fetchone()
+    if spec is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"no contract specification for instrument_id={body.instrument_id}; "
+                "its tick, step and minimum notional are unknown, so no order can be "
+                "checked against them"
+            ),
+        )
+    step_size, min_qty, min_notional = spec
+    if body.quantity < min_qty:
+        raise HTTPException(
+            status_code=400,
+            detail=f"quantity {body.quantity} is below the contract minimum of {min_qty}",
+        )
+    if body.quantity % step_size != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"quantity {body.quantity} is not a multiple of the contract step "
+                f"{step_size}; the venue would refuse it"
+            ),
+        )
+
+    price = body.limit_price or _last_price(conn, body.instrument_id)
+    if price is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"no price available for instrument_id={body.instrument_id}; the margin "
+                "this order needs cannot be computed without one"
+            ),
+        )
+    notional = body.quantity * price
+    if notional < min_notional:
+        raise HTTPException(
+            status_code=400,
+            detail=f"notional {notional} is below the contract minimum of {min_notional}",
+        )
+
+    tiers = conn.execute(_MAX_LEVERAGE, (body.instrument_id,)).fetchall()
+    if not tiers:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"no maintenance-margin tiers for instrument_id={body.instrument_id}; "
+                "without them a position could never be liquidated, so it must not be "
+                "opened"
+            ),
+        )
+    ceiling = next((max_leverage for max_leverage, cap in tiers if notional <= cap), tiers[-1][0])
+    if body.leverage > ceiling:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"leverage {body.leverage} exceeds the {ceiling}x ceiling for a notional "
+                f"of {notional} on this contract"
+            ),
+        )
+
+    required = notional / body.leverage
+    reserved_row = conn.execute(_RESERVED_MARGIN, (body.portfolio_id,)).fetchone()
+    reserved = Decimal("0") if reserved_row is None else Decimal(reserved_row[0])
+    free = cash_balance - reserved
+    if required > free:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"insufficient margin: this order needs {required} and only {free} is free "
+                f"({cash_balance} cash less {reserved} already reserved)"
+            ),
+        )
+
+
+def _last_price(conn: Connection, instrument_id: int) -> Decimal | None:
+    row = conn.execute(
+        "SELECT close FROM bars_intraday WHERE instrument_id = %s ORDER BY ts DESC LIMIT 1",
+        (instrument_id,),
+    ).fetchone()
+    if row is not None:
+        return Decimal(row[0])
+    row = conn.execute(
+        "SELECT close FROM bars_daily WHERE instrument_id = %s ORDER BY ts DESC LIMIT 1",
+        (instrument_id,),
+    ).fetchone()
+    return None if row is None else Decimal(row[0])
 
 
 def _require_sufficient_position(conn: Connection, body: CreateOrderRequest) -> None:
@@ -364,8 +508,8 @@ def _insert_order(conn: Connection, body: CreateOrderRequest) -> tuple[Order, bo
             row = conn.execute(
                 "INSERT INTO orders (portfolio_id, instrument_id, side, order_type, quantity,"
                 " limit_price, product, time_in_force, status, rationale, idempotency_key,"
-                " live_run_id)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                " live_run_id, leverage)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
                 f" RETURNING {_ORDER_COLUMNS}",
                 (
                     body.portfolio_id,
@@ -380,6 +524,7 @@ def _insert_order(conn: Connection, body: CreateOrderRequest) -> tuple[Order, bo
                     body.rationale,
                     body.idempotency_key,
                     body.live_run_id,
+                    body.leverage,
                 ),
             ).fetchone()
         assert row is not None
@@ -437,10 +582,16 @@ def create_order(
     asset_class, exchange, segment, instrument_currency = instrument_row
 
     today = date.today()
-    if asset_class != "CRYPTO":
+    if asset_class not in _ALWAYS_OPEN:
         _require_market_open(conn, exchange, segment, today)
 
-    if body.side is Side.BUY:
+    if asset_class == AssetClass.PERP.value:
+        # A perpetual sell with no position is not an error: it opens a
+        # short, and the sell IS the position. What replaces the
+        # position check is a margin check -- leverage is not free money,
+        # and the exposure still has to be collateralised.
+        _require_perp_order_is_tradable(conn, body, cash_balance)
+    elif body.side is Side.BUY:
         _require_sufficient_cash(conn, body, cash_balance)
     else:
         _require_sufficient_position(conn, body)

@@ -79,8 +79,10 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from psycopg import Connection
 
+from trading.contracts import AssetClass
 from trading.paper.enums import EntryType, OrderStatus, Side
 from trading.paper.models import ChargeBreakdown, FillDecision, Order, Position
+from trading.paper.perp import PerpPosition, apply_perp_fill, initial_margin
 
 _MONEY_DP = Decimal("0.0001")
 
@@ -95,6 +97,15 @@ def quantize_money(value: Decimal) -> Decimal:
     quantize_money`'s identical fix for the identical shape.
     """
     return value.quantize(_MONEY_DP, rounding=ROUND_HALF_UP)
+
+
+class MissingLeverage(Exception):
+    """A perpetual fill reached the ledger with no leverage on its order.
+
+    Raised rather than defaulted: leverage decides how much margin the
+    position locks up, and assuming one would silently reserve an amount
+    the trader never chose.
+    """
 
 
 class OrderNoLongerFillable(Exception):
@@ -130,8 +141,18 @@ def apply_fill(
 
     notional = decision.quantity * decision.price
     total_charges = charges.total
-    # Charges always leave the account, whichever side the trade is.
-    delta = -(notional + total_charges) if order.side is Side.BUY else notional - total_charges
+    # A perpetual moves cash on realised P&L and fees, never on notional:
+    # opening one reserves margin rather than spending money. Applying the
+    # spot formula would credit a short with the whole notional it never
+    # received. Decided before anything is written so both paths share the
+    # one order-status update and its optimistic-concurrency guard.
+    is_perp = _is_perp(conn, order.instrument_id)
+    if is_perp:
+        realised = _perp_realised(conn, order, decision)
+        delta = realised - total_charges
+    else:
+        # Charges always leave the account, whichever side the trade is.
+        delta = -(notional + total_charges) if order.side is Side.BUY else notional - total_charges
 
     fill_row = conn.execute(
         "INSERT INTO fills (order_id, quantity, price, filled_at, tick_ts,"
@@ -175,7 +196,10 @@ def apply_fill(
         (order.portfolio_id, EntryType.FILL.value, delta, fill_id, balance_after),
     )
 
-    _apply_position(conn, order, decision)
+    if is_perp:
+        _apply_perp_position(conn, order, decision)
+    else:
+        _apply_position(conn, order, decision)
 
     filled = order.filled_quantity + decision.quantity
     status = OrderStatus.FILLED if filled >= order.quantity else OrderStatus.PARTIALLY_FILLED
@@ -205,6 +229,102 @@ def apply_fill(
             "refusing to overwrite its status with a fill decided before that change"
         )
     return fill_id
+
+
+def _is_perp(conn: Connection, instrument_id: int) -> bool:
+    """Whether this instrument settles as a derivative rather than a holding.
+
+    Read from the instrument rather than passed in by the caller: every
+    call site would otherwise have to remember, and a caller that forgot
+    would silently apply spot's cash mechanics to a perpetual -- the one
+    mistake in this file that produces plausible numbers.
+    """
+    row = conn.execute(
+        "SELECT asset_class FROM instruments WHERE instrument_id = %s", (instrument_id,)
+    ).fetchone()
+    return row is not None and row[0] == AssetClass.PERP.value
+
+
+def _perp_state(conn: Connection, order: Order) -> tuple[PerpPosition, Decimal, Decimal]:
+    """The open perpetual position, its realised total, and its leverage."""
+    row = conn.execute(
+        "SELECT quantity, entry_price, leverage, realised_pnl FROM perp_positions"
+        " WHERE portfolio_id=%s AND instrument_id=%s FOR UPDATE",
+        (order.portfolio_id, order.instrument_id),
+    ).fetchone()
+    leverage = _order_leverage(conn, order)
+    if row is None:
+        return PerpPosition(Decimal("0"), Decimal("0"), leverage), Decimal("0"), leverage
+    # An existing position keeps the leverage it was opened at; a later
+    # order cannot silently re-lever exposure already taken.
+    return PerpPosition(row[0], row[1], row[2]), row[3], row[2]
+
+
+def _order_leverage(conn: Connection, order: Order) -> Decimal:
+    """The leverage this order was placed at.
+
+    Read from the model where present -- the API now surfaces it, so the
+    common path costs no query -- and from the row otherwise, which keeps
+    callers that build an `Order` by hand working.
+    """
+    if order.leverage is not None:
+        return order.leverage
+    row = conn.execute(
+        "SELECT leverage FROM orders WHERE order_id = %s", (order.order_id,)
+    ).fetchone()
+    if row is None or row[0] is None:
+        raise MissingLeverage(
+            f"order {order.order_id} is for a perpetual but carries no leverage; "
+            "refusing to assume one -- the margin it locks up depends on it"
+        )
+    return Decimal(row[0])
+
+
+def _perp_realised(conn: Connection, order: Order, decision: FillDecision) -> Decimal:
+    """What this fill closes, in money. Reads state; writes nothing."""
+    position, _total, _leverage = _perp_state(conn, order)
+    _after, realised = apply_perp_fill(
+        position, side=order.side.value, quantity=decision.quantity, price=decision.price
+    )
+    return realised
+
+
+def _apply_perp_position(conn: Connection, order: Order, decision: FillDecision) -> None:
+    """Signed position keeping, and the margin it locks up.
+
+    Margin is recomputed from the resulting position rather than adjusted
+    by a delta: a delta has to be right on every path -- open, add, reduce,
+    close, reverse -- and being wrong on one of them leaks margin that no
+    position explains. Recomputing is correct on all five by construction.
+    """
+    position, realised_total, leverage = _perp_state(conn, order)
+    after, realised = apply_perp_fill(
+        position, side=order.side.value, quantity=decision.quantity, price=decision.price
+    )
+    reserved = (
+        Decimal("0")
+        if after.is_flat
+        else initial_margin(after.quantity, price=after.entry_price, leverage=leverage)
+    )
+    conn.execute(
+        "INSERT INTO perp_positions (portfolio_id, instrument_id, quantity, entry_price,"
+        " leverage, reserved_margin, realised_pnl)"
+        " VALUES (%s,%s,%s,%s,%s,%s,%s)"
+        " ON CONFLICT (portfolio_id, instrument_id) DO UPDATE SET"
+        "   quantity = EXCLUDED.quantity, entry_price = EXCLUDED.entry_price,"
+        "   reserved_margin = EXCLUDED.reserved_margin,"
+        "   realised_pnl = perp_positions.realised_pnl + %s",
+        (
+            order.portfolio_id,
+            order.instrument_id,
+            after.quantity,
+            after.entry_price,
+            leverage,
+            reserved,
+            realised_total + realised,
+            realised,
+        ),
+    )
 
 
 def _apply_position(conn: Connection, order: Order, decision: FillDecision) -> None:

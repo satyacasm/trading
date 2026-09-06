@@ -139,6 +139,10 @@ class Order(BaseModel):
     # distinguishable from "a reason we failed to read". Defaulted so
     # every existing constructor call site keeps working unchanged.
     rejection_reason: str | None = None
+    # Only a perpetual has one. None means the instrument has no leverage
+    # concept, which is true of everything this platform traded before
+    # perpetuals existed -- distinct from "we failed to read it".
+    leverage: Decimal | None = None
 
     @property
     def remaining(self) -> Decimal:

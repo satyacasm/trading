@@ -9,11 +9,15 @@ import {
   describeDrawdown,
   describeBreakerHalt,
   describeCostDrag,
+  describeFunding,
+  describeLiquidation,
   describeStress,
   describeHurdleRate,
   describeRunWindow,
+  formatMoney,
   formatPercent,
   formatRatio,
+  formatSignedMoney,
   lostToTheHurdle,
   riskFreeCurve,
 } from "@/lib/backtests";
@@ -270,6 +274,86 @@ export default function BacktestReportPage() {
           </div>
           {underwater.length > 0 ? (
             <SeriesChart lines={underwater} height={180} priceFormat="percent" />
+          ) : null}
+        </section>
+      ) : null}
+
+      {(run.funding?.length ?? 0) > 0 || (run.liquidations?.length ?? 0) > 0 ? (
+        <section className="border-line flex flex-col gap-4 border-t pt-6">
+          <div className="flex flex-wrap items-baseline gap-x-3">
+            <h2 className="font-display text-lg">Carry and liquidations</h2>
+            <span className="text-muted text-sm">{describeFunding(run.funding ?? [])}</span>
+          </div>
+          <p className="text-muted max-w-prose text-xs">
+            Funding is shown apart from charges because it is not one. It is a signed
+            transfer between the two sides of a perpetual, settled every eight hours: a
+            short in a rising market collects it, and a levered long pays it three times a
+            day. Folding it into the cost report would make an income stream read as an
+            expense.
+          </p>
+
+          {(run.funding?.length ?? 0) > 0 ? (
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-muted border-line border-b text-left text-xs uppercase">
+                  <th className="py-2 font-normal">Contract</th>
+                  <th className="py-2 text-right font-normal">Funding</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(run.funding ?? []).map((row) => (
+                  <tr key={row.instrument_id} className="border-line/60 border-b">
+                    <td className="py-2">{row.symbol}</td>
+                    <td
+                      className={`num py-2 text-right ${
+                        Number(row.amount) > 0 ? "text-down" : "text-up"
+                      }`}
+                    >
+                      {/* Negated for display: the stored sign is "what the
+                          run paid", and a reader of a P&L column expects a
+                          gain to be positive. */}
+                      {formatSignedMoney(String(-Number(row.amount)))}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : null}
+
+          {(run.liquidations?.length ?? 0) > 0 ? (
+            <div className="flex flex-col gap-2">
+              <h3 className="text-down text-sm">
+                {run.liquidations?.length === 1
+                  ? "One position was liquidated"
+                  : `${run.liquidations?.length} positions were liquidated`}
+              </h3>
+              <ul className="flex flex-col gap-2">
+                {(run.liquidations ?? []).map((event) => (
+                  <li
+                    key={event.ordinal}
+                    className="border-down/40 bg-raised rounded border-l-2 px-3 py-2"
+                  >
+                    <p className="text-muted num text-xs">
+                      {event.ts.slice(0, 10)}
+                    </p>
+                    <p className="text-text mt-1 text-xs">{describeLiquidation(event)}</p>
+                    <p className="text-muted num mt-1 text-xs">
+                      filled at {formatMoney(event.fill_price)} · fee{" "}
+                      {formatMoney(event.fee)}
+                      {Number(event.fill_price) !== Number(event.mark)
+                        ? " · capped at the bankruptcy price, because the mark gapped past it"
+                        : ""}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+              <p className="text-muted max-w-prose text-xs">
+                A liquidation is the exchange closing a position that ran out of
+                collateral, on the mark rather than the last traded price. It is not a
+                circuit-breaker halt: the breaker pauses a whole portfolio, this closes one
+                position and the run carries on.
+              </p>
+            </div>
           ) : null}
         </section>
       ) : null}

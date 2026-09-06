@@ -310,3 +310,43 @@ export const METRIC_HELP: Record<string, { what: string; good: string }> = {
     good: "If the result survives, the edge is real. If it dies at 2x, it was never an edge.",
   },
 };
+
+/**
+ * What funding did to a run, in one sentence.
+ *
+ * Signed, because funding is a transfer and not a fee: a short in a rising
+ * market collects it, and describing that as a cost would invert the whole
+ * point of a carry strategy. The wording therefore has to branch, the same
+ * way `describeCostDrag` does.
+ */
+export function describeFunding(rows: { symbol: string; amount: string }[]): string {
+  const total = rows.reduce((sum, row) => sum + Number(row.amount), 0);
+  if (rows.length === 0 || total === 0) return "no funding settled in this window";
+  const magnitude = formatMoney(String(Math.abs(total)));
+  const scope = rows.length === 1 ? `on ${rows[0].symbol}` : `across ${rows.length} contracts`;
+  return total > 0
+    ? `this run paid ${magnitude} in funding ${scope}`
+    : `this run collected ${magnitude} in funding ${scope}`;
+}
+
+/**
+ * Why a position was closed by the exchange.
+ *
+ * Names both numbers that decided it. "Liquidated" alone tells a reader
+ * that something happened; the requirement and what was left of the margin
+ * tell them why, which is the question they actually have.
+ */
+export function describeLiquidation(event: {
+  symbol: string;
+  quantity: string;
+  mark: string;
+  equity: string;
+  maintenance: string;
+}): string {
+  const side = Number(event.quantity) < 0 ? "short" : "long";
+  return (
+    `the ${side} of ${Math.abs(Number(event.quantity))} ${event.symbol} was closed at a mark of ` +
+    `${formatMoney(event.mark)}: ${formatSignedMoney(event.equity)} left against a ` +
+    `${formatMoney(event.maintenance)} maintenance requirement`
+  );
+}

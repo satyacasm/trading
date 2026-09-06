@@ -392,6 +392,28 @@ export type TradeMetrics = {
   expectancy: string | null;
 };
 
+export type FundingPaid = {
+  instrument_id: number;
+  symbol: string;
+  /** Positive means the run paid; negative means it was paid. */
+  amount: string;
+};
+
+export type Liquidation = {
+  ordinal: number;
+  symbol: string;
+  ts: string;
+  instrument_id: number;
+  quantity: string;
+  /** The mark that triggered it -- never the last traded price. */
+  mark: string;
+  /** Capped at the bankruptcy price when the market gapped past it. */
+  fill_price: string;
+  equity: string;
+  maintenance: string;
+  fee: string;
+};
+
 export type CostDrag = {
   total_charges: string;
   gross_pnl: string;
@@ -492,6 +514,10 @@ export type BacktestDetail = BacktestSummary & {
   notes?: string[];
   equity_curve: EquityPoint[];
   fills_ledger: Fill[];
+  /** What the run paid (positive) or was paid (negative) per contract. */
+  funding?: FundingPaid[];
+  /** Positions the exchange closed. Empty for every non-perpetual run. */
+  liquidations?: Liquidation[];
   stress: Stress | null;
   reshuffle: Reshuffle | null;
   metrics: BacktestMetrics | null;

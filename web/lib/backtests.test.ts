@@ -5,6 +5,8 @@ import {
   METRIC_HELP,
   describeBreakerHalt,
   describeCostDrag,
+  describeFunding,
+  describeLiquidation,
   describeDrawdown,
   describeStress,
   describeHurdle,
@@ -331,5 +333,50 @@ describe("formatSignedMoney", () => {
 
   it("passes a non-numeric string through untouched", () => {
     expect(formatSignedMoney("n/a")).toBe("n/a");
+  });
+});
+
+describe("describeFunding", () => {
+  it("says collected when the run was paid", () => {
+    // The sign convention is the whole point: negative means the run
+    // received. A short in a rising market collects funding, and calling
+    // that a cost would invert what a carry strategy is.
+    expect(describeFunding([{ symbol: "BTC-USDT", amount: "-52.53" }])).toBe(
+      "this run collected 52.53 in funding on BTC-USDT",
+    );
+  });
+
+  it("says paid when the run was charged", () => {
+    expect(describeFunding([{ symbol: "BTC-USDT", amount: "2914.37" }])).toBe(
+      "this run paid 2,914.37 in funding on BTC-USDT",
+    );
+  });
+
+  it("nets across contracts, because one can pay while another collects", () => {
+    const sentence = describeFunding([
+      { symbol: "BTC-USDT", amount: "100" },
+      { symbol: "ETH-USDT", amount: "-30" },
+    ]);
+    expect(sentence).toBe("this run paid 70.00 in funding across 2 contracts");
+  });
+
+  it("says so plainly when nothing settled", () => {
+    expect(describeFunding([])).toBe("no funding settled in this window");
+  });
+});
+
+describe("describeLiquidation", () => {
+  it("names both numbers that decided it", () => {
+    expect(
+      describeLiquidation({
+        symbol: "BTC-USDT",
+        quantity: "-0.5",
+        mark: "47312.00",
+        equity: "-435.09",
+        maintenance: "94.62",
+      }),
+    ).toBe(
+      "the short of 0.5 BTC-USDT was closed at a mark of 47,312.00: -435.09 left against a 94.62 maintenance requirement",
+    );
   });
 });

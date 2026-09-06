@@ -1,6 +1,6 @@
 # Where this project stands
 
-**Updated:** 2026-09-06, ~16:35 IST. Keep this file current — it is the
+**Updated:** 2026-09-06, ~17:30 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
@@ -121,9 +121,36 @@ wiring none. The first attempt applied funding in the smoke path only,
 so the backtest ran against 2,889 published settlements and used zero of
 them, producing a number identical to funding being switched off.
 
-**Still open in task 7:** liquidation inside a backtest (the arithmetic
-and the per-bar check exist; the tiers are not yet in the payload), and
-the report surfacing funding P&L and liquidation events beside cost drag.
+**Liquidation now applies inside a backtest too**, on the adverse price
+(the low for a long, the high for a short) so a position liquidated
+intra-bar cannot walk out of it because the market came back before the
+close. `RunOutcome` carries `funding_paid` per instrument and every
+liquidation event, naming the mark and the requirement it fell below.
+
+**What that shows, on real BTC bars, shorting 0.5 from 2024-01-01:**
+
+| declared leverage | outcome | final equity |
+|---|---|---|
+| 20x | liquidated 2024-01-09 at 47,312 | 98,645.45 |
+| none (margin at 1x) | liquidated later, far worse price | 79,952.43 |
+
+Higher leverage *lost less*, because it was closed early and stopped
+bleeding while the barely-levered position carried on into a two-year
+rally. Counterintuitive, correct, and the sort of thing this platform
+exists to be able to show.
+
+**A stale process ate most of an afternoon.** A perpetual backtest kept
+returning a number with no liquidation in it, while the same payload run
+against the same image by hand liquidated correctly. Image current,
+payload complete, loop right -- and `lsof -ti:8000` listed **four**
+listeners, with a gateway from hours earlier still answering.
+`pkill -f uvicorn` had not matched it, and every "restart" since had
+failed to bind and been ignored. Check what owns the port before
+doubting the code.
+
+**Still open in task 7:** the report surfacing funding P&L and
+liquidation events beside cost drag. The numbers are computed and carried
+on `RunOutcome`; persistence, the API and the UI do not yet show them.
 
 ---
 

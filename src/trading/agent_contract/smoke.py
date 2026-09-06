@@ -646,6 +646,26 @@ def _funding_rates(
     )
 
 
+def _margin_tiers(conn: Connection, instrument_ids: Sequence[int]) -> tuple[dict[str, str], ...]:
+    """Each perpetual's maintenance ladder. Empty for a run with none."""
+    rows = conn.execute(
+        "SELECT instrument_id, notional_floor, notional_cap, maintenance_rate,"
+        " maintenance_amount FROM perp_margin_tiers"
+        " WHERE instrument_id = ANY(%s) ORDER BY instrument_id, notional_floor",
+        (list(instrument_ids),),
+    ).fetchall()
+    return tuple(
+        {
+            "instrument_id": str(r[0]),
+            "notional_floor": str(r[1]),
+            "notional_cap": str(r[2]),
+            "maintenance_rate": str(r[3]),
+            "maintenance_amount": str(r[4]),
+        }
+        for r in rows
+    )
+
+
 def _manifest_leverage(manifest: dict[str, Any]) -> Decimal | None:
     raw = manifest.get("leverage")
     return None if raw is None else Decimal(str(raw))
@@ -890,6 +910,7 @@ def smoke_test(
         slippage_bps=Decimal("0"),
         perp_instruments=_perp_instruments(conn, instrument_ids),
         funding_rates=_funding_rates(conn, instrument_ids, window),
+        margin_tiers=_margin_tiers(conn, instrument_ids),
         leverage=_manifest_leverage(manifest),
     )
     first = run_smoke_in_sandbox(payload, limits)
@@ -1419,6 +1440,7 @@ def backtest(
         charge_schedules=tuple(schedules),
         perp_instruments=_perp_instruments(conn, instrument_ids),
         funding_rates=_funding_rates(conn, instrument_ids, window),
+        margin_tiers=_margin_tiers(conn, instrument_ids),
         leverage=_manifest_leverage(record.manifest or {}),
         # The caller's capital when given, else what the strategy declared.
         # An operator asking "what would this have done with 50,000?" is
@@ -1459,6 +1481,7 @@ def backtest(
                 # *is* would measure two things at once.
                 perp_instruments=payload.perp_instruments,
                 funding_rates=payload.funding_rates,
+                margin_tiers=payload.margin_tiers,
                 leverage=payload.leverage,
                 starting_cash=payload.starting_cash,
                 slippage_bps=payload.slippage_bps * STRESS_MULTIPLIER,

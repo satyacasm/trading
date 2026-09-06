@@ -268,6 +268,8 @@ def main() -> int:
             dispatch_from=payload.dispatch_from,
             perp_instruments=payload.perp_instruments,
             funding_rates=_funding_rates(payload),
+            margin_tiers=_margin_tiers(payload),
+            leverage=payload.leverage,
         )
     except BaseException:  # noqa: BLE001 - the loop itself failing is still an outcome
         _emit(
@@ -345,6 +347,8 @@ def _run_live(payload, instance, manifest, strategy_cls):  # noqa: ANN001, ANN20
         ),
         perp_instruments=payload.perp_instruments,
         funding_rates=_funding_rates(payload),
+        margin_tiers=_margin_tiers(payload),
+        leverage=payload.leverage,
     )
 
     def _write(line: str) -> None:
@@ -454,6 +458,29 @@ def _funding_rates(payload):  # noqa: ANN001, ANN202
         (int(row["instrument_id"]), datetime.fromisoformat(row["ts"])): Decimal(row["rate"])
         for row in payload.funding_rates
     }
+
+
+def _margin_tiers(payload):  # noqa: ANN001, ANN202
+    """The payload's ladder rows grouped per instrument, ordered by floor.
+
+    Ordered because `maintenance_margin` walks them and takes the first
+    tier that covers the notional; an unordered ladder would pick whatever
+    row happened to come first.
+    """
+    from collections import defaultdict
+    from decimal import Decimal
+
+    grouped = defaultdict(list)
+    for row in payload.margin_tiers:
+        grouped[int(row["instrument_id"])].append(
+            (
+                Decimal(row["notional_floor"]),
+                Decimal(row["notional_cap"]),
+                Decimal(row["maintenance_rate"]),
+                Decimal(row["maintenance_amount"]),
+            )
+        )
+    return {k: tuple(sorted(v)) for k, v in grouped.items()}
 
 
 def _order_intent(order):  # noqa: ANN001, ANN202

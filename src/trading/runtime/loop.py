@@ -64,7 +64,17 @@ from trading.paper.charges import compute_charges
 from trading.paper.enums import OrderStatus, Product, Side
 from trading.paper.fills import decide_fill
 from trading.paper.models import ChargeSchedule, Order, Position
-from trading.paper.perp import funding_payment, settlements_between
+from trading.paper.perp import (
+    PerpPosition,
+    Tier,
+    bankruptcy_price,
+    funding_payment,
+    initial_margin,
+    maintenance_margin,
+    position_equity,
+    settlements_between,
+    should_liquidate,
+)
 from trading.runtime.context import SMOKE_PORTFOLIO_ID, LiveContext
 from trading.runtime.outcome import OrderSnapshot, RunOutcome
 from trading.runtime.provider import BarRecord, InMemoryBars
@@ -78,6 +88,12 @@ _MONEY_SCALE = Decimal("0.0001")
 # Quantities are 8 dp -- crypto needs it; equities are whole numbers.
 _QUANTITY_SCALE = Decimal("0.00000001")
 
+# Binance's published clearance fee, the same number
+# `perp_contract_specs.liquidation_fee` carries per contract. A single
+# constant here rather than a per-contract lookup because the container
+# has no database and every seeded contract charges within 0.25% of it.
+_LIQUIDATION_FEE = Decimal("0.0125")
+
 _TERMINAL = (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED)
 
 # DP charges (FLAT_PER_SCRIP_PER_DAY) are an Indian broker-day
@@ -85,6 +101,17 @@ _TERMINAL = (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, Or
 # engine's _ist_day_bounds_utc -- the scrip-day key below uses this,
 # not the UTC date, so a fill near midnight IST is not misclassified.
 _IST = ZoneInfo("Asia/Kolkata")
+
+
+# A stand-in for "no position", so the adverse-price choice above reads
+# as one expression rather than three lines of lookup.
+_FLAT = Position(
+    portfolio_id=SMOKE_PORTFOLIO_ID,
+    instrument_id=0,
+    quantity=Decimal("0"),
+    avg_cost=Decimal("0"),
+    realised_pnl=Decimal("0"),
+)
 
 
 class _StrategyLike(Protocol):
@@ -131,6 +158,78 @@ def _snapshot(order: Order) -> OrderSnapshot:
         status=str(order.status),
         submitted_at=order.submitted_at.isoformat(),
     )
+
+
+def liquidate_for_step(
+    state: RunState,
+    *,
+    mark_by_instrument: Mapping[int, Decimal],
+    tiers: Mapping[int, Sequence[Tier]],
+) -> list[int]:
+    """Close every perpetual whose collateral has run out. Returns the
+    instruments closed.
+
+    A backtest without this lets every over-levered strategy survive a
+    move that would have ended it, which is the most flattering possible
+    lie about leverage -- and the one a retail platform has the least
+    business telling.
+
+    Isolated margin: what backs a position is what was posted for it, so
+    the comparison is that position's own equity against its own
+    requirement, never the portfolio's.
+
+    An instrument with no tiers is never liquidated. No published tiers
+    means no maintenance requirement to breach, and inventing one would
+    close a position on a number nobody stated.
+    """
+    closed: list[int] = []
+    for instrument_id, position in list(state.positions.items()):
+        if instrument_id not in state.perp_instruments or position.quantity == 0:
+            continue
+        ladder = tiers.get(instrument_id)
+        mark = mark_by_instrument.get(instrument_id)
+        if not ladder or mark is None:
+            continue
+        margin = state.reserved_margin.get(instrument_id, Decimal("0"))
+        perp = PerpPosition(position.quantity, position.avg_cost, Decimal("1"))
+        if not should_liquidate(perp, margin=margin, mark=mark, tiers=ladder):
+            continue
+
+        # Capped at bankruptcy for the same reason the live path caps it:
+        # past there the position has consumed everything posted, and a
+        # real venue's insurance fund would have taken the rest.
+        bankrupt = bankruptcy_price(perp, margin=margin)
+        assert bankrupt is not None
+        gapped = (position.quantity > 0 and mark < bankrupt) or (
+            position.quantity < 0 and mark > bankrupt
+        )
+        fill_price = bankrupt if gapped else mark
+        realised = position.quantity * (fill_price - position.avg_cost)
+        fee = abs(position.quantity) * fill_price * _LIQUIDATION_FEE
+
+        state.cash += realised - fee
+        state.liquidations.append(
+            {
+                "instrument_id": str(instrument_id),
+                "ts": state.now.isoformat(),
+                "quantity": str(position.quantity),
+                "mark": str(mark),
+                "fill_price": str(fill_price),
+                "equity": str(position_equity(perp, margin=margin, mark=mark)),
+                "maintenance": str(maintenance_margin(position.quantity, mark=mark, tiers=ladder)),
+                "fee": str(fee.quantize(_MONEY_SCALE)),
+            }
+        )
+        state.positions[instrument_id] = position.model_copy(
+            update={
+                "quantity": Decimal("0"),
+                "avg_cost": Decimal("0"),
+                "realised_pnl": position.realised_pnl + realised,
+            }
+        )
+        state.reserved_margin[instrument_id] = Decimal("0")
+        closed.append(instrument_id)
+    return closed
 
 
 def settle_funding_for_step(
@@ -313,6 +412,8 @@ def open_session(
     dispatch_from: datetime | None = None,
     perp_instruments: Sequence[int] = (),
     funding_rates: Mapping[tuple[int, datetime], Decimal] | None = None,
+    margin_tiers: Mapping[int, Sequence[Tier]] | None = None,
+    leverage: Decimal | None = None,
 ) -> Session:
     state = RunState(
         now=None,  # type: ignore[arg-type]  # set before any handler runs
@@ -326,6 +427,10 @@ def open_session(
     ctx = LiveContext(state=state, bars=bars)
 
     rates = funding_rates or {}
+    tiers = margin_tiers or {}
+    # One leverage for the strategy (D6). Only ever read for a perpetual,
+    # where the manifest is required to declare it.
+    run_leverage = leverage or Decimal("1")
     # The close of the previous dispatched bar, so a step knows which
     # funding boundaries it crossed. None until the first real dispatch:
     # a run cannot owe funding for time before it began.
@@ -411,6 +516,21 @@ def open_session(
         printed = {bar.instrument_id: bar for bar, _ in indexed}
         for instrument_id, bar in printed.items():
             state.marks[instrument_id] = bar.close
+
+        # A position can be closed by the exchange before the strategy is
+        # handed the bar, and must be: it ran out of collateral at a price
+        # this bar reached, not at the price the strategy is about to
+        # read. Checked on the low for a long and the high for a short --
+        # the close alone would let a position that was liquidated
+        # intra-bar walk out of it because the market came back.
+        if state.perp_instruments:
+            adverse = {
+                instrument_id: (
+                    bar.low if state.positions.get(instrument_id, _FLAT).quantity > 0 else bar.high
+                )
+                for instrument_id, bar in printed.items()
+            }
+            liquidate_for_step(state, mark_by_instrument=adverse, tiers=tiers)
 
         # 1. Price resting orders against this bar, before the
         #    strategy has seen it. See the module docstring.
@@ -501,6 +621,19 @@ def open_session(
                         "total_charges": str(breakdown.total.quantize(_MONEY_SCALE)),
                     }
                 )
+                if order.instrument_id in state.perp_instruments:
+                    # Recomputed from the resulting position, never adjusted
+                    # by a delta: a delta has to be right on open, add,
+                    # reduce, close and reverse, and being wrong on one
+                    # leaks margin no position explains.
+                    held = state.positions[order.instrument_id]
+                    state.reserved_margin[order.instrument_id] = (
+                        Decimal("0")
+                        if held.quantity == 0
+                        else initial_margin(
+                            held.quantity, price=held.avg_cost, leverage=run_leverage
+                        )
+                    )
                 # The position was applied above, before the cash move --
                 # the realised amount a perpetual's cash depends on can
                 # only be known by applying it first.
@@ -604,6 +737,11 @@ def open_session(
             ),
             equity_curve=tuple(state.equity_curve),
             fill_ledger=tuple(state.fill_ledger),
+            funding_paid=tuple(
+                {"instrument_id": str(k), "amount": str(v.quantize(_MONEY_SCALE))}
+                for k, v in sorted(state.funding_paid.items())
+            ),
+            liquidations=tuple(state.liquidations),
         )
 
     def initialize(first_ts: datetime) -> None:
@@ -624,6 +762,8 @@ def run_loop(
     dispatch_from: datetime | None = None,
     perp_instruments: Sequence[int] = (),
     funding_rates: Mapping[tuple[int, datetime], Decimal] | None = None,
+    margin_tiers: Mapping[int, Sequence[Tier]] | None = None,
+    leverage: Decimal | None = None,
 ) -> RunOutcome:
     """Drive a whole recorded bar set to completion.
 
@@ -642,6 +782,8 @@ def run_loop(
         dispatch_from=dispatch_from,
         perp_instruments=perp_instruments,
         funding_rates=funding_rates,
+        margin_tiers=margin_tiers,
+        leverage=leverage,
     )
     try:
         # The first timestamp the strategy will actually experience. With

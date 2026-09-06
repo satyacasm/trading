@@ -81,6 +81,10 @@ class SmokePayload:
     # rather than looked up because the container has no database, and
     # omitting it makes every carry strategy backtest as free money.
     funding_rates: tuple[dict[str, str], ...] = ()
+    # The maintenance ladder per perpetual. Without it a backtested
+    # position can never be liquidated, and every over-levered strategy
+    # survives a move that would have ended it.
+    margin_tiers: tuple[dict[str, str], ...] = ()
 
 
 def _money(value: Decimal | None) -> str | None:
@@ -168,6 +172,7 @@ def encode_payload(payload: SmokePayload) -> bytes:
         "leverage": _money(payload.leverage),
         "perp_instruments": list(payload.perp_instruments),
         "funding_rates": [dict(row) for row in payload.funding_rates],
+        "margin_tiers": [dict(row) for row in payload.margin_tiers],
     }
     return gzip.compress(json.dumps(document, separators=(",", ":")).encode("utf-8"))
 
@@ -204,6 +209,7 @@ def decode_payload(raw: bytes) -> SmokePayload:
         ),
         perp_instruments=tuple(document.get("perp_instruments") or ()),
         funding_rates=tuple(document.get("funding_rates") or ()),
+        margin_tiers=tuple(document.get("margin_tiers") or ()),
         leverage=(None if document.get("leverage") is None else Decimal(document["leverage"])),
         max_drawdown_pct=(
             None

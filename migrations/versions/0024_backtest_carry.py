@@ -66,9 +66,7 @@ def upgrade() -> None:
             ["backtest_run_id"], ["backtest_runs.backtest_run_id"], ondelete="CASCADE"
         ),
         sa.ForeignKeyConstraint(["instrument_id"], ["instruments.instrument_id"]),
-        sa.UniqueConstraint(
-            "backtest_run_id", "ordinal", name="uq_backtest_liquidation_ordinal"
-        ),
+        sa.UniqueConstraint("backtest_run_id", "ordinal", name="uq_backtest_liquidation_ordinal"),
     )
 
 

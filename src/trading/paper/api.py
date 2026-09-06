@@ -73,7 +73,12 @@ from pydantic import BaseModel, Field, model_validator
 
 from trading.config import get_settings
 from trading.contracts import AssetClass
-from trading.paper.charges import AmbiguousChargeSchedule, MissingChargeSchedule, load_schedules
+from trading.paper.charges import (
+    BROKER_BY_ASSET_CLASS,
+    AmbiguousChargeSchedule,
+    MissingChargeSchedule,
+    load_schedules,
+)
 from trading.paper.enums import OrderStatus, OrderType, Product, Side, TimeInForce
 from trading.paper.models import Order, Portfolio, Position
 from trading.streaming.db import get_db_connection
@@ -86,11 +91,7 @@ _ORDERS_CONTROL_CHANNEL = "orders:control"
 # equity, BINANCE/BINANCE for crypto. An asset_class outside this map has
 # no broker profile at all yet, so it falls straight into the "no charge
 # schedule" rejection below rather than guessing one.
-_BROKER_BY_ASSET_CLASS: dict[str, str] = {
-    "EQUITY": "UPSTOX",
-    "CRYPTO": "BINANCE",
-    "PERP": "BINANCE",
-}
+_BROKER_BY_ASSET_CLASS = BROKER_BY_ASSET_CLASS
 
 # Instruments that trade around the clock, so a DAY order on one has no
 # session to expire at.
@@ -640,6 +641,102 @@ def create_order(
         # a sequential duplicate already gets.
         response.status_code = status.HTTP_200_OK
     return order
+
+
+class PerpPositionOut(BaseModel):
+    """One open perpetual, with the numbers a spot position has no room for.
+
+    A separate route from `/positions` rather than a widened one: a
+    perpetual and a spot holding answer different questions. Spot has an
+    average cost and a market value; a perpetual has an entry, a margin
+    that is reserved rather than spent, and a price at which the exchange
+    closes it. Folding them into one shape would leave half the fields
+    meaningless on each.
+    """
+
+    instrument_id: int
+    symbol: str
+    quantity: str
+    entry_price: str
+    leverage: str
+    reserved_margin: str
+    realised_pnl: str
+    funding_paid: str
+    mark: str | None
+    unrealised_pnl: str | None
+    liquidation_price: str | None
+
+
+_PERP_POSITIONS_SQL = """
+    SELECT p.instrument_id, i.symbol, p.quantity, p.entry_price, p.leverage,
+           p.reserved_margin, p.realised_pnl, p.funding_paid
+    FROM perp_positions p JOIN instruments i USING (instrument_id)
+    WHERE p.portfolio_id = %s AND p.quantity <> 0
+    ORDER BY i.symbol
+"""
+
+_PERP_TIERS_SQL = """
+    SELECT notional_floor, notional_cap, maintenance_rate, maintenance_amount
+    FROM perp_margin_tiers WHERE instrument_id = %s ORDER BY notional_floor
+"""
+
+
+@router.get("/portfolios/{portfolio_id}/perp-positions", response_model=list[PerpPositionOut])
+def perp_positions(
+    portfolio_id: int,
+    conn: Connection = Depends(get_db_connection),  # noqa: B008
+) -> list[PerpPositionOut]:
+    """Open perpetuals, marked and with their liquidation price.
+
+    The mark comes from where the ingestor leaves it, not from a bar: a
+    mark is not a traded price and has no bar. A position whose mark is
+    unavailable reports `None` for everything derived from it rather than
+    a number computed from a stale price -- the liquidation price is the
+    last figure that should be quietly wrong.
+
+    A GET that never writes.
+    """
+    import json as _json
+
+    from redis import Redis
+
+    from trading.paper.liquidation import liquidation_price
+    from trading.paper.perp import PerpPosition, unrealised_pnl
+
+    redis = Redis.from_url(get_settings().redis_url, decode_responses=True)
+    out: list[PerpPositionOut] = []
+    for row in conn.execute(_PERP_POSITIONS_SQL, (portfolio_id,)).fetchall():
+        instrument_id, symbol, quantity, entry, leverage, margin, realised, funding = row
+        mark: Decimal | None = None
+        raw = redis.get(f"perp_mark:{instrument_id}")
+        if raw is not None:
+            try:
+                mark = Decimal(str(_json.loads(raw)["mark_price"]))
+            except (ValueError, KeyError, TypeError):
+                mark = None
+
+        position = PerpPosition(quantity, entry, leverage)
+        tiers = [tuple(t) for t in conn.execute(_PERP_TIERS_SQL, (instrument_id,)).fetchall()]
+        liquidation = liquidation_price(position, margin=margin, tiers=tiers) if tiers else None
+
+        out.append(
+            PerpPositionOut(
+                instrument_id=instrument_id,
+                symbol=symbol,
+                quantity=str(quantity),
+                entry_price=str(entry),
+                leverage=str(leverage),
+                reserved_margin=str(margin),
+                realised_pnl=str(realised),
+                funding_paid=str(funding),
+                mark=None if mark is None else str(mark),
+                unrealised_pnl=(
+                    None if mark is None else str(unrealised_pnl(position, mark=mark))
+                ),
+                liquidation_price=None if liquidation is None else str(liquidation),
+            )
+        )
+    return out
 
 
 @router.delete("/orders/{order_id}", response_model=Order)

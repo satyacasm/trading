@@ -22,6 +22,14 @@ export type OrderDraft = {
   quantity: string;
   limitPrice: string;
   rationale: string;
+  /** Required for a perpetual, meaningless otherwise. */
+  leverage?: string;
+  /**
+   * Whether this instrument settles as a derivative. Drives both the
+   * leverage requirement and the fact that a SELL opens a short rather
+   * than needing a position behind it.
+   */
+  isPerpetual?: boolean;
 };
 
 /**
@@ -42,6 +50,19 @@ export function validateOrderDraft(draft: OrderDraft): string | null {
   if (quantity <= 0) return "Quantity must be greater than zero.";
 
   if (draft.rationale.trim() === "") return "Say why you're placing this trade.";
+
+  // Only a perpetual has leverage, and it must declare one: the platform
+  // refuses to assume a number that decides how much margin the position
+  // locks up. A value left in the field after switching to a spot
+  // instrument is ignored rather than rejected, exactly as a stale limit
+  // price is on a MARKET order.
+  if (draft.isPerpetual) {
+    const leverage = Number(draft.leverage);
+    if ((draft.leverage ?? "").trim() === "") return "A perpetual order needs a leverage.";
+    if (Number.isNaN(leverage) || leverage <= 0) {
+      return "Leverage must be a number greater than zero.";
+    }
+  }
 
   // Only a limit order carries a limit price, so a stale value left in the
   // field after switching back to MARKET is ignored rather than rejected.

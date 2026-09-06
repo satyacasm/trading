@@ -130,6 +130,9 @@ export type CreateOrderBody = {
   product: "DELIVERY" | "INTRADAY";
   time_in_force: "DAY" | "GTC";
   rationale: string;
+  /** Required for a perpetual, null otherwise. The platform refuses to
+   *  assume one: it decides how much margin the position locks up. */
+  leverage?: string | null;
   idempotency_key: string;
 };
 
@@ -190,6 +193,29 @@ export async function createPortfolio(body: {
     body: JSON.stringify(body),
   });
   if (!res.ok) throw await readError(res, `POST /portfolios failed: ${res.status}`);
+  return res.json();
+}
+
+export type PerpPosition = {
+  instrument_id: number;
+  symbol: string;
+  /** Signed: negative is short. There is no side field. */
+  quantity: string;
+  entry_price: string;
+  leverage: string;
+  /** Reserved, not spent -- it is not gone from your cash. */
+  reserved_margin: string;
+  realised_pnl: string;
+  /** Positive means this position has paid funding; negative means it collected. */
+  funding_paid: string;
+  mark: string | null;
+  unrealised_pnl: string | null;
+  liquidation_price: string | null;
+};
+
+export async function fetchPerpPositions(portfolioId: number): Promise<PerpPosition[]> {
+  const res = await fetch(`${API_URL}/portfolios/${portfolioId}/perp-positions`);
+  if (!res.ok) throw await readError(res, `GET perp positions failed: ${res.status}`);
   return res.json();
 }
 

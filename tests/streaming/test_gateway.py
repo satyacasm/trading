@@ -66,14 +66,17 @@ def test_instruments_endpoint_lists_crypto_and_equity_instruments(
     assert response.status_code == 200
     body = response.json()
 
-    by_symbol = {row["symbol"]: row for row in body}
-    assert by_symbol["BTC-USDT"]["instrument_id"] == seeded_instrument_id
-    assert by_symbol["BTC-USDT"]["asset_class"] == "CRYPTO"
-    assert by_symbol["BTC-USDT"]["exchange"] == "BINANCE"
-    assert set(by_symbol) >= set(CRYPTO_PAIRS)
+    # Keyed by (symbol, asset_class), because symbol alone stopped being
+    # unique when perpetuals arrived: BTC-USDT spot and BTC-USDT perpetual
+    # are different instruments with the same name, different prices and
+    # different cost models. Anything that identifies an instrument by
+    # symbol -- including a picker in the UI -- has to say which.
+    by_key = {(row["symbol"], row["asset_class"]): row for row in body}
+    assert by_key[("BTC-USDT", "CRYPTO")]["instrument_id"] == seeded_instrument_id
+    assert by_key[("BTC-USDT", "CRYPTO")]["exchange"] == "BINANCE"
+    assert {symbol for symbol, kind in by_key if kind == "CRYPTO"} >= set(CRYPTO_PAIRS)
 
-    assert by_symbol["RELIANCE"]["asset_class"] == "EQUITY"
-    assert by_symbol["RELIANCE"]["exchange"] == "NSE"
+    assert by_key[("RELIANCE", "EQUITY")]["exchange"] == "NSE"
 
 
 def test_instruments_endpoint_performs_no_writes(
@@ -242,3 +245,28 @@ def test_ws_rejects_a_non_hashable_instrument_id_and_stays_connected(
 
         received = json.loads(ws.receive_text())
         assert received == published
+
+
+def test_instruments_endpoint_lists_perpetuals_distinguishably(
+    client: TestClient, seeded_instrument_id: int
+) -> None:
+    """A perpetual absent from this list cannot be charted, watched or
+    ordered from the UI at all, however completely the backend supports
+    it -- which is exactly the state it was in when the order ticket had
+    no way to go short.
+
+    It must also be tellable from its spot twin: same symbol, different
+    instrument, different price series, different cost model.
+    """
+
+    body = client.get("/instruments").json()
+    perps = [row for row in body if row["asset_class"] == "PERP"]
+    if not perps:  # pragma: no cover - only when the universe is unseeded
+        return
+
+    perp = next(row for row in perps if row["symbol"] == "BTC-USDT")
+    spot = next(
+        row for row in body if row["symbol"] == "BTC-USDT" and row["asset_class"] == "CRYPTO"
+    )
+    assert perp["instrument_id"] != spot["instrument_id"]
+    assert perp["exchange"] == "BINANCE_FUTURES"

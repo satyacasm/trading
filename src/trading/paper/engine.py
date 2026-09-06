@@ -117,6 +117,7 @@ from trading.paper.breaker import (
     trip,
 )
 from trading.paper.charges import (
+    BROKER_BY_ASSET_CLASS,
     AmbiguousChargeSchedule,
     InvalidChargeSchedule,
     MissingChargeSchedule,
@@ -153,10 +154,7 @@ _IST = ZoneInfo("Asia/Kolkata")
 # identical mapping -- duplicated rather than imported, since api.py's copy
 # is a private, route-local constant and this module has no other reason
 # to depend on the HTTP layer.
-_BROKER_BY_ASSET_CLASS: dict[str, str] = {
-    "EQUITY": "UPSTOX",
-    "CRYPTO": "BINANCE",
-}
+_BROKER_BY_ASSET_CLASS = BROKER_BY_ASSET_CLASS
 
 _TERMINAL_ORDER_STATUSES = frozenset(
     {OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED}

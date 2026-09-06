@@ -1,6 +1,6 @@
 # Where this project stands
 
-**Updated:** 2026-09-05, ~11:40 IST. Keep this file current — it is the
+**Updated:** 2026-09-06, ~14:30 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ---
@@ -42,7 +42,7 @@ change), and the post-tax P&L lens.
 
 ---
 
-## Phase 3.5 — crypto perpetuals (tasks 1 and 2 shipped 2026-09-05)
+## Phase 3.5 — crypto perpetuals (tasks 1-5 shipped, 2026-09-05/06)
 
 Design: `docs/superpowers/specs/2026-09-05-crypto-perpetuals-design.md`.
 A separate derivative core beside spot, not a flag on it: spot keeps its
@@ -69,8 +69,40 @@ That is the number whose omission makes every carry strategy backtest as
 free money. And Binance's last kline is the interval still open: taking it
 is lookahead arriving through the live feed.
 
-**Not tradeable yet.** No charge schedule and no margin tiers, so an order
-is refused at submission. That is task 3 onward.
+**Task 3 — signed positions.** 85 margin tiers seeded from Binance's
+signed endpoint. `perp_positions.quantity` is signed with no
+`ck_no_negative_position`: the sign is the direction. A short can be
+placed, filled and seen in equity. The gate that had to move was
+`_require_sufficient_position` -- for a perpetual the sell IS the
+position -- replaced by four checks: leverage declared, quantity on the
+contract step, leverage inside the tier ceiling, margin actually free.
+
+**Task 4 — funding.** Settles on the 00/08/16 UTC boundaries, half-open
+`(since, until]` so adjacent windows partition the timeline and a process
+asleep across two settles both. Its own `FUNDING` ledger type, because a
+charge always costs the holder and funding pays one side.
+
+**Task 5 — liquidation.** On the mark, never last traded. Solved from the
+definition, so at the liquidation price remaining equity equals the
+maintenance requirement exactly. The forced close goes through the
+ordinary order and fill path, so it lands in the blotter with a rationale
+naming both numbers. Beyond bankruptcy the fill is capped and the gap
+recorded -- a real venue's insurance fund would have covered it.
+
+**Worth not relearning:** at 20x, bankruptcy is exactly 5% from entry
+(1/leverage) and liquidation sits ~0.4% inside it. That buffer is narrow,
+and a test that picks a mark "well past the line" is testing the
+bankruptcy cap, not liquidation.
+
+**Open:** grade the liquidation price against Binance's own calculator,
+the way Task 12 graded charges against Upstox's. Internal consistency is
+necessary, not sufficient.
+
+**Left in the phase:** task 6 (contract and runtime -- manifest leverage,
+short orders from a strategy, `ctx.data` funding series) and task 7
+(perp-aware backtesting, funding and liquidation in the report). Nothing
+perpetual reaches a strategy yet; everything so far is the engine and the
+manual order path.
 
 ---
 

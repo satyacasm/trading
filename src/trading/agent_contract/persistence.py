@@ -90,6 +90,40 @@ _SELECT_FILLS = f"""
     WHERE backtest_run_id = %s ORDER BY ordinal
 """
 
+_LIQUIDATION_COLUMNS = (
+    "ts",
+    "instrument_id",
+    "quantity",
+    "mark",
+    "fill_price",
+    "equity",
+    "maintenance",
+    "fee",
+)
+
+_INSERT_FUNDING = """
+    INSERT INTO backtest_funding (backtest_run_id, instrument_id, amount)
+    VALUES (%s, %s, %s)
+"""
+
+_SELECT_FUNDING = """
+    SELECT f.instrument_id, i.symbol, f.amount
+    FROM backtest_funding f JOIN instruments i USING (instrument_id)
+    WHERE f.backtest_run_id = %s ORDER BY i.symbol
+"""
+
+_INSERT_LIQUIDATION = f"""
+    INSERT INTO backtest_liquidations (
+        backtest_run_id, ordinal, {", ".join(_LIQUIDATION_COLUMNS)}
+    ) VALUES ({", ".join(["%s"] * (len(_LIQUIDATION_COLUMNS) + 2))})
+"""
+
+_SELECT_LIQUIDATIONS = f"""
+    SELECT l.ordinal, i.symbol, {", ".join("l." + c for c in _LIQUIDATION_COLUMNS)}
+    FROM backtest_liquidations l JOIN instruments i USING (instrument_id)
+    WHERE l.backtest_run_id = %s ORDER BY l.ordinal
+"""
+
 _INSERT_POINT = """
     INSERT INTO backtest_equity_points (backtest_run_id, ts, equity, cash)
     VALUES (%s, %s, %s, %s)
@@ -181,6 +215,34 @@ def record_backtest_run(
                 [
                     (run_id, index, *(fill.get(column) for column in _FILL_COLUMNS))
                     for index, fill in enumerate(ledger)
+                ],
+            )
+
+    funding = outcome.get("funding_paid") or []
+    if funding:
+        with conn.cursor() as cur:
+            cur.executemany(
+                _INSERT_FUNDING,
+                [
+                    (run_id, int(row["instrument_id"]), _money(row["amount"]))
+                    for row in funding
+                ],
+            )
+
+    liquidations = outcome.get("liquidations") or []
+    if liquidations:
+        with conn.cursor() as cur:
+            cur.executemany(
+                _INSERT_LIQUIDATION,
+                [
+                    (
+                        run_id,
+                        index,
+                        event["ts"],
+                        int(event["instrument_id"]),
+                        *(_money(event[c]) for c in _LIQUIDATION_COLUMNS[2:]),
+                    )
+                    for index, event in enumerate(liquidations)
                 ],
             )
 
@@ -290,6 +352,22 @@ def get_backtest_run(conn: Connection, backtest_run_id: int) -> dict[str, Any]:
             )
         )
         for row in conn.execute(_SELECT_FILLS, (backtest_run_id,)).fetchall()
+    ]
+    run["funding"] = [
+        {"instrument_id": instrument_id, "symbol": symbol, "amount": str(amount)}
+        for instrument_id, symbol, amount in conn.execute(
+            _SELECT_FUNDING, (backtest_run_id,)
+        ).fetchall()
+    ]
+    run["liquidations"] = [
+        {
+            "ordinal": row[0],
+            "symbol": row[1],
+            "ts": row[2].isoformat(),
+            "instrument_id": row[3],
+            **{c: str(v) for c, v in zip(_LIQUIDATION_COLUMNS[2:], row[4:], strict=True)},
+        }
+        for row in conn.execute(_SELECT_LIQUIDATIONS, (backtest_run_id,)).fetchall()
     ]
     run["equity_curve"] = [
         {"ts": ts.isoformat(), "equity": str(equity), "cash": str(cash)}

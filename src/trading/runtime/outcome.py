@@ -54,3 +54,12 @@ class RunOutcome:
     # Present on the crash path too -- a partial ledger says what a run paid
     # before it died, as a partial curve says where it died.
     fill_ledger: tuple[dict[str, str], ...] = ()
+    # What funding cost (positive) or paid (negative), per instrument. Kept
+    # apart from trading P&L because a carry strategy's entire return is
+    # this number, and burying it in the trading result makes the two
+    # indistinguishable in a report.
+    funding_paid: tuple[dict[str, str], ...] = ()
+    # Positions the exchange closed, each naming the mark and the
+    # requirement it fell below. A position that simply vanished from a
+    # report is unexplainable months later.
+    liquidations: tuple[dict[str, str], ...] = ()

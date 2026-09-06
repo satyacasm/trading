@@ -34,7 +34,22 @@ from psycopg import Connection
 
 from trading.paper.enums import EntryType, OrderStatus, OrderType, Product, Side, TimeInForce
 from trading.paper.models import ChargeBreakdown, FillDecision, Order
-from trading.paper.perp import PerpPosition, Tier, maintenance_margin, unrealised_pnl
+
+# The arithmetic lives in `perp`, which imports nothing. The strategy
+# runtime needs it and is copied into a container with no database, no
+# structlog and no psycopg -- a pure function in an I/O module is a pure
+# function the sandbox cannot have. Re-exported so callers of this module
+# keep working.
+from trading.paper.perp import (
+    PerpPosition,
+    Tier,
+    bankruptcy_price,
+    liquidation_price,
+    maintenance_margin,
+    position_equity,
+    should_liquidate,
+    unrealised_pnl,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -46,104 +61,6 @@ __all__ = [
     "position_equity",
     "should_liquidate",
 ]
-
-
-def position_equity(position: PerpPosition, *, margin: Decimal, mark: Decimal) -> Decimal:
-    """What is left of the collateral behind this position.
-
-    The margin posted, plus whatever the move has done since entry. This
-    is the number the maintenance requirement is compared against, and it
-    is deliberately *this position's* equity rather than the portfolio's:
-    isolated margin means one position's loss cannot reach another's
-    collateral.
-    """
-    return margin + unrealised_pnl(position, mark=mark)
-
-
-def should_liquidate(
-    position: PerpPosition, *, margin: Decimal, mark: Decimal, tiers: Sequence[Tier]
-) -> bool:
-    """Whether the exchange would close this position at `mark`.
-
-    Strictly below, matching the circuit breaker's convention: a position
-    landing exactly on its requirement is still adequately margined, and
-    a boundary that liquidates on equality closes positions the exchange
-    would have left alone.
-    """
-    if position.is_flat:
-        return False
-    required = maintenance_margin(position.quantity, mark=mark, tiers=tiers)
-    return position_equity(position, margin=margin, mark=mark) < required
-
-
-def liquidation_price(
-    position: PerpPosition, *, margin: Decimal, tiers: Sequence[Tier]
-) -> Decimal | None:
-    """The mark at which this position would be closed, or None if flat.
-
-    Solved from the definition rather than pattern-matched from a
-    published formula, so it stays right when the inputs change. At the
-    liquidation price, remaining equity equals the requirement:
-
-        margin + quantity x (m - entry) = |quantity| x m x rate - deduction
-
-    Rearranged for a long (quantity positive), where `q` is the size:
-
-        m = (margin - q x entry + deduction) / (q x (rate - 1))
-
-    and for a short, where the unrealised term flips sign:
-
-        m = (margin + q x entry + deduction) / (q x (rate + 1))
-
-    The tier is chosen at the position's *entry* notional. A liquidating
-    position is usually near the tier it opened in, and solving for the
-    tier that the solution itself selects would need an iteration whose
-    only effect, at these sizes, is to move the answer by less than a tick.
-    Worth knowing rather than worth hiding: a position opened close to a
-    tier boundary can liquidate a little off this estimate.
-    """
-    if position.is_flat:
-        return None
-
-    size = abs(position.quantity)
-    entry_notional = size * position.entry_price
-    rate, deduction = _tier_for(entry_notional, tiers)
-
-    if position.quantity > 0:
-        return (margin - size * position.entry_price + deduction) / (size * (rate - 1))
-    return (margin + size * position.entry_price + deduction) / (size * (rate + 1))
-
-
-def _tier_for(notional: Decimal, tiers: Sequence[Tier]) -> tuple[Decimal, Decimal]:
-    for floor, cap, rate, deduction in tiers:
-        if floor <= notional <= cap:
-            return rate, deduction
-    raise LookupError(
-        f"no maintenance tier covers a notional of {notional}; a position the exchange "
-        "would not have permitted has no liquidation price either"
-    )
-
-
-def bankruptcy_price(position: PerpPosition, *, margin: Decimal) -> Decimal | None:
-    """The mark at which this position has consumed exactly its margin.
-
-    Beyond the liquidation price, and the difference between them is the
-    maintenance buffer -- the room the exchange keeps so it can close the
-    position while something is still left to close it with.
-
-    A real venue closes between the two and its insurance fund covers any
-    gap when the market moves faster than that. This platform has no fund,
-    so a fill beyond here is capped at this price and the shortfall is
-    recorded rather than silently absorbed: pretending the loss stopped at
-    the margin would understate what leverage actually did.
-    """
-    if position.is_flat:
-        return None
-    size = abs(position.quantity)
-    per_unit = margin / size
-    if position.quantity > 0:
-        return position.entry_price - per_unit
-    return position.entry_price + per_unit
 
 
 @dataclass(frozen=True)

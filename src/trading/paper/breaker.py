@@ -97,6 +97,7 @@ from zoneinfo import ZoneInfo
 
 from trading.paper.enums import OrderStatus
 from trading.paper.models import Position
+from trading.paper.perp import PerpPosition, unrealised_pnl
 
 if TYPE_CHECKING:
     # trading.runtime imports this module for its pure evaluate_breach;
@@ -161,13 +162,30 @@ class MissingMark(Exception):
 
 
 def compute_equity(
-    cash: Decimal, positions: Sequence[Position], marks: Mapping[int, Decimal]
+    cash: Decimal,
+    positions: Sequence[Position],
+    marks: Mapping[int, Decimal],
+    *,
+    perp_positions: Sequence[tuple[int, PerpPosition]] = (),
+    perp_marks: Mapping[int, Decimal] | None = None,
 ) -> Decimal:
-    """Cash plus every held position, marked to `marks`. Pure.
+    """Cash, plus spot marked to `marks`, plus perpetual profit. Pure.
+
+    The two terms are different on purpose, and it is the difference that
+    matters most in this file:
+
+        cash + SUM spot_qty x mark  +  SUM perp_qty x (mark - entry)
+
+    Buying spot already moved cash by the full notional, so its position is
+    worth `quantity x mark`. Opening a perpetual moves no cash at all --
+    margin is reserved, not spent -- so only the *change* since entry
+    belongs in equity. Applying the spot formula to a perpetual would
+    credit a portfolio with the whole position value out of nowhere, and
+    subtract it for a short.
 
     A position with `quantity == 0` (fully closed but still present as a
-    `positions` row) contributes nothing and needs no mark -- only a held
-    position can misprice equity, so only a held position requires one.
+    row) contributes nothing and needs no mark -- only a held position can
+    misprice equity, so only a held position requires one.
     """
     equity = cash
     for position in positions:
@@ -183,6 +201,20 @@ def compute_equity(
                 "failing loudly instead"
             )
         equity += position.quantity * mark
+
+    available = perp_marks or {}
+    for instrument_id, perp in perp_positions:
+        if perp.is_flat:
+            continue
+        mark = available.get(instrument_id)
+        if mark is None:
+            raise MissingMark(
+                f"no mark available for perpetual instrument_id={instrument_id} "
+                f"(quantity={perp.quantity}); refusing to value an open perpetual at "
+                "zero or at entry -- and unlike a spot holding this one can lose more "
+                "than it cost, so guessing is worse here than anywhere"
+            )
+        equity += unrealised_pnl(perp, mark=mark)
     return equity
 
 

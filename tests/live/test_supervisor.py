@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import io
+import json
 import subprocess
+from decimal import Decimal
 from unittest.mock import MagicMock
 
 from trading.live.protocol import FRAME_ERROR, FRAME_ORDERS, encode_frame
@@ -193,3 +195,65 @@ def test_a_refused_order_reaches_the_row(monkeypatch) -> None:  # noqa: ANN001
     assert run.orders_placed == 0
     written = conn.execute.call_args[0][1]
     assert 1 in written and "the currency gate said no" in written
+
+
+def test_a_perpetual_order_carries_its_leverage_to_the_gateway(monkeypatch) -> None:  # noqa: ANN001
+    """A short reaches the gateway only if it says what leverage it is at.
+    Without it the order is refused -- correctly, since leverage decides
+    the margin locked up -- and the strategy sits at zero fills with the
+    reason buried in a refusal count."""
+    import urllib.error
+    import urllib.request
+
+    from trading.live import supervisor
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status = 201
+
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    def _urlopen(request, timeout=None):  # noqa: ANN001, ANN202, ARG001
+        captured.update(json.loads(request.data))
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    run = _run([])
+    run.leverage = Decimal("20")
+
+    assert supervisor.place_order("http://x", run, _intent(), 0) is True
+    assert captured["leverage"] == "20"
+
+
+def test_an_unlevered_run_sends_no_leverage_at_all(monkeypatch) -> None:  # noqa: ANN001
+    """None, not 1. An equity strategy has no leverage concept, and
+    sending 1 would put a number that reads as a fact on every order this
+    platform has ever placed."""
+    import urllib.error
+    import urllib.request
+
+    from trading.live import supervisor
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status = 201
+
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda request, timeout=None: (captured.update(json.loads(request.data)), _Response())[1],  # noqa: ARG005
+    )
+    assert supervisor.place_order("http://x", _run([]), _intent(), 0) is True
+    assert captured["leverage"] is None

@@ -81,6 +81,10 @@ class LiveRun:
     # every bar reads as an idle one unless the count is kept.
     orders_refused: int = 0
     last_refusal: str | None = None
+    # What the manifest declared, or None for a strategy that trades
+    # nothing levered. Sent on every order this run places: the gateway
+    # requires it for a perpetual and refuses it as meaningless otherwise.
+    leverage: Decimal | None = None
     _order_times: list[float] = field(default_factory=list)
 
     def over_rate_limit(self) -> bool:
@@ -106,6 +110,7 @@ def start_run(
     starting_cash: Decimal,
     slippage_bps: Decimal,
     limits: SandboxLimits | None = None,
+    leverage: Decimal | None = None,
 ) -> LiveRun:
     """Launch a strategy's container and record the run.
 
@@ -135,6 +140,7 @@ def start_run(
             starting_cash=starting_cash,
             slippage_bps=slippage_bps,
             charge_schedules=tuple(schedules),
+            leverage=leverage,
         )
     )
     process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
@@ -162,6 +168,7 @@ def start_run(
         instrument_ids=set(instrument_ids),
         runtime=resolved.runtime or "runc",
         kernel_isolated=(resolved.runtime or "runc") in {"runsc"},
+        leverage=leverage,
     )
 
 
@@ -277,6 +284,7 @@ def place_order(api_url: str, run: LiveRun, intent: dict[str, Any], seq: int) ->
             "limit_price": intent["limit_price"],
             "product": intent["product"],
             "rationale": intent["rationale"],
+            "leverage": None if run.leverage is None else str(run.leverage),
             "idempotency_key": f"live-{run.live_run_id}-{seq}",
             "live_run_id": run.live_run_id,
         }
@@ -389,6 +397,7 @@ def reconcile(conn: Connection, runs: dict[int, LiveRun]) -> None:
             continue
         try:
             instrument_ids = resolve_universe(conn, manifest, datetime.now(UTC).date())
+            declared_leverage = _manifest_leverage(manifest)
             broker, exchange, asset_class = _charge_key_for(conn, instrument_ids)
             schedules = load_schedules(
                 conn, broker, exchange, asset_class, Product.DELIVERY, datetime.now(UTC).date()
@@ -406,7 +415,19 @@ def reconcile(conn: Connection, runs: dict[int, LiveRun]) -> None:
             instrument_ids,
             schedules,
             Decimal(str(cash)),
+            leverage=declared_leverage,
         )
+
+
+def _manifest_leverage(manifest: Any) -> Decimal | None:
+    """What the manifest declared, as a Decimal.
+
+    Read as a string first: the manifest is stored as JSON, and a leverage
+    that arrived as a float would carry binary error into the margin the
+    order reserves.
+    """
+    raw = (manifest or {}).get("leverage")
+    return None if raw is None else Decimal(str(raw))
 
 
 def stop_run_row(conn: Connection, live_run_id: int, status: str, reason: str) -> None:
@@ -434,6 +455,7 @@ def _launch(
     schedules: Any,
     starting_cash: Decimal,
     limits: SandboxLimits | None = None,
+    leverage: Decimal | None = None,
 ) -> LiveRun:
     """Start a container for a run row that already exists."""
     resolved = _resolve_limits(limits)
@@ -468,6 +490,7 @@ def _launch(
         instrument_ids=set(instrument_ids),
         runtime=resolved.runtime or "runc",
         kernel_isolated=(resolved.runtime or "runc") == "runsc",
+        leverage=leverage,
     )
 
 

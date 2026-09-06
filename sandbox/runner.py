@@ -267,6 +267,7 @@ def main() -> int:
             # None for a smoke run, which dispatches every bar it is given.
             dispatch_from=payload.dispatch_from,
             perp_instruments=payload.perp_instruments,
+            funding_rates=_funding_rates(payload),
         )
     except BaseException:  # noqa: BLE001 - the loop itself failing is still an outcome
         _emit(
@@ -343,6 +344,7 @@ def _run_live(payload, instance, manifest, strategy_cls):  # noqa: ANN001, ANN20
             else getattr(manifest, "max_drawdown_pct", None)
         ),
         perp_instruments=payload.perp_instruments,
+        funding_rates=_funding_rates(payload),
     )
 
     def _write(line: str) -> None:
@@ -437,6 +439,21 @@ def _parse_ts(raw):  # noqa: ANN001, ANN202
     from datetime import datetime
 
     return datetime.fromisoformat(raw)
+
+
+def _funding_rates(payload):  # noqa: ANN001, ANN202
+    """The payload's settlement rows as the loop's `(instrument, ts)` map.
+
+    Decimal, not float: this multiplies a position notional to move cash,
+    three times a day, for the length of the run.
+    """
+    from datetime import datetime
+    from decimal import Decimal
+
+    return {
+        (int(row["instrument_id"]), datetime.fromisoformat(row["ts"])): Decimal(row["rate"])
+        for row in payload.funding_rates
+    }
 
 
 def _order_intent(order):  # noqa: ANN001, ANN202

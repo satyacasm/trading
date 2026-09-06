@@ -16,6 +16,15 @@ from trading.runtime.state import RunState
 D = Decimal
 
 
+def _flat_rates(instrument_id: int, rate: Decimal) -> dict[tuple[int, datetime], Decimal]:
+    """The same rate at every boundary in the tested window. Real rates
+    move -- `test_funding_in_loop` covers that -- but a test about *how
+    many* boundaries a step crosses is clearer when the rate does not."""
+    return {(instrument_id, datetime(2026, 9, 5, hour, tzinfo=UTC)): rate for hour in (8, 16)} | {
+        (instrument_id, datetime(2026, 9, 6, 0, tzinfo=UTC)): rate
+    }
+
+
 def _position(instrument_id: int, quantity: str, avg_cost: str):
     from trading.paper.models import Position
 
@@ -157,7 +166,7 @@ def test_funding_settles_at_the_boundaries_a_bar_crossed() -> None:
         state,
         previous=datetime(2026, 9, 5, tzinfo=UTC),
         now=datetime(2026, 9, 6, tzinfo=UTC),
-        rates={7: D("0.0001")},
+        rates=_flat_rates(7, D("0.0001")),
     )
     # Three boundaries crossed (08:00, 16:00, 00:00), 8 received each time.
     assert state.cash == D("100024")
@@ -174,7 +183,7 @@ def test_a_long_pays_across_the_same_step() -> None:
         state,
         previous=datetime(2026, 9, 5, tzinfo=UTC),
         now=datetime(2026, 9, 6, tzinfo=UTC),
-        rates={7: D("0.0001")},
+        rates=_flat_rates(7, D("0.0001")),
     )
     assert state.cash == D("99976")
 
@@ -189,7 +198,7 @@ def test_a_step_inside_one_interval_settles_nothing() -> None:
         state,
         previous=datetime(2026, 9, 5, 9, tzinfo=UTC),
         now=datetime(2026, 9, 5, 15, tzinfo=UTC),
-        rates={7: D("0.0001")},
+        rates=_flat_rates(7, D("0.0001")),
     )
     assert state.cash == D("100000")
 
@@ -204,6 +213,6 @@ def test_a_spot_position_never_accrues_funding() -> None:
         state,
         previous=datetime(2026, 9, 5, tzinfo=UTC),
         now=datetime(2026, 9, 6, tzinfo=UTC),
-        rates={1: D("0.0001")},
+        rates=_flat_rates(1, D("0.0001")),
     )
     assert state.cash == D("100000")

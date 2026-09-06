@@ -47,7 +47,7 @@ from trading.agent_contract.sandbox import (
 from trading.agent_contract.validation import Finding, ValidationReport
 from trading.config import get_settings
 from trading.corpactions.adjust import adjusted_bars
-from trading.paper.charges import load_schedules
+from trading.paper.charges import BROKER_BY_ASSET_CLASS, load_schedules
 from trading.paper.enums import Product
 from trading.paper.models import ChargeSchedule
 from trading.runtime.payload import MODE_SMOKE, SmokePayload
@@ -609,7 +609,7 @@ def resolve_universe(conn: Connection, manifest: dict[str, Any], as_of: date) ->
     return [row[0] for row in rows]
 
 
-_BROKER_FOR_ASSET_CLASS = {"EQUITY": "UPSTOX", "CRYPTO": "BINANCE", "PERP": "BINANCE"}
+_BROKER_FOR_ASSET_CLASS = BROKER_BY_ASSET_CLASS
 
 
 def _perp_instruments(conn: Connection, instrument_ids: Sequence[int]) -> tuple[int, ...]:

@@ -15,6 +15,12 @@ import {
 type Props = {
   instrumentId: number;
   symbol: string;
+  /**
+   * `PERP` changes three things: a SELL opens a short instead of needing a
+   * position behind it, the order must declare a leverage, and the product
+   * is INTRADAY because a perpetual is never delivered.
+   */
+  assetClass?: string;
   /** Latest traded price, or null before the first tick arrives. */
   referencePrice: number | null;
   /** Called after a successful submit, so the page can refresh what it shows. */
@@ -27,7 +33,14 @@ function formatMoney(value: number): string {
   return value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-export function OrderTicket({ instrumentId, symbol, referencePrice, onSubmitted }: Props) {
+export function OrderTicket({
+  instrumentId,
+  symbol,
+  assetClass,
+  referencePrice,
+  onSubmitted,
+}: Props) {
+  const isPerpetual = assetClass === "PERP";
   const { portfolios, selected, selectedId, setSelectedId, error: portfolioError } = usePortfolios();
 
   const [side, setSide] = useState<OrderSide>("BUY");
@@ -36,11 +49,21 @@ export function OrderTicket({ instrumentId, symbol, referencePrice, onSubmitted 
   const [limitPrice, setLimitPrice] = useState("");
   const [product, setProduct] = useState<(typeof PRODUCTS)[number]>("DELIVERY");
   const [rationale, setRationale] = useState("");
+  const [leverage, setLeverage] = useState("5");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [placed, setPlaced] = useState<Order | null>(null);
 
-  const draft: OrderDraft = { portfolioId: selectedId, side, orderType, quantity, limitPrice, rationale };
+  const draft: OrderDraft = {
+    portfolioId: selectedId,
+    side,
+    orderType,
+    quantity,
+    limitPrice,
+    rationale,
+    leverage,
+    isPerpetual,
+  };
   const notional = estimatedNotional(quantity, orderType === "LIMIT" ? Number(limitPrice) || null : referencePrice);
 
   async function submit(event: React.FormEvent) {
@@ -62,9 +85,14 @@ export function OrderTicket({ instrumentId, symbol, referencePrice, onSubmitted 
         order_type: orderType,
         quantity,
         limit_price: orderType === "LIMIT" ? limitPrice : null,
-        product,
-        time_in_force: orderType === "LIMIT" ? "GTC" : "DAY",
+        // A perpetual has no expiry to deliver at, so its charges are
+        // seeded under INTRADAY and DELIVERY would find no schedule.
+        product: isPerpetual ? "INTRADAY" : product,
+        // GTC for a perpetual whatever the order type: the market never
+        // closes, so there is no session for a DAY order to expire at.
+        time_in_force: isPerpetual || orderType === "LIMIT" ? "GTC" : "DAY",
         rationale,
+        leverage: isPerpetual ? leverage : null,
         // One key per submission. The API treats a repeated key as the same
         // order and returns the original, which is what makes a double-click
         // safe -- but a deliberate second identical order must still be a
@@ -213,6 +241,35 @@ export function OrderTicket({ instrumentId, symbol, referencePrice, onSubmitted 
             <span className="text-muted text-xs ml-2">before charges</span>
           </dd>
         </dl>
+
+        {isPerpetual ? (
+          <div className="flex flex-col gap-1">
+            <label htmlFor="leverage" className="text-muted text-xs tracking-wide uppercase">
+              Leverage
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                id="leverage"
+                type="text"
+                inputMode="decimal"
+                value={leverage}
+                onChange={(e) => setLeverage(e.target.value)}
+                className="border-line bg-raised num w-20 rounded border px-2 py-1 text-sm"
+              />
+              <span className="text-muted num text-xs">
+                {notional !== null && Number(leverage) > 0
+                  ? `margin ${formatMoney(notional / Number(leverage))}`
+                  : "margin is reserved, not spent"}
+              </span>
+            </div>
+            <p className="text-muted max-w-prose text-xs">
+              A perpetual has no expiry. {sideIsBuy ? "Buying" : "Selling"} opens a{" "}
+              {sideIsBuy ? "long" : "short"} — a sell needs no position behind it — and
+              funding settles every eight hours on notional rather than on margin, so
+              leverage multiplies it.
+            </p>
+          </div>
+        ) : null}
 
         <button
           type="submit"

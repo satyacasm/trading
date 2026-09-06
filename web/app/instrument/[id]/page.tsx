@@ -341,6 +341,7 @@ export default function InstrumentPage() {
           <OrderTicket
             instrumentId={instrumentId}
             symbol={symbolLabel}
+            assetClass={instrument?.asset_class}
             referencePrice={header.price}
           />
         </div>

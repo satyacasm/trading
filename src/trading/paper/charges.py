@@ -21,6 +21,23 @@ from typing import TYPE_CHECKING
 from trading.paper.enums import ChargeBasis, ChargeType, Product, Rounding, Side
 from trading.paper.models import ChargeBreakdown, ChargeSchedule
 
+# Which broker's schedules price which asset class. One table, imported by
+# `paper.api` (which refuses an order it cannot price), `paper.engine`
+# (which refuses a fill it cannot price) and `agent_contract.smoke` (which
+# refuses a backtest it cannot price).
+#
+# There were three copies. Perpetuals were added to two, and an order then
+# passed the gateway and was rejected at fill time with "no charge schedule
+# covers this fill" -- a message that describes the symptom exactly and
+# names nothing that leads to the cause. An asset class absent here cannot
+# be traded, which is the correct default and must be a decision rather
+# than an omission.
+BROKER_BY_ASSET_CLASS: dict[str, str] = {
+    "EQUITY": "UPSTOX",
+    "CRYPTO": "BINANCE",
+    "PERP": "BINANCE",
+}
+
 if TYPE_CHECKING:
     # trading.runtime imports this module for its pure compute_charges;
     # psycopg must not load at runtime inside the sandbox, which has no

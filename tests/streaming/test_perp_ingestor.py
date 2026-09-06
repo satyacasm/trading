@@ -141,12 +141,23 @@ def test_a_mark_is_published_and_left_where_the_engine_can_read_it_back() -> Non
         index_price=Decimal("79612"),
         funding_rate=Decimal("0.00001036"),
         next_funding_time=datetime(2026, 9, 4, 16, 0, tzinfo=UTC),
+        as_of=datetime(2026, 9, 4, 15, 45, tzinfo=UTC),
     )
     publish_mark(FakeRedis(), mark)
 
-    assert published[0][0] == "perp_marks:7"
-    assert json.loads(published[0][1])["mark_price"] == "79580"
-    assert stored["perp_mark:7"] == published[0][1]
+    by_channel = dict(published)
+    assert json.loads(by_channel["perp_marks:7"])["mark_price"] == "79580"
+    assert stored["perp_mark:7"] == by_channel["perp_marks:7"]
+
+    # And a tick, because the paper engine prices resting orders from
+    # `ticks:*` and nowhere else. Without it a perpetual order rests
+    # forever -- which is what a short placed from the order ticket did.
+    tick = json.loads(by_channel["ticks:7"])
+    assert tick["price"] == "79580"
+    assert tick["ts"] == "2026-09-04T15:45:00+00:00"
+    # No size: a mark is not a trade. Inventing a volume would put a
+    # number in the tick stream that never happened.
+    assert tick["quantity"] == "0"
 
 
 def test_a_bar_is_published_once_however_often_it_is_polled(db_conn) -> None:

@@ -8,10 +8,12 @@ import {
   createPortfolio,
   fetchInstruments,
   fetchOrders,
+  fetchPerpPositions,
   fetchPositions,
   type InstrumentSummary,
   type Order,
   type OrderStatus,
+  type PerpPosition,
   type Position,
 } from "@/lib/api";
 import { usePortfolios } from "@/lib/usePortfolios";
@@ -65,6 +67,7 @@ export default function PortfolioPage() {
     usePortfolios();
 
   const [positions, setPositions] = useState<Position[]>([]);
+  const [perps, setPerps] = useState<PerpPosition[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
   const [instruments, setInstruments] = useState<Map<number, InstrumentSummary>>(new Map());
   const [marks, setMarks] = useState<Map<number, number>>(new Map());
@@ -80,12 +83,14 @@ export default function PortfolioPage() {
       return;
     }
     try {
-      const [pos, ords] = await Promise.all([
+      const [pos, ords, perpRows] = await Promise.all([
         fetchPositions(selectedId),
         fetchOrders(selectedId),
+        fetchPerpPositions(selectedId),
       ]);
       setPositions(pos);
       setOrders(ords);
+      setPerps(perpRows);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -294,6 +299,77 @@ export default function PortfolioPage() {
             </div>
           )}
         </section>
+
+        {perps.length > 0 && (
+          <section aria-labelledby="perps-heading">
+            <h2 id="perps-heading" className="font-display mb-3 text-sm tracking-wide">
+              PERPETUALS
+            </h2>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-muted border-line border-b text-left text-xs uppercase">
+                    <th className="px-3 py-2 font-normal">Contract</th>
+                    <th className="px-3 py-2 font-normal">Side</th>
+                    <th className="px-3 py-2 text-right font-normal">Size</th>
+                    <th className="px-3 py-2 text-right font-normal">Entry</th>
+                    <th className="px-3 py-2 text-right font-normal">Mark</th>
+                    <th className="px-3 py-2 text-right font-normal">Unrealised</th>
+                    <th className="px-3 py-2 text-right font-normal">Margin</th>
+                    <th className="px-3 py-2 text-right font-normal">Liquidation</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {perps.map((p) => {
+                    const short = Number(p.quantity) < 0;
+                    const pnl = p.unrealised_pnl === null ? null : Number(p.unrealised_pnl);
+                    return (
+                      <tr key={p.instrument_id} className="border-line/60 border-b">
+                        <td className="px-3 py-2">{p.symbol}</td>
+                        <td className={`px-3 py-2 ${short ? "text-down" : "text-up"}`}>
+                          {short ? "SHORT" : "LONG"} {Number(p.leverage)}x
+                        </td>
+                        {/* Absolute: the side column already carries the
+                            sign, and a size shown as -0.01 next to the word
+                            SHORT reads as a double negative. */}
+                        <td className="num px-3 py-2 text-right">
+                          {Math.abs(Number(p.quantity))}
+                        </td>
+                        <td className="num px-3 py-2 text-right">{formatMoney(Number(p.entry_price))}</td>
+                        <td className="num px-3 py-2 text-right">
+                          {p.mark === null ? "--" : formatMoney(Number(p.mark))}
+                        </td>
+                        <td
+                          className={`num px-3 py-2 text-right ${
+                            pnl === null ? "" : pnl >= 0 ? "text-up" : "text-down"
+                          }`}
+                        >
+                          {pnl === null ? "--" : formatMoney(pnl)}
+                        </td>
+                        {/* Reserved, not spent: it is still in your cash
+                            balance, just unavailable to open anything else. */}
+                        <td className="num text-muted px-3 py-2 text-right">
+                          {formatMoney(Number(p.reserved_margin))}
+                        </td>
+                        <td className="num text-down px-3 py-2 text-right">
+                          {p.liquidation_price === null
+                            ? "--"
+                            : formatMoney(Number(p.liquidation_price))}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <p className="text-muted mt-2 max-w-prose text-xs">
+              Margin is reserved, not spent — it is still in your cash balance, just
+              unavailable to open anything else. If the mark reaches the liquidation
+              price the exchange closes the position and charges a 1.25% fee; that is not
+              a circuit-breaker halt, and the rest of the portfolio keeps trading.
+            </p>
+          </section>
+        )}
 
         <section aria-labelledby="orders-heading">
           <h2 id="orders-heading" className="font-display text-sm tracking-wide mb-3">

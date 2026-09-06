@@ -106,3 +106,40 @@ describe("unrealisedPnl", () => {
     expect(unrealisedPnl({ quantity: 0, avgCost: 100 }, 110)).toBe(0);
   });
 });
+
+describe("a perpetual draft", () => {
+  const perp = (over: Partial<OrderDraft> = {}): OrderDraft => ({
+    portfolioId: 1,
+    side: "SELL",
+    orderType: "MARKET",
+    quantity: "0.5",
+    limitPrice: "",
+    rationale: "short the funding",
+    leverage: "10",
+    isPerpetual: true,
+    ...over,
+  });
+
+  it("accepts a sell with no position, because that is how you go short", () => {
+    expect(validateOrderDraft(perp())).toBeNull();
+  });
+
+  it("requires leverage, because it decides the margin locked up", () => {
+    expect(validateOrderDraft(perp({ leverage: "" }))).toMatch(/leverage/i);
+  });
+
+  it("refuses leverage that is not a positive number", () => {
+    expect(validateOrderDraft(perp({ leverage: "0" }))).toMatch(/leverage/i);
+    expect(validateOrderDraft(perp({ leverage: "-2" }))).toMatch(/leverage/i);
+    expect(validateOrderDraft(perp({ leverage: "abc" }))).toMatch(/leverage/i);
+  });
+
+  it("ignores leverage entirely on a spot draft", () => {
+    // A leverage left in the field after switching instruments must not
+    // reject an order the platform would happily accept -- the same
+    // reasoning that lets a stale limit price through on a MARKET order.
+    expect(
+      validateOrderDraft({ ...perp({ isPerpetual: false, leverage: "" }), side: "BUY" }),
+    ).toBeNull();
+  });
+});

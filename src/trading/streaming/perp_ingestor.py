@@ -47,6 +47,11 @@ log = structlog.get_logger(__name__)
 PREMIUM_INDEX_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
 
 MARK_CHANNEL = "perp_marks"
+# The paper engine prices every resting order from `ticks:*` and from
+# nowhere else, so a perpetual that publishes only marks and closed bars
+# leaves its orders resting forever -- which is exactly what a short
+# placed from the order ticket did before this existed.
+TICK_CHANNEL = "ticks"
 MARK_KEY = "perp_mark"
 # The aggregator's channel, spoken deliberately: the live supervisor learns
 # that a minute closed from `closed_bars:*` and nowhere else, so a perpetual
@@ -80,6 +85,7 @@ class Mark:
     index_price: Decimal
     funding_rate: Decimal
     next_funding_time: datetime
+    as_of: datetime
 
     def as_json(self) -> str:
         return json.dumps(
@@ -121,6 +127,7 @@ def marks_for(client: httpx.Client, instrument_ids: Mapping[str, int]) -> list[M
                     next_funding_time=datetime.fromtimestamp(
                         int(row["nextFundingTime"]) / 1000, UTC
                     ),
+                    as_of=datetime.fromtimestamp(int(row["time"]) / 1000, UTC),
                 )
             )
         except (KeyError, TypeError, ValueError, ArithmeticError):
@@ -129,15 +136,40 @@ def marks_for(client: httpx.Client, instrument_ids: Mapping[str, int]) -> list[M
 
 
 def publish_mark(redis: MarkSink, mark: Mark) -> None:
-    """Announce the mark, and leave it where it can be read back.
+    """Announce the mark, leave it where it can be read back, and price
+    resting orders against it.
 
-    Both, because they answer different questions. A subscriber listening
-    now wants the change; a liquidation check waking between publishes
-    wants the last known value, and pub/sub cannot answer that.
+    The first two answer different questions: a subscriber listening now
+    wants the change, and a liquidation check waking between publishes
+    wants the last known value, which pub/sub cannot give it.
+
+    The third is the fill path. The paper engine prices resting orders
+    from `ticks:*` and nowhere else, so without this a perpetual order
+    rests forever. **The mark, not a traded price** -- Binance's futures
+    trade stream is not available from this jurisdiction (see the module
+    docstring), and the mark is the price the same contract's liquidation
+    already uses, so one price concept governs both rather than two that
+    can disagree. It is index-derived and sits within a few basis points
+    of last, which is a smaller approximation than the open-high-low-close
+    path a backtest already accepts.
     """
     payload = mark.as_json()
     redis.publish(f"{MARK_CHANNEL}:{mark.instrument_id}", payload)
     redis.set(f"{MARK_KEY}:{mark.instrument_id}", payload)
+    redis.publish(
+        f"{TICK_CHANNEL}:{mark.instrument_id}",
+        json.dumps(
+            {
+                "instrument_id": mark.instrument_id,
+                "ts": mark.as_of.isoformat(),
+                "price": str(mark.mark_price),
+                # No size: a mark is not a trade and has no quantity. The
+                # engine reads price and timestamp; inventing a volume here
+                # would put a number in the tick stream that never happened.
+                "quantity": "0",
+            }
+        ),
+    )
 
 
 def closed_klines(

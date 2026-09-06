@@ -29,6 +29,7 @@ from trading.paper import api as paper_api
 from trading.streaming import market_data_api
 from trading.streaming.db import get_db_connection
 from trading.streaming.seed_instruments import crypto_canonical_keys, seed_crypto_instruments
+from trading.streaming.seed_perp_instruments import perp_canonical_keys
 from trading.streaming.seed_upstox_instruments import (
     seed_upstox_instrument_keys,
     upstox_canonical_keys,
@@ -113,7 +114,10 @@ def instruments(conn: Connection = Depends(get_db_connection)) -> list[Instrumen
     # resolves the watchlists' canonical keys in-process (no DB round trip,
     # no write) and looks up the matching rows by `canonical_key`, rather
     # than the whole `instruments` table.
-    canonical_keys = crypto_canonical_keys() + upstox_canonical_keys()
+    # Perpetuals belong here for the same reason spot does: an instrument
+    # absent from this list cannot be charted, watched, or ordered from the
+    # UI at all, however completely the backend supports it.
+    canonical_keys = crypto_canonical_keys() + upstox_canonical_keys() + perp_canonical_keys()
     if not canonical_keys:
         return []
     rows = conn.execute(

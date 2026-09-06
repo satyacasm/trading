@@ -223,10 +223,7 @@ def record_backtest_run(
         with conn.cursor() as cur:
             cur.executemany(
                 _INSERT_FUNDING,
-                [
-                    (run_id, int(row["instrument_id"]), _money(row["amount"]))
-                    for row in funding
-                ],
+                [(run_id, int(row["instrument_id"]), _money(row["amount"])) for row in funding],
             )
 
     liquidations = outcome.get("liquidations") or []

@@ -189,7 +189,8 @@ _TICK_PATTERN = "ticks:*"
 _BAR_PATTERN = "bars:*"
 
 _SELECT_UPSTOX_BOUND_INSTRUMENT_IDS = """
-    SELECT instrument_id FROM instruments WHERE source_bindings ? 'upstox_instrument_key'
+    SELECT instrument_id FROM instruments
+    WHERE source_bindings ? 'upstox_instrument_key' OR asset_class = 'PERP'
 """
 
 Sleeper = Callable[[float], Awaitable[None]]
@@ -216,12 +217,16 @@ def _parse_bar(raw: str) -> Bar | None:
 
 
 def _query_upstox_bound_instrument_ids(conn: Connection) -> set[int]:
-    """Instruments with an Upstox binding get their bars authoritatively
-    from `bars:*` (published from `marketOHLC`'s I1 entries) -- letting
-    the tick path also aggregate bars for them would both under-count
-    volume (mode "full" ticks are LTP snapshots, not a trade stream) and
-    race the good bars for the same `(instrument_id, ts, interval_sec)`
-    primary key, with the winner decided by arrival order."""
+    """Instruments whose bars come from somewhere better than our own
+    bucketing, and must not be built twice.
+
+    Upstox-bound instruments get theirs authoritatively from `bars:*`
+    (published from `marketOHLC`'s I1 entries). Perpetuals get theirs from
+    Binance's klines endpoint, polled by `perp_ingestor`. In both cases
+    letting the tick path also aggregate would under-count volume -- these
+    ticks are price snapshots, not a trade stream -- and race the good bars
+    for the same `(instrument_id, ts, interval_sec)` primary key, with the
+    winner decided by arrival order."""
     rows = conn.execute(_SELECT_UPSTOX_BOUND_INSTRUMENT_IDS).fetchall()
     return {int(row[0]) for row in rows}
 

@@ -67,3 +67,6 @@ class EntryType(StrEnum):
     FILL = "FILL"
     CHARGE = "CHARGE"
     DEPOSIT = "DEPOSIT"
+    # A perpetual's eight-hourly carry. Its own type, not a CHARGE: a
+    # charge always costs the holder, and funding pays one side.
+    FUNDING = "FUNDING"

@@ -297,11 +297,13 @@ def open_session(
     max_daily_loss: Decimal | None = None,
     max_drawdown_pct: Decimal | None = None,
     dispatch_from: datetime | None = None,
+    perp_instruments: Sequence[int] = (),
 ) -> Session:
     state = RunState(
         now=None,  # type: ignore[arg-type]  # set before any handler runs
         cash=starting_cash,
         starting_cash=starting_cash,
+        perp_instruments=set(perp_instruments),
     )
     state.cursor = dict.fromkeys(bars.instruments(), 0)
     state.day_open_equity = starting_cash
@@ -591,6 +593,7 @@ def run_loop(
     max_daily_loss: Decimal | None = None,
     max_drawdown_pct: Decimal | None = None,
     dispatch_from: datetime | None = None,
+    perp_instruments: Sequence[int] = (),
 ) -> RunOutcome:
     """Drive a whole recorded bar set to completion.
 
@@ -607,6 +610,7 @@ def run_loop(
         max_daily_loss=max_daily_loss,
         max_drawdown_pct=max_drawdown_pct,
         dispatch_from=dispatch_from,
+        perp_instruments=perp_instruments,
     )
     try:
         # The first timestamp the strategy will actually experience. With

@@ -266,6 +266,7 @@ def main() -> int:
             ),
             # None for a smoke run, which dispatches every bar it is given.
             dispatch_from=payload.dispatch_from,
+            perp_instruments=payload.perp_instruments,
         )
     except BaseException:  # noqa: BLE001 - the loop itself failing is still an outcome
         _emit(
@@ -341,6 +342,7 @@ def _run_live(payload, instance, manifest, strategy_cls):  # noqa: ANN001, ANN20
             if payload.max_drawdown_pct is not None
             else getattr(manifest, "max_drawdown_pct", None)
         ),
+        perp_instruments=payload.perp_instruments,
     )
 
     def _write(line: str) -> None:

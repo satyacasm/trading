@@ -72,6 +72,11 @@ class SmokePayload:
     # field the codec drops is a field the strategy declared and the
     # platform never saw.
     leverage: Decimal | None = None
+    # Which instruments in this run settle as derivatives. The container
+    # has no database, and whether an instrument is a perpetual decides
+    # how its fills move cash -- a runtime that guessed would apply spot's
+    # notional to a perpetual and credit a short with money it never got.
+    perp_instruments: tuple[int, ...] = ()
 
 
 def _money(value: Decimal | None) -> str | None:
@@ -157,6 +162,7 @@ def encode_payload(payload: SmokePayload) -> bytes:
         "max_daily_loss": _money(payload.max_daily_loss),
         "max_drawdown_pct": _money(payload.max_drawdown_pct),
         "leverage": _money(payload.leverage),
+        "perp_instruments": list(payload.perp_instruments),
     }
     return gzip.compress(json.dumps(document, separators=(",", ":")).encode("utf-8"))
 
@@ -191,6 +197,7 @@ def decode_payload(raw: bytes) -> SmokePayload:
         max_daily_loss=(
             None if document.get("max_daily_loss") is None else Decimal(document["max_daily_loss"])
         ),
+        perp_instruments=tuple(document.get("perp_instruments") or ()),
         leverage=(None if document.get("leverage") is None else Decimal(document["leverage"])),
         max_drawdown_pct=(
             None

@@ -138,20 +138,31 @@ def settle_funding_for_step(
     *,
     previous: datetime,
     now: datetime,
-    rates: Mapping[int, Decimal],
+    rates: Mapping[tuple[int, datetime], Decimal],
 ) -> None:
     """Settle every funding boundary the step from `previous` to `now`
-    crossed.
+    crossed, each at the rate published for it.
 
     Per step, not per bar, because a bar and a settlement are unrelated
-    clocks: a daily bar crosses three boundaries and a one-minute bar
-    crosses none most of the time. Settling once per bar would undercharge
-    daily carry by two thirds and overcharge minute carry by four hundred
-    and eighty.
+    clocks: a daily bar crosses three eight-hour boundaries and a
+    one-minute bar crosses none most of the time. Settling once per bar
+    would undercharge daily carry by two thirds and overcharge minute
+    carry by four hundred and eighty.
 
-    The rate is charged on notional at the current mark, which is what the
-    exchange does -- funding is not a function of entry price, so a
-    position deep in profit pays on what it is worth now.
+    Each boundary at its own rate, not an average across the step. Rates
+    move -- BTC's went negative at 23% of settlements over the last year
+    -- and averaging smooths away precisely the variation a carry strategy
+    exists to trade.
+
+    A boundary with no published rate is skipped. The series has real
+    gaps: Binance's earliest rows carry no mark, and a contract listed
+    mid-history has no settlements before it existed. Settling those at
+    zero would be indistinguishable in the result from a genuine zero-rate
+    settlement.
+
+    Charged on notional at the current mark, which is what the exchange
+    does -- funding is not a function of entry price, so a position deep
+    in profit pays on what it is worth now.
     """
     boundaries = settlements_between(previous, now)
     if not boundaries:
@@ -159,15 +170,18 @@ def settle_funding_for_step(
     for instrument_id, position in state.positions.items():
         if instrument_id not in state.perp_instruments or position.quantity == 0:
             continue
-        rate = rates.get(instrument_id)
         mark = state.marks.get(instrument_id)
-        if rate is None or mark is None:
+        if mark is None:
             continue
-        paid = funding_payment(position.quantity, mark=mark, rate=rate) * len(boundaries)
-        state.cash -= paid
-        state.funding_paid[instrument_id] = (
-            state.funding_paid.get(instrument_id, Decimal("0")) + paid
-        )
+        for boundary in boundaries:
+            rate = rates.get((instrument_id, boundary))
+            if rate is None:
+                continue
+            paid = funding_payment(position.quantity, mark=mark, rate=rate)
+            state.cash -= paid
+            state.funding_paid[instrument_id] = (
+                state.funding_paid.get(instrument_id, Decimal("0")) + paid
+            )
 
 
 def apply_fill_cash(
@@ -298,6 +312,7 @@ def open_session(
     max_drawdown_pct: Decimal | None = None,
     dispatch_from: datetime | None = None,
     perp_instruments: Sequence[int] = (),
+    funding_rates: Mapping[tuple[int, datetime], Decimal] | None = None,
 ) -> Session:
     state = RunState(
         now=None,  # type: ignore[arg-type]  # set before any handler runs
@@ -309,6 +324,12 @@ def open_session(
     state.day_open_equity = starting_cash
     state.peak_equity = starting_cash
     ctx = LiveContext(state=state, bars=bars)
+
+    rates = funding_rates or {}
+    # The close of the previous dispatched bar, so a step knows which
+    # funding boundaries it crossed. None until the first real dispatch:
+    # a run cannot owe funding for time before it began.
+    previous_close: datetime | None = None
 
     fills = 0
     rejections: list[str] = []
@@ -366,6 +387,14 @@ def open_session(
             # skipping a warm-up bar means "done with this bar, keep going",
             # which is exactly what the driver reads a True as.
             return True
+
+        # Funding first, before this bar's marks move: the settlements
+        # this step crossed happened at prices the run had already seen,
+        # not at the close it is only now being handed.
+        nonlocal previous_close
+        if previous_close is not None and rates:
+            settle_funding_for_step(state, previous=previous_close, now=close_ts, rates=rates)
+        previous_close = close_ts
 
         # Roll day_open_equity at the IST calendar boundary -- see
         # the module docstring. Read equity *before* this bar's own
@@ -594,6 +623,7 @@ def run_loop(
     max_drawdown_pct: Decimal | None = None,
     dispatch_from: datetime | None = None,
     perp_instruments: Sequence[int] = (),
+    funding_rates: Mapping[tuple[int, datetime], Decimal] | None = None,
 ) -> RunOutcome:
     """Drive a whole recorded bar set to completion.
 
@@ -611,6 +641,7 @@ def run_loop(
         max_drawdown_pct=max_drawdown_pct,
         dispatch_from=dispatch_from,
         perp_instruments=perp_instruments,
+        funding_rates=funding_rates,
     )
     try:
         # The first timestamp the strategy will actually experience. With

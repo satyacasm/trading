@@ -77,6 +77,10 @@ class SmokePayload:
     # how its fills move cash -- a runtime that guessed would apply spot's
     # notional to a perpetual and credit a short with money it never got.
     perp_instruments: tuple[int, ...] = ()
+    # Every funding settlement in the run's window, as published. Carried
+    # rather than looked up because the container has no database, and
+    # omitting it makes every carry strategy backtest as free money.
+    funding_rates: tuple[dict[str, str], ...] = ()
 
 
 def _money(value: Decimal | None) -> str | None:
@@ -163,6 +167,7 @@ def encode_payload(payload: SmokePayload) -> bytes:
         "max_drawdown_pct": _money(payload.max_drawdown_pct),
         "leverage": _money(payload.leverage),
         "perp_instruments": list(payload.perp_instruments),
+        "funding_rates": [dict(row) for row in payload.funding_rates],
     }
     return gzip.compress(json.dumps(document, separators=(",", ":")).encode("utf-8"))
 
@@ -198,6 +203,7 @@ def decode_payload(raw: bytes) -> SmokePayload:
             None if document.get("max_daily_loss") is None else Decimal(document["max_daily_loss"])
         ),
         perp_instruments=tuple(document.get("perp_instruments") or ()),
+        funding_rates=tuple(document.get("funding_rates") or ()),
         leverage=(None if document.get("leverage") is None else Decimal(document["leverage"])),
         max_drawdown_pct=(
             None

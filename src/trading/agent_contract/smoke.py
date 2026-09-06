@@ -627,6 +627,25 @@ def _perp_instruments(conn: Connection, instrument_ids: Sequence[int]) -> tuple[
     return tuple(int(r[0]) for r in rows)
 
 
+def _funding_rates(
+    conn: Connection, instrument_ids: Sequence[int], window: dict[str, str]
+) -> tuple[dict[str, str], ...]:
+    """Every published settlement inside the run's window.
+
+    Strings on the wire, like every other number crossing into the
+    container. Empty for a run with no perpetuals, which costs nothing.
+    """
+    rows = conn.execute(
+        "SELECT instrument_id, funding_time, rate FROM perp_funding"
+        " WHERE instrument_id = ANY(%s) AND funding_time >= %s AND funding_time <= %s"
+        " ORDER BY funding_time",
+        (list(instrument_ids), window["start"], window["end"]),
+    ).fetchall()
+    return tuple(
+        {"instrument_id": str(r[0]), "ts": r[1].isoformat(), "rate": str(r[2])} for r in rows
+    )
+
+
 def _manifest_leverage(manifest: dict[str, Any]) -> Decimal | None:
     raw = manifest.get("leverage")
     return None if raw is None else Decimal(str(raw))
@@ -870,6 +889,7 @@ def smoke_test(
         starting_cash=Decimal(str(manifest.get("capital", "0"))),
         slippage_bps=Decimal("0"),
         perp_instruments=_perp_instruments(conn, instrument_ids),
+        funding_rates=_funding_rates(conn, instrument_ids, window),
         leverage=_manifest_leverage(manifest),
     )
     first = run_smoke_in_sandbox(payload, limits)

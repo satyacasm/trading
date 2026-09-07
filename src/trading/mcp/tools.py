@@ -14,11 +14,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
-from trading.indicators import CATALOGUE
+from trading.indicators import CATALOGUE, IndicatorRequest, compute, parse, warmup_for
 from trading.mcp.client import GatewayClient, GatewayRefusal
-from trading.mcp.formatting import freshness, refused
+from trading.mcp.formatting import freshness, money, refused
 from trading.mcp.session import AgentSession, SessionStore
 from trading.paper.charges import BROKER_BY_ASSET_CLASS
 from trading.paper.enums import OrderType, Product, Side, TimeInForce
@@ -180,3 +181,94 @@ async def get_perp_context(deps: ToolDeps, instrument_id: int) -> dict[str, Any]
         return dict(await deps.client.get(f"/perp-context/{instrument_id}"))
     except GatewayRefusal as refusal:
         return refused(refusal.detail, instrument_id=instrument_id)
+
+
+def _column(candles: list[dict[str, Any]], field: str) -> list[Decimal]:
+    return [Decimal(str(candle[field])) for candle in candles]
+
+
+def _rendered(value: Decimal | dict[str, Decimal] | None) -> Any:
+    """Indicator output as text, preserving the shape.
+
+    `None` survives as `None` rather than becoming a number: an indicator
+    that could not be computed must not be indistinguishable from one
+    that computed to zero.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {key: money(inner) for key, inner in value.items()}
+    return money(value)
+
+
+async def _snapshot_one(
+    deps: ToolDeps,
+    instrument_id: int,
+    interval: str,
+    requests: list[IndicatorRequest],
+    history: int,
+    warmup: int,
+) -> dict[str, Any]:
+    try:
+        candles = await _fetch_candles(deps, instrument_id, interval, history + warmup)
+    except GatewayRefusal as refusal:
+        # One bad instrument must not lose the others: an agent watching
+        # six symbols should still see five when the sixth is unknown.
+        return refused(refusal.detail, instrument_id=instrument_id)
+
+    highs = _column(candles, "high")
+    lows = _column(candles, "low")
+    closes = _column(candles, "close")
+    computed = {
+        request.token: _rendered(compute(request, highs=highs, lows=lows, closes=closes))
+        for request in requests
+    }
+    return {
+        "instrument_id": instrument_id,
+        "interval": interval,
+        "last_price": money(closes[-1]) if closes else None,
+        "bars": candles[-history:] if history else [],
+        "indicators": computed,
+        "warmup_bars_used": warmup,
+        # Whether the database could supply the run-up the indicators
+        # needed. An RSI computed from 15 bars is not the RSI computed
+        # from 100, and a caller told nothing would never know which it
+        # holds.
+        "warmup_sufficient": len(candles) >= history + warmup,
+        "freshness": freshness(_last_ts(candles), interval, _utcnow()),
+    }
+
+
+async def get_market_snapshot(
+    deps: ToolDeps,
+    instrument_ids: list[int],
+    interval: str = "1d",
+    indicators: list[str] | None = None,
+    history: int = 50,
+) -> dict[str, Any]:
+    """Current state of several instruments, with indicators computed here.
+
+    Indicators are computed server-side from decimal bars rather than
+    handed over as raw OHLCV for the caller to reduce: a language model
+    doing Wilder smoothing over 200 rows in its head produces a number
+    that looks right and is not, and nothing downstream would catch it.
+    """
+    try:
+        requests = [parse(token) for token in (indicators or [])]
+    except ValueError as error:
+        # The whole call is refused, not the one token. A snapshot missing
+        # what the agent asked for, but shaped as though complete, is the
+        # worse failure.
+        return refused(str(error))
+
+    warmup = warmup_for(requests)
+    rows = [
+        await _snapshot_one(deps, instrument_id, interval, requests, history, warmup)
+        for instrument_id in instrument_ids
+    ]
+    return {
+        "interval": interval,
+        "requested_indicators": [request.token for request in requests],
+        "history": history,
+        "instruments": rows,
+    }

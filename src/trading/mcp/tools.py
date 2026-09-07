@@ -272,3 +272,101 @@ async def get_market_snapshot(
         "history": history,
         "instruments": rows,
     }
+
+
+_OPEN_ORDER_STATUSES = frozenset({"PENDING", "OPEN", "PARTIALLY_FILLED"})
+
+# `Portfolio`, `Position` and `Order` (src/trading/paper/models.py) each
+# carry an explicit `field_serializer` that renders their Decimal money
+# fields as a JSON *number*, not text -- unlike every other model on this
+# platform, and unlike `PerpPositionOut`, which builds every field with
+# `str(...)`. By the time httpx has decoded that response the float has
+# already lost precision no downstream `Decimal(str(...))` recovers, so
+# these rows are re-rendered through `money()` before they cross this
+# boundary. A field absent from a row (e.g. a test fixture that only sets
+# some keys) is left alone rather than injected.
+_PORTFOLIO_MONEY_FIELDS = ("initial_capital", "cash_balance", "max_daily_loss", "max_drawdown_pct")
+_POSITION_MONEY_FIELDS = ("quantity", "avg_cost", "realised_pnl")
+_ORDER_MONEY_FIELDS = ("quantity", "filled_quantity", "limit_price", "leverage")
+
+
+def _with_money_fields(row: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    """`row`, with each of `fields` re-rendered as exact text where present."""
+    rendered = dict(row)
+    for field in fields:
+        if field in rendered:
+            rendered[field] = money(rendered[field])
+    return rendered
+
+
+async def get_portfolio_state(deps: ToolDeps) -> dict[str, Any]:
+    """Cash, positions and working orders for the session's portfolio.
+
+    The portfolio is filtered here from the session, never passed as a
+    parameter. `GET /portfolios` returns every book the operator owns,
+    and an agent that could name one could name the wrong one.
+    """
+    session = _session(deps)
+    portfolios: list[dict[str, Any]] = await deps.client.get("/portfolios")
+    mine = next(
+        (row for row in portfolios if row.get("portfolio_id") == session.portfolio_id), None
+    )
+    if mine is None:
+        return refused(
+            f"the session's portfolio_id={session.portfolio_id} does not exist; "
+            f"check the mcp_tokens configuration"
+        )
+    positions: list[dict[str, Any]] = await deps.client.get(
+        f"/portfolios/{session.portfolio_id}/positions"
+    )
+    # `portfolio_id` is a REQUIRED query parameter on this route, not an
+    # optional filter: omitting it is a 422, and an unknown id is a 404
+    # rather than an empty list. The scoping therefore happens server-side;
+    # the comprehension below is belt-and-braces against a future change.
+    orders: list[dict[str, Any]] = await deps.client.get(
+        "/orders", params={"portfolio_id": session.portfolio_id, "limit": 500}
+    )
+    mine_orders = [row for row in orders if row.get("portfolio_id") == session.portfolio_id]
+    return {
+        "portfolio": _with_money_fields(mine, _PORTFOLIO_MONEY_FIELDS),
+        "positions": [_with_money_fields(row, _POSITION_MONEY_FIELDS) for row in positions],
+        "open_orders": [
+            _with_money_fields(row, _ORDER_MONEY_FIELDS)
+            for row in mine_orders
+            if row.get("status") in _OPEN_ORDER_STATUSES
+        ],
+    }
+
+
+async def get_perp_positions(deps: ToolDeps) -> dict[str, Any]:
+    """Open perpetual positions with their margin and liquidation price.
+
+    Unlike `Portfolio`/`Position`/`Order`, `PerpPositionOut` builds every
+    field with `str(...)` rather than a float `field_serializer` -- it is
+    already exact text on arrival, so nothing here needs re-rendering.
+    """
+    session = _session(deps)
+    positions = await deps.client.get(f"/portfolios/{session.portfolio_id}/perp-positions")
+    return {"portfolio_id": session.portfolio_id, "positions": positions}
+
+
+async def list_orders(deps: ToolDeps, status: str | None = None, limit: int = 50) -> dict[str, Any]:
+    """The session portfolio's order blotter, newest first (`GET /orders`
+    orders by `order_id DESC`)."""
+    session = _session(deps)
+    # `portfolio_id` is required by the route; `limit` is capped at 500,
+    # the route's own `le=500` -- sending more would be refused rather
+    # than clamped, and the cap belongs here so a caller-supplied limit
+    # never turns a read into a refusal.
+    orders: list[dict[str, Any]] = await deps.client.get(
+        "/orders", params={"portfolio_id": session.portfolio_id, "limit": min(limit, 500)}
+    )
+    rows = [row for row in orders if row.get("portfolio_id") == session.portfolio_id]
+    if status is not None:
+        wanted = status.upper()
+        rows = [row for row in rows if row.get("status") == wanted]
+    rows = rows[:limit]
+    return {
+        "count": len(rows),
+        "orders": [_with_money_fields(row, _ORDER_MONEY_FIELDS) for row in rows],
+    }

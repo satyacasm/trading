@@ -52,6 +52,20 @@ def perp_instrument_id(db_conn) -> int:
     # perp_margin_tiers.effective_from is NOT NULL with no default and is
     # part of the primary key (migrations/versions/0019_perp_contracts.py)
     # -- the brief's fixture omits it too.
+    #
+    # Two tiers, and the higher-floor one inserted FIRST: a query missing
+    # its ORDER BY would come back in roughly insertion order (5000, 0),
+    # not ascending (0, 5000). A single-tier fixture cannot tell "ORDER BY
+    # notional_floor" apart from no ordering at all.
+    db_conn.execute(
+        """
+        INSERT INTO perp_margin_tiers
+            (instrument_id, notional_floor, effective_from, notional_cap, max_leverage,
+             maintenance_rate, maintenance_amount)
+        VALUES (%s, 5000, '2020-01-01', 100000, 50, 0.01, 32.5)
+        """,
+        (instrument_id,),
+    )
     db_conn.execute(
         """
         INSERT INTO perp_margin_tiers
@@ -60,6 +74,19 @@ def perp_instrument_id(db_conn) -> int:
         VALUES (%s, 0, '2020-01-01', 5000, 75, 0.0065, 0)
         """,
         (instrument_id,),
+    )
+    # Two funding rows, and the earlier one inserted FIRST: a query
+    # missing its ORDER BY ... DESC would return rows in roughly
+    # insertion order, so a bare "LIMIT 1" would grab the stale
+    # 2026-08-01 row rather than the true latest one from 2026-09-01. A
+    # single-funding-row fixture cannot distinguish "latest" from "the
+    # only row there is".
+    db_conn.execute(
+        """
+        INSERT INTO perp_funding (instrument_id, funding_time, rate, mark_price)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (instrument_id, datetime(2026, 8, 1, 0, tzinfo=UTC), Decimal("0.0003"), Decimal("0.19")),
     )
     db_conn.execute(
         """
@@ -158,10 +185,23 @@ def test_perp_context_reports_the_latest_funding_observation(
 def test_perp_context_lists_the_margin_tiers_in_notional_order(
     client: TestClient, perp_instrument_id: int
 ) -> None:
-    tiers = client.get(f"/perp-context/{perp_instrument_id}").json()["margin_tiers"]
-    assert len(tiers) == 1
+    body = client.get(f"/perp-context/{perp_instrument_id}").json()
+    tiers = body["margin_tiers"]
+    assert len(tiers) == 2
+    # The fixture inserts the 5000-floor tier first and the 0-floor tier
+    # second, so this only passes if the route actually orders by
+    # notional_floor rather than returning insertion (or scan) order.
+    assert Decimal(tiers[0]["notional_floor"]) == Decimal(0)
     assert Decimal(tiers[0]["max_leverage"]) == Decimal(75)
     assert Decimal(tiers[0]["maintenance_rate"]) == Decimal("0.0065")
+    assert Decimal(tiers[1]["notional_floor"]) == Decimal(5000)
+    assert Decimal(tiers[1]["max_leverage"]) == Decimal(50)
+    assert Decimal(tiers[1]["maintenance_rate"]) == Decimal("0.01")
+    # max_leverage at the top level is the lowest-notional_floor tier's
+    # leverage (75, the 0-floor tier), not the 5000-floor tier's 50 --
+    # only distinguishable from "whichever tier came back first" now that
+    # there are two tiers with different leverages.
+    assert Decimal(body["max_leverage"]) == Decimal(75)
 
 
 def test_perp_context_refuses_an_instrument_that_is_not_a_perpetual(

@@ -6,6 +6,7 @@ import pytest
 from trading.mcp.client import GatewayClient
 from trading.mcp.session import SessionStore
 from trading.mcp.tools import ToolDeps, get_capabilities, get_strategy_contract, list_instruments
+from trading.paper.enums import OrderType, Product, Side, TimeInForce
 
 # `InstrumentSummary` (gateway.py:100-105) carries exactly these four
 # fields -- no segment, no lot size, no tick size. The mock must not
@@ -49,10 +50,10 @@ async def test_capabilities_list_every_indicator_with_a_description() -> None:
 @pytest.mark.anyio
 async def test_capabilities_carry_the_order_vocabulary() -> None:
     result = await get_capabilities(_deps(httpx.MockTransport(_routes)))
-    assert set(result["order_types"]) == {"MARKET", "LIMIT"}
-    assert set(result["sides"]) == {"BUY", "SELL"}
-    assert set(result["products"]) == {"DELIVERY", "INTRADAY"}
-    assert set(result["time_in_force"]) == {"DAY", "GTC"}
+    assert result["order_types"] == [o.value for o in OrderType]
+    assert result["sides"] == [s.value for s in Side]
+    assert result["products"] == [p.value for p in Product]
+    assert result["time_in_force"] == [t.value for t in TimeInForce]
 
 
 @pytest.mark.anyio

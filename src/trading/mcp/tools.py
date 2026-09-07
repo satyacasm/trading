@@ -19,6 +19,7 @@ from trading.indicators import CATALOGUE
 from trading.mcp.client import GatewayClient
 from trading.mcp.session import AgentSession, SessionStore
 from trading.paper.charges import BROKER_BY_ASSET_CLASS
+from trading.paper.enums import OrderType, Product, Side, TimeInForce
 
 
 @dataclass(frozen=True)
@@ -47,11 +48,18 @@ async def get_capabilities(deps: ToolDeps) -> dict[str, Any]:
     return {
         "tradeable_asset_classes": sorted(BROKER_BY_ASSET_CLASS),
         "brokers": dict(BROKER_BY_ASSET_CLASS),
-        "sides": ["BUY", "SELL"],
-        "order_types": ["MARKET", "LIMIT"],
-        "products": ["DELIVERY", "INTRADAY"],
-        "time_in_force": ["DAY", "GTC"],
+        "sides": [s.value for s in Side],
+        "order_types": [o.value for o in OrderType],
+        "products": [p.value for p in Product],
+        "time_in_force": [t.value for t in TimeInForce],
+        # margin_modes stays hardcoded: its source is Literal["ISOLATED","CROSS"]
+        # on a FastAPI request model (src/trading/paper/api.py:126). Importing
+        # trading.paper.api would pull psycopg in, breaching the hard constraint
+        # that no psycopg import exists anywhere under src/trading/mcp/.
         "margin_modes": ["ISOLATED", "CROSS"],
+        # bar_intervals stays hardcoded: its source is a Literal type alias in
+        # the agent_contract package; deriving it needs typing.get_args across a
+        # package boundary and costs more than it buys.
         "bar_intervals": ["1m", "5m", "15m", "1h", "1d"],
         "indicators": dict(CATALOGUE),
         "notes": [

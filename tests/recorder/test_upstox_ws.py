@@ -15,8 +15,15 @@ from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from trading.recorder.session import RecordingSession, read_frames
-from trading.recorder.upstox_ws import Frame, LiveUpstoxFeed, run_recording_loop
+from trading.recorder.upstox_ws import (
+    AuthRejected,
+    Frame,
+    LiveUpstoxFeed,
+    run_recording_loop,
+)
 
 
 class FakeClock:
@@ -333,3 +340,78 @@ def test_a_silent_feed_still_reaches_its_deadline(tmp_path: Path) -> None:
     # distinction this manifest exists to preserve.
     assert manifest["gaps"] == []
     assert feed.closed is True
+
+
+class RejectedFeed:
+    """A feed whose credentials the broker refuses."""
+
+    def __init__(self, status: int = 401) -> None:
+        self.attempts = 0
+        self.status = status
+        self.closed = False
+
+    async def authorize(self) -> None:
+        self.attempts += 1
+        raise AuthRejected(f"HTTP {self.status} from the authorize endpoint")
+
+    async def subscribe(self, instrument_keys: list[str]) -> list[str]:  # pragma: no cover
+        return []
+
+    async def __aiter__(self) -> AsyncIterator[Frame]:  # pragma: no cover
+        yield b""
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_rejected_credentials_stop_the_run_instead_of_retrying(tmp_path: Path) -> None:
+    """A 401 is not a dropped socket. It will not fix itself, and retrying
+    it every thirty seconds until the close turns a one-line config
+    mistake into a whole session of lost history that nothing announces.
+
+    This is not hypothetical: a stale token in `.env.local` outranked the
+    live one for three hours of a real trading day, logging the same
+    warning 360 times and capturing nothing.
+    """
+    session = _new_session(tmp_path)
+    feed = RejectedFeed()
+    start = datetime(2026, 8, 13, 9, 15, tzinfo=UTC)
+
+    with pytest.raises(AuthRejected):
+        asyncio.run(
+            run_recording_loop(
+                session,
+                lambda: feed,
+                universe=["NIFTY"],
+                until=start + timedelta(hours=6),
+                clock=FakeClock(start=start, step=timedelta(seconds=1)),
+                sleep=_no_sleep,
+            )
+        )
+
+    # Once, not until the market closes.
+    assert feed.attempts == 1
+    manifest = _manifest(tmp_path)
+    # And it is recorded, so the session file says why it is empty rather
+    # than looking like a market that never traded.
+    assert any("401" in str(gap) for gap in manifest["gaps"])
+
+
+def test_a_dropped_socket_is_still_retried(tmp_path: Path) -> None:
+    """The distinction that makes the above safe: a broken stream is
+    transient and reconnecting is exactly right."""
+    session = _new_session(tmp_path)
+    feed = ScriptedFeed([b"f1"], fail_after=ConnectionError("socket died"))
+    start = datetime(2026, 8, 13, 9, 15, tzinfo=UTC)
+
+    asyncio.run(
+        run_recording_loop(
+            session,
+            lambda: feed,
+            universe=["NIFTY"],
+            until=start + timedelta(seconds=6),
+            clock=FakeClock(start=start, step=timedelta(seconds=1)),
+            sleep=_no_sleep,
+        )
+    )
+    assert _manifest(tmp_path)["frame_count"] >= 1

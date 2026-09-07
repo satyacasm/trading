@@ -131,7 +131,16 @@ async def run_recording_loop(
     while clock() < until:
         feed = feed_factory()
         try:
-            await feed.authorize()
+            try:
+                await feed.authorize()
+            except AuthRejected as exc:
+                # Recorded before re-raising, so the session file says why
+                # it is empty rather than looking like a market that never
+                # traded.
+                session.note_disconnect(str(exc))
+                session.close()
+                log.error("recorder.auth_rejected", reason=str(exc))
+                raise
             session.note_connect()
             backoff = initial_backoff_seconds
 
@@ -165,7 +174,14 @@ async def run_recording_loop(
                 if now - last_heartbeat >= heartbeat_interval:
                     session.heartbeat()
                     last_heartbeat = now
-        except Exception as exc:  # noqa: BLE001 - any failure here is a gap, not a crash
+        except AuthRejected:
+            # Ahead of the generic handler on purpose: a rejected
+            # credential is the one failure here that is not a gap. Left to
+            # the handler below it would be retried until the close, which
+            # is precisely the six hours of silent loss this exists to
+            # prevent.
+            raise
+        except Exception as exc:  # noqa: BLE001 - any other failure is a gap, not a crash
             log.warning("recorder.disconnected", reason=str(exc))
             session.note_disconnect(str(exc))
             wait = min(backoff, max_backoff_seconds)
@@ -181,6 +197,21 @@ async def run_recording_loop(
 
 
 AUTHORIZE_URL = "https://api.upstox.com/v3/feed/market-data-feed/authorize"
+
+
+class AuthRejected(Exception):
+    """The broker refused these credentials.
+
+    Distinct from every other failure in this module because it is the
+    only one that will not fix itself. A dropped socket is transient and
+    reconnecting is right; a 401 is a wrong or expired token, and
+    retrying it every thirty seconds until the close turns a one-line
+    config mistake into a whole session of history nobody can get back.
+
+    Raised out of the recording loop so the process exits non-zero and the
+    scheduler records a failure, rather than logging the same warning
+    hundreds of times into a file nobody is watching.
+    """
 
 
 class LiveUpstoxFeed:
@@ -211,6 +242,18 @@ class LiveUpstoxFeed:
                     "Accept": "application/json",
                 },
             )
+            if response.status_code in (401, 403):
+                # Not a transient failure. Naming the candidates is the
+                # point: this platform carries two names for this secret,
+                # and the whole incident that produced this branch was a
+                # stale UPSTOX_ACCESS_TOKEN in .env.local outranking the
+                # live UPSTOX_ANALYTICS_TOKEN in .env.
+                raise AuthRejected(
+                    f"the broker refused these credentials (HTTP {response.status_code}). "
+                    "Check UPSTOX_ACCESS_TOKEN and UPSTOX_ANALYTICS_TOKEN in .env and "
+                    ".env.local -- the first one set wins, and a stale one there will "
+                    "outrank a live one elsewhere."
+                )
             response.raise_for_status()
             redirect_uri = response.json()["data"]["authorized_redirect_uri"]
         self._connection = await ws_connect(redirect_uri, max_size=None)

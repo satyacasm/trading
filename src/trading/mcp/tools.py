@@ -13,10 +13,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from trading.indicators import CATALOGUE
-from trading.mcp.client import GatewayClient
+from trading.mcp.client import GatewayClient, GatewayRefusal
+from trading.mcp.formatting import freshness, refused
 from trading.mcp.session import AgentSession, SessionStore
 from trading.paper.charges import BROKER_BY_ASSET_CLASS
 from trading.paper.enums import OrderType, Product, Side, TimeInForce
@@ -96,3 +98,85 @@ async def get_strategy_contract(deps: ToolDeps) -> dict[str, Any]:
     """
     bundle: dict[str, Any] = await deps.client.get("/strategies/contract")
     return bundle
+
+
+def _utcnow() -> datetime:
+    """Indirection so tests can pin the clock without patching `datetime`."""
+    return datetime.now(UTC)
+
+
+def _last_ts(candles: list[dict[str, Any]]) -> datetime | None:
+    if not candles:
+        return None
+    return datetime.fromisoformat(str(candles[-1]["ts"]))
+
+
+async def _fetch_candles(
+    deps: ToolDeps, instrument_id: int, interval: str, limit: int
+) -> list[dict[str, Any]]:
+    """Bars as decimal text, oldest first. Raises `GatewayRefusal`."""
+    body = await deps.client.get(
+        f"/candles/{instrument_id}",
+        params={"interval": interval, "limit": limit, "precision": "string"},
+    )
+    return list(body.get("candles", []))
+
+
+async def get_candles(
+    deps: ToolDeps, instrument_id: int, interval: str = "1d", limit: int = 300
+) -> dict[str, Any]:
+    """Raw OHLCV for an agent's own analysis, with a freshness verdict."""
+    try:
+        candles = await _fetch_candles(deps, instrument_id, interval, limit)
+    except GatewayRefusal as refusal:
+        return refused(refusal.detail, instrument_id=instrument_id)
+    return {
+        "instrument_id": instrument_id,
+        "interval": interval,
+        "count": len(candles),
+        "candles": candles,
+        "freshness": freshness(_last_ts(candles), interval, _utcnow()),
+    }
+
+
+async def get_data_freshness(
+    deps: ToolDeps, instrument_ids: list[int], interval: str = "1d"
+) -> dict[str, Any]:
+    """How current each series is.
+
+    Its own tool rather than only a field on a snapshot, because the
+    question "is this database current?" is one an agent should be able
+    to ask before it reasons, not only after. The bhavcopy feed has gone
+    weeks without a write before now, and a backtest run against it looks
+    exactly like one run against fresh data.
+    """
+    rows: list[dict[str, Any]] = []
+    for instrument_id in instrument_ids:
+        try:
+            candles = await _fetch_candles(deps, instrument_id, interval, 1)
+        except GatewayRefusal as refusal:
+            rows.append({"instrument_id": instrument_id, "stale": True, "warning": refusal.detail})
+            continue
+        rows.append(
+            {
+                "instrument_id": instrument_id,
+                **freshness(_last_ts(candles), interval, _utcnow()),
+            }
+        )
+    return {
+        "interval": interval,
+        "any_stale": any(row["stale"] for row in rows),
+        "instruments": rows,
+    }
+
+
+async def get_perp_context(deps: ToolDeps, instrument_id: int) -> dict[str, Any]:
+    """Contract filters and the latest funding print for one perpetual.
+
+    Sizing a perpetual without these is guesswork: DOGE steps by a whole
+    coin, BTC by 0.001, and the order path refuses anything off-step.
+    """
+    try:
+        return dict(await deps.client.get(f"/perp-context/{instrument_id}"))
+    except GatewayRefusal as refusal:
+        return refused(refusal.detail, instrument_id=instrument_id)

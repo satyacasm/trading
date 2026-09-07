@@ -72,6 +72,24 @@ class Settings(BaseSettings):
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
 
+    # Where the MCP server finds the gateway. It speaks HTTP to the same
+    # routes a browser uses rather than touching the database, so that
+    # every invariant -- market hours, sufficient cash, contract filters,
+    # the breaker -- keeps exactly one enforcement path.
+    mcp_gateway_url: str = "http://localhost:8000"
+
+    # Comma-separated `token:portfolio_id` pairs, in the style of
+    # `cors_allow_origins`. A token binds an agent to exactly one
+    # portfolio: the agent never names a book, so it cannot trade the
+    # wrong one. Empty means the HTTP transport refuses every caller.
+    mcp_tokens: str = ""
+
+    # Which portfolio the stdio transport trades. There is no token over
+    # stdio -- the subprocess is already inside the trust boundary -- so
+    # the scope has to come from configuration. None means stdio refuses
+    # to start rather than guessing a book.
+    mcp_stdio_portfolio_id: int | None = None
+
     @property
     def raw_archive_root(self) -> Path:
         return self.data_root / "raw"

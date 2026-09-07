@@ -16,6 +16,7 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "redis>=5.0",
     "protobuf>=5.0",
+    "mcp>=2.1",
 ]
 
 [dependency-groups]

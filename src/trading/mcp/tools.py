@@ -551,3 +551,115 @@ async def cancel_order(deps: ToolDeps, order_id: int) -> dict[str, Any]:
     except GatewayRefusal as refusal:
         return refused(refusal.detail, order_id=order_id)
     return _with_money_fields(order, _ORDER_MONEY_FIELDS)
+
+
+def _strategy_version(now: datetime) -> str:
+    """A version distinct on every call, to the microsecond.
+
+    `(name, version)` is immutable once registered (`register_strategy`'s
+    docstring, `trading/agent_contract/registry.py`): resubmitting the
+    same name with edited code under a version already on file raises
+    `VersionConflict`, which `POST /strategies` never catches, so it would
+    surface here as an unhandled 500 -- `GatewayUnavailable`, not a
+    refusal an agent could read and act on. There is no `version`
+    parameter on this tool, and an agent iterating on one strategy
+    resubmits the same `name` after every fix, so the version is derived
+    from the clock rather than asked of the caller: every attempt lands
+    as its own row without anyone having to name one.
+    """
+    return now.strftime("%Y%m%dT%H%M%S%f")
+
+
+async def submit_strategy(deps: ToolDeps, name: str, python_code: str) -> dict[str, Any]:
+    """Register a strategy: validated statically, then smoke-run sandboxed.
+
+    Gated on `_session` even though a strategy is not portfolio-scoped --
+    `UploadStrategyRequest` carries no `portfolio_id` at all -- because
+    `POST /strategies` (`trading/agent_contract/api.py`) spawns up to
+    three Docker containers per call, and only a recognised token should
+    be able to trigger that.
+
+    The brief's sample body was `{"name": ..., "code": ...}`; the real
+    route is `UploadStrategyRequest{name, version, source, user_id}`, so
+    the body sent here is `name`/`version`/`source` instead -- see
+    `_strategy_version` for where `version` comes from.
+
+    A rejection comes back as findings rather than an error, because the
+    findings are the useful part -- they say what to change. An agent
+    iterating on a strategy reads them and resubmits. `UploadStrategyResponse`
+    (and the `RunSummary` nested inside it) already render every field as
+    text via `str(...)`/`_as_str`, never a float `field_serializer` the
+    way `Portfolio`/`Position`/`Order` do, so nothing here needs `money()`.
+    """
+    _session(deps)
+    body: dict[str, Any] = {
+        "name": name,
+        "version": _strategy_version(_utcnow()),
+        "source": python_code,
+    }
+    try:
+        return dict(await deps.client.post("/strategies", body))
+    except GatewayRefusal as refusal:
+        return refused(refusal.detail, name=name)
+
+
+async def run_backtest(
+    deps: ToolDeps,
+    strategy_id: int,
+    start: str,
+    end: str,
+    starting_cash: str | None = None,
+    max_daily_loss: str | None = None,
+    max_drawdown_pct: str | None = None,
+) -> dict[str, Any]:
+    """Replay a registered strategy over a window and return its metrics.
+
+    Blocks for the run, matching the route: `POST
+    /strategies/{id}/backtests` is a plain `def` (psycopg is synchronous,
+    and it shells out to Docker) that runs the replay to completion and
+    returns the finished result. Its own module docstring puts the honest
+    expectation at seconds for a daily decade and explicitly declines to
+    build a job queue for a wait that does not exist, so there is nothing
+    here to poll -- this coroutine just waits for the one response the
+    route was built to give.
+
+    Overrides that were not given are omitted from the body rather than
+    sent as null: the route reads a missing field as "use the strategy's
+    own", and an explicit null would override the manifest with nothing.
+
+    `BacktestResponse` renders every money field and the equity curve as
+    text (`_as_str`/`str(...)` throughout `trading/agent_contract/api.py`),
+    so nothing here needs `money()` either.
+    """
+    _session(deps)
+    body: dict[str, Any] = {"start": start, "end": end}
+    if starting_cash is not None:
+        body["starting_cash"] = starting_cash
+    if max_daily_loss is not None:
+        body["max_daily_loss"] = max_daily_loss
+    if max_drawdown_pct is not None:
+        body["max_drawdown_pct"] = max_drawdown_pct
+    try:
+        return dict(await deps.client.post(f"/strategies/{strategy_id}/backtests", body))
+    except GatewayRefusal as refusal:
+        return refused(refusal.detail, strategy_id=strategy_id)
+
+
+async def get_backtest(deps: ToolDeps, backtest_run_id: int) -> dict[str, Any]:
+    """Re-read a stored run: its curve, itemised fills, and computed metrics.
+
+    `GET /backtests/{id}` returns `BacktestDetail`
+    (`trading/agent_contract/api.py`) whole, with no pagination of its
+    own -- the platform's own answer to an unbounded payload is the
+    *other* read route, `GET /strategies/{id}/backtests`
+    (`BacktestSummary`, no curve, no fills, not this task's tool), not
+    truncation of the detail view. So this tool is a straight pass
+    through of the one route that carries the curve, rather than a second,
+    divergent limit invented here. Money and the curve are text
+    end-to-end on this route too, the same as `run_backtest`.
+    """
+    _session(deps)
+    try:
+        return dict(await deps.client.get(f"/backtests/{backtest_run_id}"))
+    except GatewayRefusal as refusal:
+        return refused(refusal.detail, backtest_run_id=backtest_run_id)

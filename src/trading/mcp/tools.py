@@ -12,11 +12,11 @@ an agent can only act on wording it receives.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Protocol, cast
 
 from trading.indicators import CATALOGUE, IndicatorRequest, compute, parse, warmup_for
 from trading.mcp.client import GatewayClient, GatewayRefusal, GatewayUnavailable
@@ -663,3 +663,202 @@ async def get_backtest(deps: ToolDeps, backtest_run_id: int) -> dict[str, Any]:
         return dict(await deps.client.get(f"/backtests/{backtest_run_id}"))
     except GatewayRefusal as refusal:
         return refused(refusal.detail, backtest_run_id=backtest_run_id)
+
+
+async def _call(call: Awaitable[dict[str, Any]]) -> dict[str, Any]:
+    """The last line of defence against a `GatewayRefusal` a tool forgot to catch.
+
+    Every tool above is supposed to catch its own `GatewayRefusal` and
+    return `formatting.refused(...)` -- that is the module convention
+    stated at the top of this file, and most of the fifteen do. A few
+    (`get_strategy_contract`, `list_instruments`, `get_perp_positions`)
+    call the gateway with no try/except at all, relying on this wrapper;
+    Task 12 shipped one that forgot with nothing to catch it, and only a
+    review caught it before it shipped. `register()` (below) routes every
+    tool call through here so a sixteenth tool that forgets is caught the
+    same way, without every call site having to remember to guard itself.
+
+    `GatewayRefusal` becomes the *same* shape a tool's own catch produces
+    -- `refused(refusal.detail)` -- not the SDK's `ToolError`. Keeping the
+    shape uniform matters more than which layer caught it: an agent that
+    pattern-matches on `status == "REFUSED"` sees identical data whether
+    the tool or this wrapper did the catching.
+
+    `GatewayUnavailable` is deliberately left alone. `client.py`'s own
+    docstring is the rule this follows: "an agent should adapt to a
+    refusal and must not adapt to a crash." Catching it here and handing
+    back a dict would do exactly the thing that docstring forbids --
+    manufacture a plausible-looking answer for a platform that could not
+    be reached. Left uncaught, it propagates out of the tool coroutine and
+    the SDK wraps it as `UnexpectedToolError`: `is_error=True`, the
+    message withheld to `Error executing tool <name>`, and the traceback
+    logged at ERROR. A crash reaches the agent looking like a crash.
+    """
+    try:
+        return await call
+    except GatewayRefusal as refusal:
+        return refused(refusal.detail)
+
+
+class _ToolServer(Protocol):
+    """The one method `register` needs from an MCP server.
+
+    `register`'s own parameter stays typed `Any` -- that is the plan's
+    interface, and a fresh `MCPServer()` per transport is the only thing
+    ever passed in practice. The cast to this `Protocol` inside the
+    function body exists solely so `@typed.tool(...)` is a *typed*
+    decorator under mypy strict's `disallow_untyped_decorators`; decorating
+    with a method resolved from `Any` (`@server.tool(...)` directly) makes
+    every decorated function's type `Any` too, which would erase every
+    tool's `dict[str, Any]` return annotation right where it matters most.
+    """
+
+    def tool(self, *, name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]: ...
+
+
+def register(server: Any, deps: ToolDeps) -> None:
+    """Expose every tool on an MCP server.
+
+    A thin adapter on purpose: the tools above are plain functions, so
+    both transports register the same objects and the tests never touch
+    MCP machinery. The docstrings become the tool descriptions an agent
+    reads, which is why they say what a tool refuses and why. Every call
+    is routed through `_call` -- see its docstring for what that buys and
+    why `GatewayUnavailable` is excluded from it on purpose.
+
+    Names are passed explicitly (`@typed.tool(name=...)`): the installed
+    SDK (`mcp` 2.1.1, `MCPServer.tool`) takes one, so the agent sees the
+    clean name (`place_order`) rather than the trailing-underscore name
+    (`place_order_`) that dodges shadowing the module-level function of
+    the same name inside this function's body.
+    """
+    typed = cast(_ToolServer, server)
+
+    @typed.tool(name="get_capabilities")
+    async def get_capabilities_() -> dict[str, Any]:
+        """What this platform can trade, and the vocabulary it accepts."""
+        return await _call(get_capabilities(deps))
+
+    @typed.tool(name="list_instruments")
+    async def list_instruments_(
+        asset_class: str | None = None, query: str | None = None
+    ) -> dict[str, Any]:
+        """Instruments, optionally filtered, each flagged tradeable or not."""
+        return await _call(list_instruments(deps, asset_class, query))
+
+    @typed.tool(name="get_strategy_contract")
+    async def get_strategy_contract_() -> dict[str, Any]:
+        """The contract a strategy script must satisfy to be accepted."""
+        return await _call(get_strategy_contract(deps))
+
+    @typed.tool(name="get_market_snapshot")
+    async def get_market_snapshot_(
+        instrument_ids: list[int],
+        interval: str = "1d",
+        indicators: list[str] | None = None,
+        history: int = 50,
+    ) -> dict[str, Any]:
+        """Prices, bars and computed indicators, with a freshness verdict."""
+        return await _call(get_market_snapshot(deps, instrument_ids, interval, indicators, history))
+
+    @typed.tool(name="get_candles")
+    async def get_candles_(
+        instrument_id: int, interval: str = "1d", limit: int = 300
+    ) -> dict[str, Any]:
+        """Raw OHLCV as decimal strings, oldest first."""
+        return await _call(get_candles(deps, instrument_id, interval, limit))
+
+    @typed.tool(name="get_data_freshness")
+    async def get_data_freshness_(
+        instrument_ids: list[int], interval: str = "1d"
+    ) -> dict[str, Any]:
+        """How current each series is. Ask before trusting a backtest."""
+        return await _call(get_data_freshness(deps, instrument_ids, interval))
+
+    @typed.tool(name="get_perp_context")
+    async def get_perp_context_(instrument_id: int) -> dict[str, Any]:
+        """Step size, minimum notional, leverage tiers and latest funding."""
+        return await _call(get_perp_context(deps, instrument_id))
+
+    @typed.tool(name="get_portfolio_state")
+    async def get_portfolio_state_() -> dict[str, Any]:
+        """Cash, positions and working orders for this session's portfolio."""
+        return await _call(get_portfolio_state(deps))
+
+    @typed.tool(name="get_perp_positions")
+    async def get_perp_positions_() -> dict[str, Any]:
+        """Open perpetual positions with margin and liquidation price."""
+        return await _call(get_perp_positions(deps))
+
+    @typed.tool(name="list_orders")
+    async def list_orders_(status: str | None = None, limit: int = 50) -> dict[str, Any]:
+        """This session portfolio's order blotter."""
+        return await _call(list_orders(deps, status, limit))
+
+    @typed.tool(name="place_order")
+    async def place_order_(
+        instrument_id: int,
+        side: str,
+        order_type: str,
+        quantity: str,
+        product: str,
+        rationale: str,
+        limit_price: str | None = None,
+        time_in_force: str = "DAY",
+        leverage: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Place an order in this session's portfolio.
+
+        Quantities and prices are decimal STRINGS, never numbers.
+        `rationale` is required and stored with the order. `leverage` is
+        required for a perpetual and meaningless otherwise. A refusal
+        comes back as status REFUSED with the platform's own reason;
+        retrying it unchanged will be refused again.
+        """
+        return await _call(
+            place_order(
+                deps,
+                instrument_id,
+                side,
+                order_type,
+                quantity,
+                product,
+                rationale,
+                limit_price,
+                time_in_force,
+                leverage,
+                idempotency_key,
+            )
+        )
+
+    @typed.tool(name="cancel_order")
+    async def cancel_order_(order_id: int) -> dict[str, Any]:
+        """Cancel a working order."""
+        return await _call(cancel_order(deps, order_id))
+
+    @typed.tool(name="submit_strategy")
+    async def submit_strategy_(name: str, python_code: str) -> dict[str, Any]:
+        """Register a strategy: statically validated, then smoke-run."""
+        return await _call(submit_strategy(deps, name, python_code))
+
+    @typed.tool(name="run_backtest")
+    async def run_backtest_(
+        strategy_id: int,
+        start: str,
+        end: str,
+        starting_cash: str | None = None,
+        max_daily_loss: str | None = None,
+        max_drawdown_pct: str | None = None,
+    ) -> dict[str, Any]:
+        """Replay a strategy over a window. Dates are YYYY-MM-DD."""
+        return await _call(
+            run_backtest(
+                deps, strategy_id, start, end, starting_cash, max_daily_loss, max_drawdown_pct
+            )
+        )
+
+    @typed.tool(name="get_backtest")
+    async def get_backtest_(backtest_run_id: int) -> dict[str, Any]:
+        """Re-read a stored backtest run with its curve and fills."""
+        return await _call(get_backtest(deps, backtest_run_id))

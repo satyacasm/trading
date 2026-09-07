@@ -11,6 +11,7 @@ an agent can only act on wording it receives.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,7 +19,7 @@ from decimal import Decimal
 from typing import Any
 
 from trading.indicators import CATALOGUE, IndicatorRequest, compute, parse, warmup_for
-from trading.mcp.client import GatewayClient, GatewayRefusal
+from trading.mcp.client import GatewayClient, GatewayRefusal, GatewayUnavailable
 from trading.mcp.formatting import freshness, money, refused
 from trading.mcp.session import AgentSession, SessionStore
 from trading.paper.charges import BROKER_BY_ASSET_CLASS
@@ -383,3 +384,135 @@ async def list_orders(deps: ToolDeps, status: str | None = None, limit: int = 50
         "count": len(rows),
         "orders": [_with_money_fields(row, _ORDER_MONEY_FIELDS) for row in rows],
     }
+
+
+def _derive_idempotency_key(
+    portfolio_id: int,
+    instrument_id: int,
+    side: str,
+    order_type: str,
+    quantity: str,
+    limit_price: str | None,
+    now: datetime,
+) -> str:
+    """A key that is stable across retries of the same decision.
+
+    Bucketed to the minute: an agent that retries a decision seconds
+    later means the same order, and two orders would be the wrong answer.
+    An agent that genuinely wants to buy twice in one minute passes its
+    own key -- which is why the parameter stays.
+    """
+    material = "|".join(
+        [
+            str(portfolio_id),
+            str(instrument_id),
+            side,
+            order_type,
+            quantity,
+            limit_price or "",
+            now.strftime("%Y-%m-%dT%H:%M"),
+        ]
+    )
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+async def place_order(
+    deps: ToolDeps,
+    instrument_id: int,
+    side: str,
+    order_type: str,
+    quantity: str,
+    product: str,
+    rationale: str,
+    limit_price: str | None = None,
+    time_in_force: str = "DAY",
+    leverage: str | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Place one order in the session's portfolio.
+
+    There is no `portfolio_id` parameter. The book comes from the session,
+    so a confused or misled agent cannot trade the wrong one.
+
+    `rationale` is required by the API and stored with the order. It is
+    the only record of why an autonomous decision was taken, so it is
+    passed through rather than defaulted.
+
+    A timed-out POST is retried exactly once, with the *same*
+    idempotency_key -- never re-derived, since a fresh derivation would
+    stamp a different minute-bucket onto a retry that crossed a minute
+    boundary and defeat the whole point of the key. `POST /orders` holds
+    a unique constraint on idempotency_key and `_insert_order`
+    (`trading/paper/api.py`) recovers a `UniqueViolation` by returning
+    the order that won the race rather than raising, so a same-key retry
+    converges on exactly one order whether or not the first attempt
+    reached the database. Two failures in a row is reported as `UNKNOWN`
+    rather than guessed at either way: claiming FILLED or REFUSED here
+    would be inventing an outcome for real money.
+    """
+    session = _session(deps)
+    key = idempotency_key or _derive_idempotency_key(
+        session.portfolio_id, instrument_id, side, order_type, quantity, limit_price, _utcnow()
+    )
+    body: dict[str, Any] = {
+        "portfolio_id": session.portfolio_id,
+        "instrument_id": instrument_id,
+        "side": side,
+        "order_type": order_type,
+        "quantity": quantity,
+        "product": product,
+        "time_in_force": time_in_force,
+        "rationale": rationale,
+        "idempotency_key": key,
+    }
+    if limit_price is not None:
+        body["limit_price"] = limit_price
+    if leverage is not None:
+        body["leverage"] = leverage
+
+    for attempt in (1, 2):
+        try:
+            order: dict[str, Any] = await deps.client.post("/orders", body)
+        except GatewayRefusal as refusal:
+            # A rejected order (insufficient cash, market closed, a
+            # contract-filter violation) is business data, not a crash --
+            # the gateway's wording already says what would satisfy it.
+            return refused(refusal.detail, idempotency_key=key)
+        except GatewayUnavailable as unavailable:
+            # Safe to repeat: idempotency_key carries a unique constraint
+            # and `_insert_order` returns the winner of a race rather than
+            # creating a second order. Exactly one order exists whether or
+            # not the first attempt reached the database.
+            if attempt == 2:
+                return {
+                    "status": "UNKNOWN",
+                    "reason": (
+                        f"the gateway did not answer, so this order may or may not have been "
+                        f"placed: {unavailable}. Call list_orders before retrying; re-sending "
+                        f"with the same idempotency_key will not create a second order."
+                    ),
+                    "idempotency_key": key,
+                }
+            continue
+        # `Order` (trading.paper.models) serialises its Decimal money
+        # fields as JSON floats, exactly like Portfolio and Position --
+        # see the module-level comment above _PORTFOLIO_MONEY_FIELDS.
+        return _with_money_fields(order, _ORDER_MONEY_FIELDS)
+    raise AssertionError("unreachable")
+
+
+async def cancel_order(deps: ToolDeps, order_id: int) -> dict[str, Any]:
+    """Cancel a working order. Refusals -- already terminal, unknown id --
+    carry the gateway's wording verbatim.
+
+    Never retried: `DELETE /orders/{id}` carries no idempotency key, so a
+    second attempt after a timeout cannot be told apart from a second
+    genuine cancel, and `GatewayClient.delete` already does not retry for
+    exactly this reason.
+    """
+    _session(deps)
+    try:
+        order: dict[str, Any] = await deps.client.delete(f"/orders/{order_id}")
+    except GatewayRefusal as refusal:
+        return refused(refusal.detail, order_id=order_id)
+    return _with_money_fields(order, _ORDER_MONEY_FIELDS)

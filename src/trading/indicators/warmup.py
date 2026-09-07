@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from trading.indicators._shared import _require_positive_period
+
 # Five periods of run-up puts the residual weight of the seed below 1% for
 # the smoothings used here; the floor covers very short periods, where five
 # periods is still only a handful of bars.
@@ -20,8 +22,7 @@ _MIN_WARMUP_BARS = 50
 
 def warmup_bars_for(period: int) -> int:
     """Bars to fetch BEYOND the caller's requested history."""
-    if period <= 0:
-        raise ValueError(f"period must be positive, got {period}")
+    _require_positive_period(period)
     return max(_WARMUP_MULTIPLE * period, _MIN_WARMUP_BARS)
 
 

@@ -6,7 +6,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from trading.indicators.trend import ema, ema_series, sma
+from trading.indicators.trend import adx, ema, ema_series, macd, sma
 
 _prices = st.lists(
     st.decimals(min_value=Decimal("0.01"), max_value=Decimal("100000"), places=2),
@@ -66,3 +66,59 @@ def test_ema_never_leaves_the_range_of_its_inputs(values: list[Decimal]) -> None
     result = ema(values, 3)
     if result is not None:
         assert min(values) <= result <= max(values)
+
+
+def test_macd_of_a_flat_series_is_zero_on_every_leg() -> None:
+    closes = [Decimal(10)] * 60
+    result = macd(closes)
+    assert result is not None
+    assert result.line == Decimal(0)
+    assert result.signal == Decimal(0)
+    assert result.histogram == Decimal(0)
+
+
+def test_macd_line_is_positive_while_price_rises() -> None:
+    # The fast EMA sits above the slow one in an uptrend.
+    closes = [Decimal(i) for i in range(1, 81)]
+    result = macd(closes)
+    assert result is not None
+    assert result.line > 0
+
+
+def test_macd_histogram_is_the_line_minus_its_signal() -> None:
+    closes = [Decimal(i) for i in range(1, 81)]
+    result = macd(closes)
+    assert result is not None
+    assert result.histogram == result.line - result.signal
+
+
+def test_macd_returns_none_without_enough_bars() -> None:
+    assert macd([Decimal(10)] * 20) is None
+
+
+def test_macd_rejects_a_fast_period_that_is_not_faster() -> None:
+    with pytest.raises(ValueError):
+        macd([Decimal(10)] * 60, fast=26, slow=26)
+
+
+def test_adx_of_a_flat_series_is_none() -> None:
+    # No directional movement and no true range: DX is undefined at every
+    # bar, so there is nothing to average.
+    flat = [Decimal(10)] * 60
+    assert adx(flat, flat, flat, period=14) is None
+
+
+def test_adx_of_a_persistent_uptrend_is_high() -> None:
+    # Every bar makes a higher high and higher low, so -DI is zero, DX is
+    # pinned at 100, and its average is 100.
+    closes = [Decimal(i) for i in range(1, 61)]
+    highs = [c + Decimal(1) for c in closes]
+    lows = [c - Decimal(1) for c in closes]
+    result = adx(highs, lows, closes, period=14)
+    assert result is not None
+    assert result == Decimal(100)
+
+
+def test_adx_returns_none_without_enough_bars() -> None:
+    closes = [Decimal(i) for i in range(1, 10)]
+    assert adx(closes, closes, closes, period=14) is None

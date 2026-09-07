@@ -5,10 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from decimal import Decimal
 
-
-def _require_positive_period(period: int) -> None:
-    if period <= 0:
-        raise ValueError(f"period must be positive, got {period}")
+from trading.indicators._shared import _require_positive_period
 
 
 def rsi(closes: Sequence[Decimal], period: int = 14) -> Decimal | None:

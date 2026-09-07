@@ -6,10 +6,7 @@ from collections.abc import Sequence
 from decimal import Decimal
 from typing import NamedTuple
 
-
-def _require_positive_period(period: int) -> None:
-    if period <= 0:
-        raise ValueError(f"period must be positive, got {period}")
+from trading.indicators._shared import _require_positive_period
 
 
 class Bands(NamedTuple):

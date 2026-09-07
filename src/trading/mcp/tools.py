@@ -505,12 +505,47 @@ async def cancel_order(deps: ToolDeps, order_id: int) -> dict[str, Any]:
     """Cancel a working order. Refusals -- already terminal, unknown id --
     carry the gateway's wording verbatim.
 
+    `DELETE /orders/{order_id}` (`trading/paper/api.py`) selects and
+    cancels by `order_id` alone -- unlike `GET /orders` just below it in
+    that file, it takes no `portfolio_id` and enforces no ownership at
+    all. So before issuing the DELETE, this confirms `order_id` is among
+    the session's own orders, reusing the same `GET /orders?portfolio_id=`
+    call `list_orders` already makes. This is *not* a second enforcement
+    path duplicating something the gateway already checks -- the gateway
+    checks nothing here, so this is the only check that exists. If the
+    route is ever fixed to scope by portfolio itself, this guard becomes
+    redundant and should be revisited then, not deleted now as
+    duplication before that happens.
+
+    The refusal for an order outside the session's portfolio never says
+    whether `order_id` exists under some other book -- and structurally
+    cannot: `GET /orders` is itself filtered server-side to the caller's
+    own `portfolio_id`, so this tool never learns anything about anyone
+    else's orders to leak in the first place.
+
     Never retried: `DELETE /orders/{id}` carries no idempotency key, so a
     second attempt after a timeout cannot be told apart from a second
     genuine cancel, and `GatewayClient.delete` already does not retry for
-    exactly this reason.
+    exactly this reason. A `GatewayUnavailable` from either call
+    propagates uncaught -- a crash here must not be adapted into a
+    plausible-looking REFUSED or CANCELLED.
     """
-    _session(deps)
+    session = _session(deps)
+    try:
+        mine_orders: list[dict[str, Any]] = await deps.client.get(
+            "/orders", params={"portfolio_id": session.portfolio_id, "limit": 500}
+        )
+    except GatewayRefusal as refusal:
+        return refused(refusal.detail, order_id=order_id)
+    owned = any(
+        row.get("order_id") == order_id and row.get("portfolio_id") == session.portfolio_id
+        for row in mine_orders
+    )
+    if not owned:
+        return refused(
+            f"no order with order_id={order_id} in this session's portfolio", order_id=order_id
+        )
+
     try:
         order: dict[str, Any] = await deps.client.delete(f"/orders/{order_id}")
     except GatewayRefusal as refusal:

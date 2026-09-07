@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from trading.mcp import tools
-from trading.mcp.client import GatewayClient
+from trading.mcp.client import GatewayClient, GatewayUnavailable
 from trading.mcp.session import SessionStore
 from trading.mcp.tools import ToolDeps
 
@@ -163,22 +163,103 @@ async def test_a_write_that_keeps_timing_out_reports_the_key_to_reconcile_with()
     assert "may or may not" in str(result["reason"])
 
 
+def _cancel_routes(
+    *, mine: list[dict[str, object]], on_delete: httpx.Response
+) -> httpx.MockTransport:
+    """A routing handler for cancel_order's two calls.
+
+    cancel_order now issues a `GET /orders?portfolio_id=` ownership check
+    before the `DELETE /orders/{id}` -- a handler that answers the same
+    response regardless of path (as the original brief's mocks did) can
+    no longer tell the two calls apart, so every cancel_order test below
+    routes on `request.method`/`request.url.path` explicitly.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/orders":
+            return httpx.Response(200, json=mine)
+        if request.method == "DELETE":
+            return on_delete
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    return httpx.MockTransport(handler)
+
+
 @pytest.mark.anyio
 async def test_cancel_order_returns_the_cancelled_order() -> None:
     cancelled = {**_ORDER, "status": "CANCELLED"}
-    handler = httpx.MockTransport(lambda r: httpx.Response(200, json=cancelled))
+    handler = _cancel_routes(mine=[_ORDER], on_delete=httpx.Response(200, json=cancelled))
     result = await tools.cancel_order(_deps(handler), 11)
     assert result["status"] == "CANCELLED"
 
 
 @pytest.mark.anyio
 async def test_cancel_order_surfaces_a_refusal_verbatim() -> None:
-    handler = httpx.MockTransport(
-        lambda r: httpx.Response(400, json={"detail": "order 11 is already FILLED"})
-    )
+    refusal = httpx.Response(400, json={"detail": "order 11 is already FILLED"})
+    handler = _cancel_routes(mine=[_ORDER], on_delete=refusal)
     result = await tools.cancel_order(_deps(handler), 11)
     assert result["status"] == "REFUSED"
     assert "already FILLED" in result["reason"]
+
+
+@pytest.mark.anyio
+async def test_cancel_order_sends_the_delete_to_the_specific_order_path() -> None:
+    # A write path is worth pinning the exact request for: a bug sending
+    # the DELETE to "/orders" instead of "/orders/11" would still return
+    # a 2xx from a permissive mock and pass every assertion above.
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        if request.method == "GET" and request.url.path == "/orders":
+            return httpx.Response(200, json=[_ORDER])
+        return httpx.Response(200, json={**_ORDER, "status": "CANCELLED"})
+
+    await tools.cancel_order(_deps(httpx.MockTransport(handler)), 11)
+    assert ("DELETE", "/orders/11") in seen
+
+
+@pytest.mark.anyio
+async def test_cancel_order_refuses_an_order_outside_the_session_portfolio() -> None:
+    # DELETE /orders/{order_id} (trading/paper/api.py) enforces no
+    # portfolio ownership at all -- unlike GET /orders directly below it
+    # in that file, which requires portfolio_id. This is the guard that
+    # exists in its place: an order_id absent from the session's own
+    # GET /orders must refuse before ever reaching DELETE.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/orders":
+            return httpx.Response(200, json=[])  # this portfolio owns nothing
+        raise AssertionError("must not reach DELETE for an order outside the portfolio")
+
+    result = await tools.cancel_order(_deps(httpx.MockTransport(handler)), 999)
+    assert result["status"] == "REFUSED"
+    assert "999" in result["reason"]
+
+
+@pytest.mark.anyio
+async def test_cancel_order_propagates_a_gateway_unavailable() -> None:
+    # DELETE is never retried -- GatewayClient.delete's own convention,
+    # and cancel_order adds no catch of its own -- so a crash here must
+    # reach the caller as an exception, not an adapted REFUSED/UNKNOWN.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/orders":
+            return httpx.Response(200, json=[_ORDER])
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    with pytest.raises(GatewayUnavailable):
+        await tools.cancel_order(_deps(httpx.MockTransport(handler)), 11)
+
+
+@pytest.mark.anyio
+async def test_place_order_posts_to_the_orders_path() -> None:
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        return httpx.Response(201, json=_ORDER)
+
+    await _place(_deps(httpx.MockTransport(handler)))
+    assert seen == [("POST", "/orders")]
 
 
 # The two tests below back place_order/cancel_order with
@@ -202,8 +283,9 @@ async def test_place_order_re_renders_float_money_fields_as_exact_text() -> None
 
 @pytest.mark.anyio
 async def test_cancel_order_re_renders_float_money_fields_as_exact_text() -> None:
+    mine_order = {**_ORDER, "quantity": 10.0}
     float_order = {**_ORDER, "status": "CANCELLED", "quantity": 10.0}
-    handler = httpx.MockTransport(lambda r: httpx.Response(200, json=float_order))
+    handler = _cancel_routes(mine=[mine_order], on_delete=httpx.Response(200, json=float_order))
     result = await tools.cancel_order(_deps(handler), 11)
     assert result["quantity"] == "10.0"
     assert isinstance(result["quantity"], str)

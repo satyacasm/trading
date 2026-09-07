@@ -23,11 +23,21 @@ _INTERVAL_SECONDS: dict[str, int] = {
 def money(value: object) -> str | None:
     """Any monetary value as exact text, or `None`.
 
-    A string passes through untouched -- the gateway already sends money
-    as text, and re-parsing it can only lose precision. A float is
-    stringified rather than fed to `Decimal` directly, since
-    `Decimal(0.1)` is 0.1000000000000000055… and `Decimal(str(0.1))` is
-    the 0.1 that was meant.
+    Not every gateway model sends money as text. Most do (candles,
+    `PerpPositionOut`, `/perp-context`), and for those a string passes
+    through untouched -- re-parsing it can only lose precision. But
+    `Portfolio`, `Position` and `Order` (`trading.paper.models`) each
+    carry an explicit `field_serializer` that renders their Decimal money
+    fields as a JSON *number* instead, so a caller reading one of those
+    gets a Python `float` here, already decoded from that JSON number by
+    the time it reaches this function. This function cannot recover
+    precision a float has already lost in transit -- it can only avoid
+    losing more: it is stringified rather than fed to `Decimal` directly,
+    since `Decimal(0.1)` is 0.1000000000000000055… and
+    `Decimal(str(0.1))` is the 0.1 that was meant. A caller that controls
+    the source and can choose precision-preserving text instead (as
+    `trading.mcp.tools._with_money_fields` does for those three models)
+    should still do so upstream of this function.
     """
     if value is None:
         return None

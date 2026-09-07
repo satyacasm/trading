@@ -352,15 +352,28 @@ async def get_perp_positions(deps: ToolDeps) -> dict[str, Any]:
 
 async def list_orders(deps: ToolDeps, status: str | None = None, limit: int = 50) -> dict[str, Any]:
     """The session portfolio's order blotter, newest first (`GET /orders`
-    orders by `order_id DESC`)."""
+    orders by `order_id DESC`).
+
+    `GET /orders` 404s when `portfolio_id` does not exist (mirroring
+    `get_positions`), and that is reachable here: an operator's
+    `mcp_tokens` entry can point at a portfolio that has since been
+    deleted, or was mistyped at configuration time. `get_portfolio_state`
+    treats the same failure mode as a first-class refusal rather than a
+    crash, and this tool follows the same convention this module states
+    at the top of the file -- a business refusal is data, not a raised
+    exception a caller has to catch.
+    """
     session = _session(deps)
     # `portfolio_id` is required by the route; `limit` is capped at 500,
     # the route's own `le=500` -- sending more would be refused rather
     # than clamped, and the cap belongs here so a caller-supplied limit
     # never turns a read into a refusal.
-    orders: list[dict[str, Any]] = await deps.client.get(
-        "/orders", params={"portfolio_id": session.portfolio_id, "limit": min(limit, 500)}
-    )
+    try:
+        orders: list[dict[str, Any]] = await deps.client.get(
+            "/orders", params={"portfolio_id": session.portfolio_id, "limit": min(limit, 500)}
+        )
+    except GatewayRefusal as refusal:
+        return refused(refusal.detail, portfolio_id=session.portfolio_id)
     rows = [row for row in orders if row.get("portfolio_id") == session.portfolio_id]
     if status is not None:
         wanted = status.upper()

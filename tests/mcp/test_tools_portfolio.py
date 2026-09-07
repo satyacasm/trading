@@ -34,7 +34,7 @@ _PORTFOLIOS = [
         "margin_mode": "CROSS",
     },
 ]
-_POSITIONS = [{"instrument_id": 7, "quantity": "10", "average_price": "100.25"}]
+_POSITIONS = [{"instrument_id": 7, "quantity": "10", "avg_cost": "100.25"}]
 _ORDERS = [
     {
         "order_id": 11,
@@ -140,6 +140,20 @@ async def test_orders_are_requested_with_the_required_portfolio_parameter() -> N
 async def test_list_orders_respects_the_limit() -> None:
     result = await tools.list_orders(_deps(httpx.MockTransport(_routes)), limit=1)
     assert len(result["orders"]) == 1
+
+
+@pytest.mark.anyio
+async def test_list_orders_refuses_gracefully_when_the_portfolio_is_gone() -> None:
+    # GET /orders 404s when portfolio_id doesn't exist (get_positions does
+    # the same). A session bound to a portfolio_id that has since been
+    # deleted, or was mistyped in mcp_tokens, must surface as data an
+    # agent can read -- not an exception that crashes the tool call.
+    handler = httpx.MockTransport(
+        lambda request: httpx.Response(404, json={"detail": "no portfolio with portfolio_id=1"})
+    )
+    result = await tools.list_orders(_deps(handler))
+    assert result["status"] == "REFUSED"
+    assert "no portfolio with portfolio_id=1" in result["reason"]
 
 
 # The routes below back these tools with `trading.paper.models.Portfolio`,

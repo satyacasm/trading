@@ -292,3 +292,62 @@ def test_get_watchlist_returns_last_price_as_a_json_number(client, db_conn, fixt
 
     body = client.get("/watchlist").json()
     assert isinstance(body[0]["last_price"], float)
+
+
+@pytest.fixture
+def instrument_with_daily_bars(db_conn, fixture_equity_instrument_id: int) -> int:
+    # An equity, not crypto: 1d for a CRYPTO instrument routes to the bucketed
+    # bars_intraday path (see test_get_candles_1d_buckets_bars_intraday_for_crypto),
+    # so only an equity's 1d actually reads the bars_daily rows this fixture writes.
+    for day, close in enumerate((Decimal("100.25"), Decimal("101.50")), start=1):
+        db_conn.execute(
+            """
+            INSERT INTO bars_daily
+                (instrument_id, ts, open, high, low, close, volume, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 6)
+            """,
+            (
+                fixture_equity_instrument_id,
+                datetime(2026, 1, day, tzinfo=UTC),
+                close,
+                close,
+                close,
+                close,
+                Decimal("1000"),
+            ),
+        )
+    return fixture_equity_instrument_id
+
+
+def test_candles_default_to_floats_so_existing_clients_are_untouched(
+    client: TestClient, instrument_with_daily_bars: int
+) -> None:
+    response = client.get(f"/candles/{instrument_with_daily_bars}", params={"interval": "1d"})
+    assert response.status_code == 200
+    first = response.json()["candles"][0]
+    assert isinstance(first["close"], float)
+
+
+def test_candles_with_string_precision_return_exact_decimal_text(
+    client: TestClient, instrument_with_daily_bars: int
+) -> None:
+    response = client.get(
+        f"/candles/{instrument_with_daily_bars}",
+        params={"interval": "1d", "precision": "string"},
+    )
+    assert response.status_code == 200
+    closes = [candle["close"] for candle in response.json()["candles"]]
+    # bars_daily.close is NUMERIC(18,4); psycopg hands back a Decimal at that
+    # exact scale, and str() of it preserves the trailing zeros the database
+    # actually stores -- that precision is the entire point of this shape.
+    assert closes == ["100.2500", "101.5000"]
+
+
+def test_candles_reject_an_unknown_precision(
+    client: TestClient, instrument_with_daily_bars: int
+) -> None:
+    response = client.get(
+        f"/candles/{instrument_with_daily_bars}",
+        params={"interval": "1d", "precision": "exact"},
+    )
+    assert response.status_code == 422

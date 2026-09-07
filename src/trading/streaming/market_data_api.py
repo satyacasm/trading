@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from psycopg import Connection
@@ -109,6 +110,28 @@ class CandlesResponse(BaseModel):
     candles: list[Candle]
 
 
+class StringCandle(BaseModel):
+    """OHLCV as decimal text.
+
+    A price is money, and JSON has no decimal type. A client that must not
+    round -- anything sizing a position, and every indicator computed from
+    these bars -- asks for this shape instead.
+    """
+
+    ts: datetime
+    open: str
+    high: str
+    low: str
+    close: str
+    volume: str
+
+
+class StringCandlesResponse(BaseModel):
+    instrument_id: int
+    interval: str
+    candles: list[StringCandle]
+
+
 _INTERVAL_BUCKETS: dict[str, str] = {
     "1m": "1 minute",
     "5m": "5 minutes",
@@ -134,24 +157,6 @@ _BUCKETED_CANDLES_SQL = """
 """
 
 
-def _fetch_bucketed_candles(
-    conn: Connection, instrument_id: int, bucket: str, limit: int
-) -> list[Candle]:
-    rows = conn.execute(_BUCKETED_CANDLES_SQL, (bucket, instrument_id, limit)).fetchall()
-    candles = [
-        Candle(
-            ts=ts,
-            open=open_,
-            high=high,
-            low=low,
-            close=close,
-            volume=float(volume or Decimal(0)),
-        )
-        for ts, open_, high, low, close, volume in rows
-    ]
-    return list(reversed(candles))
-
-
 _DAILY_CANDLES_SQL = """
     SELECT ts, open, high, low, close, volume
     FROM bars_daily
@@ -160,30 +165,77 @@ _DAILY_CANDLES_SQL = """
     LIMIT %s
 """
 
+_Row = tuple[datetime, Decimal, Decimal, Decimal, Decimal, Decimal]
 
-def _fetch_daily_candles(conn: Connection, instrument_id: int, limit: int) -> list[Candle]:
+
+def _decimal(value: object) -> Decimal:
+    """Whatever the driver returned, as a Decimal. `None` volume is zero.
+
+    `str()` first for a float: `Decimal(0.1)` is 0.1000000000000000055…,
+    while `Decimal(str(0.1))` is the 0.1 the database meant.
+    """
+    if value is None:
+        return Decimal(0)
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
+def _fetch_bucketed_rows(
+    conn: Connection, instrument_id: int, bucket: str, limit: int
+) -> list[_Row]:
+    rows = conn.execute(_BUCKETED_CANDLES_SQL, (bucket, instrument_id, limit)).fetchall()
+    built = [
+        (ts, _decimal(o), _decimal(h), _decimal(low), _decimal(c), _decimal(v))
+        for ts, o, h, low, c, v in rows
+    ]
+    return list(reversed(built))
+
+
+def _fetch_daily_rows(conn: Connection, instrument_id: int, limit: int) -> list[_Row]:
     rows = conn.execute(_DAILY_CANDLES_SQL, (instrument_id, limit)).fetchall()
-    candles = [
+    built = [
+        (ts, _decimal(o), _decimal(h), _decimal(low), _decimal(c), _decimal(v))
+        for ts, o, h, low, c, v in rows
+    ]
+    return list(reversed(built))
+
+
+def _as_float_candles(rows: list[_Row]) -> list[Candle]:
+    return [
         Candle(
             ts=ts,
-            open=open_,
-            high=high,
-            low=low,
-            close=close,
-            volume=float(Decimal(volume) if volume is not None else Decimal(0)),
+            open=float(o),
+            high=float(h),
+            low=float(low),
+            close=float(c),
+            volume=float(v),
         )
-        for ts, open_, high, low, close, volume in rows
+        for ts, o, h, low, c, v in rows
     ]
-    return list(reversed(candles))
 
 
-@router.get("/candles/{instrument_id}", response_model=CandlesResponse)
+def _as_string_candles(rows: list[_Row]) -> list[StringCandle]:
+    return [
+        StringCandle(ts=ts, open=str(o), high=str(h), low=str(low), close=str(c), volume=str(v))
+        for ts, o, h, low, c, v in rows
+    ]
+
+
+@router.get("/candles/{instrument_id}", response_model=None)
 def get_candles(
     instrument_id: int,
     interval: str = Query(...),
     limit: int = _DEFAULT_LIMIT,
+    precision: Literal["float", "string"] = "float",
     conn: Connection = Depends(get_db_connection),  # noqa: B008
-) -> CandlesResponse:
+) -> CandlesResponse | StringCandlesResponse:
+    """`precision` defaults to `float`, which is what the web charts read.
+
+    `string` is for clients that must not round: money has no float
+    representation, and an indicator or a position size computed from a
+    rounded close is wrong in a way nothing downstream can detect.
+    """
     if interval not in _VALID_INTERVALS:
         raise HTTPException(
             status_code=400,
@@ -199,9 +251,15 @@ def get_candles(
     asset_class = row[0]
 
     if interval == "1d" and asset_class != "CRYPTO":
-        candles = _fetch_daily_candles(conn, instrument_id, limit)
+        rows = _fetch_daily_rows(conn, instrument_id, limit)
     else:
         bucket = _INTERVAL_BUCKETS.get(interval, "1 day")
-        candles = _fetch_bucketed_candles(conn, instrument_id, bucket, limit)
+        rows = _fetch_bucketed_rows(conn, instrument_id, bucket, limit)
 
-    return CandlesResponse(instrument_id=instrument_id, interval=interval, candles=candles)
+    if precision == "string":
+        return StringCandlesResponse(
+            instrument_id=instrument_id, interval=interval, candles=_as_string_candles(rows)
+        )
+    return CandlesResponse(
+        instrument_id=instrument_id, interval=interval, candles=_as_float_candles(rows)
+    )

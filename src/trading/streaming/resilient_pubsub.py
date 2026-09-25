@@ -53,15 +53,19 @@ async def resilient_messages(
     max_backoff: float = 30.0,
 ) -> AsyncIterator[dict]:
     """Yield every actual pub/sub message forever (subscribe/psubscribe
-    confirmation events from `listen()` are consumed but not yielded). A
-    raised exception from `listen()` and a `listen()` that returns having
-    delivered nothing are both treated as a disconnect worth backing off
-    for: log it, back off (1s, 2s, 4s, ... capped at `max_backoff`, reset
-    to 1s the moment any item is delivered), open a fresh pubsub, and
+    confirmation events from `listen()` are consumed but not yielded, and
+    do not themselves count as delivery). A raised exception from
+    `listen()` and a `listen()` that returns having delivered no real
+    message are both treated as a disconnect worth backing off for: log
+    it, back off (1s, 2s, 4s, ... capped at `max_backoff`, reset to 1s the
+    moment a real message is delivered), open a fresh pubsub, and
     resubscribe to the same patterns/channels. A `listen()` that returns
-    after delivering at least one item just needs a fresh generator (the
-    per-connection iterator ended) -- that is not itself evidence of a
-    problem, so it does not incur another backoff sleep."""
+    after delivering at least one real message just needs a fresh
+    generator (the per-connection iterator ended) -- that is not itself
+    evidence of a problem, so it does not incur another backoff sleep. A
+    session that only ever produces subscribe confirmations before dying
+    (a flaky connection that never gets past resubscribing) must still be
+    scored as a disconnect, not as delivery, or the backoff never engages."""
     backoff = _INITIAL_BACKOFF
     pubsub = await _subscribe(redis_client, patterns, channels)
     while True:
@@ -69,10 +73,10 @@ async def resilient_messages(
         raised = False
         try:
             async for message in pubsub.listen():
-                backoff = _INITIAL_BACKOFF
-                delivered = True
                 if message.get("type") not in ("message", "pmessage"):
                     continue  # subscribe/psubscribe confirmation, not a real message
+                backoff = _INITIAL_BACKOFF
+                delivered = True
                 yield message
         except Exception as exc:  # noqa: BLE001 - any failure here is a reconnect
             raised = True
@@ -95,7 +99,11 @@ class SyncResilientPubSub:
     loop. Never raises on a connection error: `get_message` returns
     `None` for that call and reconnects (with the same backoff) before
     the next one, so a caller already treating `None` as "nothing right
-    now" needs no new branch."""
+    now" needs no new branch. A subscribe/psubscribe confirmation also
+    returns `None` -- it is not a real message -- but unlike a genuine
+    delivered message it does not reset the backoff, so a connection that
+    keeps resubscribing and dying without ever delivering a real message
+    still escalates instead of retrying at the initial step forever."""
 
     def __init__(
         self,
@@ -131,6 +139,9 @@ class SyncResilientPubSub:
             self._backoff = min(self._backoff * 2, self._max_backoff)
             self._pubsub = self._connect()
             return None
-        if message is not None:
-            self._backoff = _INITIAL_BACKOFF
+        if message is None:
+            return None
+        if message.get("type") not in ("message", "pmessage"):
+            return None  # subscribe/psubscribe confirmation -- not a real message, no backoff reset
+        self._backoff = _INITIAL_BACKOFF
         return message

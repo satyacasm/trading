@@ -10,7 +10,6 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
 
 import httpx
 import structlog

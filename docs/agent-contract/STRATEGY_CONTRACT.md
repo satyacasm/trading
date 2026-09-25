@@ -348,11 +348,27 @@ Structured logging. Retained with the run and shown in its report. Not stdout �
 ### `ctx.state`
 
 A persisted key-value store surviving restarts within a run. Values must be
-JSON-serializable.
+JSON-serializable, and the whole store must serialise to at most **64 KB**
+(`Settings.live_state_max_bytes`) -- exceeding either limit crashes the run
+on that bar, with a message naming which one was broken.
 
 ```python
 ctx.state["entry_price"] = str(price)   # Decimals as strings; see §5
 ```
+
+It is written after every bar, not only at the end of a run, so a
+supervisor restart loses at most the bar in progress.
+
+### `ctx.is_catchup`
+
+`True` on a bar delivered late enough that its price is no longer
+tradeable -- more than two minutes after the bar's own close, at the
+time it reaches the strategy. Indicators and `ctx.state` still update
+normally on a catch-up bar; only the ORDER is refused, by the
+supervisor rather than by this process, and counted on the run with
+`last_refusal = "catch-up bar: price no longer tradeable"`. A live run
+recovering from an outage sees a run of `ctx.is_catchup=True` bars
+before trading resumes on the first bar that is not one.
 
 ### `ctx.intel` — market intelligence
 
@@ -755,10 +771,14 @@ behaves worse live than its backtest suggested:
   that decided to sit still unless you read the reason.
 
 **A forward run does not survive a supervisor restart with its memory
-intact.** The row keeps running and a fresh container is launched, so
-whatever your strategy held in `self` is gone and its next bar looks like
-its first. Keep durable state in `ctx.state`, which is persisted, not in
-instance attributes.
+intact, but it survives with its recorded state intact.** The row keeps
+running and a fresh container is launched; whatever your strategy held
+in bare `self` attributes is gone, but `ctx.state` -- persisted after
+every bar -- is restored into the new container before its first bar.
+The bars it missed while no container was running are delivered to it
+first, marked `ctx.is_catchup=True`; no order from those bars reaches
+the market. Keep durable state in `ctx.state`, not in instance
+attributes, if you want it to survive a restart at all.
 
 ### Static validation is not the sandbox
 

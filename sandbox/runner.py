@@ -370,6 +370,8 @@ def _run_live(payload, instance, manifest, strategy_cls):  # noqa: ANN001, ANN20
         margin_tiers=_margin_tiers(payload),
         leverage=payload.leverage,
     )
+    if payload.strategy_state:
+        session.ctx.state.update(payload.strategy_state)
 
     def _write(line: str) -> None:
         # The same explicit write loop `_emit` uses, for the same reason: a
@@ -434,6 +436,7 @@ def _run_live(payload, instance, manifest, strategy_cls):  # noqa: ANN001, ANN20
                 session.initialize(bar.close_ts)
                 initialised = True
                 _write(encode_frame(FRAME_READY, strategy_class=strategy_cls.__name__))
+            session.ctx.is_catchup = bool(frame.get("catchup", False))
             alive = session.step(bar.close_ts, ((bar, index),))
         except BaseException:  # noqa: BLE001 - any failure is still an outcome
             _write(encode_frame(FRAME_ERROR, error=traceback.format_exc(limit=20)))
@@ -443,6 +446,10 @@ def _run_live(payload, instance, manifest, strategy_cls):  # noqa: ANN001, ANN20
         # replaying it whole would re-place every earlier order.
         new_orders = session.state.submissions[submitted_before:]
         submitted_before = len(session.state.submissions)
+        state_text, state_error = _encode_state(session.ctx.state, payload.state_max_bytes)
+        if state_error is not None:
+            _write(encode_frame(FRAME_ERROR, error=state_error))
+            break
         _write(
             encode_frame(
                 FRAME_ORDERS,
@@ -450,6 +457,7 @@ def _run_live(payload, instance, manifest, strategy_cls):  # noqa: ANN001, ANN20
                 orders=[_order_intent(session.state.orders[oid]) for oid in new_orders],
                 breaker_reason=session.state.breaker_reason,
                 alive=alive,
+                state=json.loads(state_text),
             )
         )
         if not alive:

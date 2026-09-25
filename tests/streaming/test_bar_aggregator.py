@@ -6,6 +6,7 @@ from collections.abc import Coroutine
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from unittest.mock import MagicMock
 
 import redis
 from redis.asyncio import Redis as AsyncRedis
@@ -1102,3 +1103,256 @@ def test_startup_backfill_writes_and_announces_with_a_fake_fetch(db_conn, redis_
     assert row == (Decimal("100.0000"), 11)  # 11 = BINANCE_SPOT_KLINE
     body = json.loads(message["data"])
     assert body["instrument_id"] == iid
+
+
+def test_a_tick_after_90s_of_silence_triggers_a_backfill_of_the_gap(db_conn) -> None:
+    """A tick resuming after a long silence means the process (or the
+    network) was down for that stretch -- the aggregator cannot have
+    seen those minutes, and this is the trigger to fetch them."""
+    import asyncio
+
+    from trading.sources.binance_spot import SpotKline
+    from trading.streaming.bar_aggregator import BarAggregator, _silence_backfill
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    fetched: list[tuple[str, int, int]] = []
+
+    def _fake_fetch(symbol, *, start_ms, end_ms, client=None):
+        fetched.append((symbol, start_ms, end_ms))
+        return [
+            SpotKline(
+                ts=datetime(2026, 9, 25, 10, 0, tzinfo=UTC),
+                open=Decimal("1"), high=Decimal("1"), low=Decimal("1"),
+                close=Decimal("1"), volume=Decimal("0"), trades=0,
+            )
+        ]
+
+    async def _inline_to_thread(fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    class _NullRedis:
+        async def publish(self, *a, **k):
+            return None
+
+    aggregator = BarAggregator()
+    asyncio.run(
+        _silence_backfill(
+            lambda: db_conn,
+            aggregator,
+            _NullRedis(),
+            instrument_id=iid,
+            symbol="BTC-USDT",
+            since=datetime(2026, 9, 25, 10, 0, tzinfo=UTC),
+            until=datetime(2026, 9, 25, 10, 5, tzinfo=UTC),
+            to_thread=_inline_to_thread,
+            fetch=_fake_fetch,
+        )
+    )
+    assert fetched and fetched[0][0] == "BTCUSDT"
+    row = db_conn.execute(
+        "SELECT source FROM bars_intraday WHERE instrument_id=%s AND ts=%s",
+        (iid, datetime(2026, 9, 25, 10, 0, tzinfo=UTC)),
+    ).fetchone()
+    assert row == (11,)  # BINANCE_SPOT_KLINE
+
+
+def test_ticks_still_reach_bars_intraday_through_resilient_messages(
+    db_conn, redis_client: redis.Redis
+) -> None:
+    """Wiring proof, not a disconnect drill (Task 2 already covers
+    reconnect logic; Task 15's integration test covers a real Redis
+    restart). Confirms _consume_ticks now iterates resilient_messages
+    rather than pubsub.listen() directly, using this file's own
+    isolated-channel/two-tick pattern (see
+    test_run_aggregation_loop_writes_a_closed_bar_once_its_window_elapses
+    above) so no real wall-clock wait is needed for the bucket to close."""
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    base = datetime.now(UTC) + timedelta(minutes=3)
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(
+            async_redis, db_conn, sleep=_no_sleep, max_bars_written=1, pattern=pattern
+        )
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)
+            redis_client.publish(channel, _tick_json(iid, base.isoformat(), "100.00"))
+            redis_client.publish(
+                channel,
+                _tick_json(iid, (base + timedelta(minutes=1, seconds=5)).isoformat(), "101.00"),
+            )
+
+        asyncio.run(_run_both(loop_task, _publish_after_subscribed()))
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    row = db_conn.execute(
+        "SELECT close FROM bars_intraday WHERE instrument_id = %s", (iid,)
+    ).fetchone()
+    assert row == (Decimal("100.0000"),)
+
+
+def test_main_turns_backfill_on_with_the_configured_thresholds(monkeypatch) -> None:
+    """Every backfill kwarg defaults to off. A `main()` that forgets one
+    ships the mechanism tested and dead, so assert the wiring itself."""
+    from trading.streaming import bar_aggregator
+
+    captured: dict[str, object] = {}
+
+    async def fake_loop(redis, conn, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        captured.update(kwargs)
+
+    monkeypatch.setattr(bar_aggregator, "run_aggregation_loop", fake_loop)
+    monkeypatch.setattr(bar_aggregator.psycopg, "connect", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(bar_aggregator.Redis, "from_url", lambda *a, **k: MagicMock())
+
+    bar_aggregator.main()
+
+    settings = bar_aggregator.get_settings()
+    assert callable(captured["backfill_conn_factory"])
+    assert captured["backfill_silence_seconds"] == settings.backfill_silence_seconds
+    assert captured["backfill_sweep_seconds"] == settings.backfill_sweep_seconds
+    assert (
+        captured["backfill_sweep_window_minutes"] == settings.backfill_sweep_window_minutes
+    )
+
+
+def test_silence_backfill_survives_a_conn_factory_failure(db_conn) -> None:
+    """`_silence_backfill` is fired via `asyncio.create_task` from
+    `_consume_ticks` and never awaited by its caller -- an unhandled
+    exception there is invisible except as an unretrieved-task warning.
+    `backfill_conn_factory()` raising (Postgres still down) is exactly
+    the failure Task 3's `ReconnectingConnection.get()` can produce, and
+    it must be logged and swallowed here, symmetric with a REST failure
+    from `backfill_window` itself."""
+    import asyncio
+
+    import psycopg
+
+    from trading.streaming.bar_aggregator import BarAggregator, _silence_backfill
+
+    def _raising_conn_factory():
+        raise psycopg.OperationalError("could not connect to server")
+
+    async def _inline_to_thread(fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    class _NullRedis:
+        async def publish(self, *a, **k):
+            return None
+
+    aggregator = BarAggregator()
+    asyncio.run(
+        _silence_backfill(
+            _raising_conn_factory,
+            aggregator,
+            _NullRedis(),
+            instrument_id=1,
+            symbol="BTC-USDT",
+            since=datetime(2026, 9, 25, 10, 0, tzinfo=UTC),
+            until=datetime(2026, 9, 25, 10, 5, tzinfo=UTC),
+            to_thread=_inline_to_thread,
+        )
+    )
+    # No assertion beyond "didn't raise" -- asyncio.run would propagate an
+    # unguarded exception straight out of this test.
+
+
+def test_sweep_backfill_survives_a_conn_factory_failure(db_conn) -> None:
+    """The sweep's own instrument query calls `backfill_conn_factory()`
+    directly, independent of `_silence_backfill`'s guard -- if it raised
+    here, `_periodic_sweep_backfill`'s unguarded `await _sweep_backfill(...)`
+    would let it propagate out of the sweep task and, in production
+    (`asyncio.gather(consumer, bars_consumer, flusher, sweep_task)`), take
+    the whole aggregation loop down with it."""
+    import asyncio
+
+    import psycopg
+
+    from trading.streaming.bar_aggregator import BarAggregator, _sweep_backfill
+
+    def _raising_conn_factory():
+        raise psycopg.OperationalError("could not connect to server")
+
+    async def _inline_to_thread(fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    class _NullRedis:
+        async def publish(self, *a, **k):
+            return None
+
+    aggregator = BarAggregator()
+    asyncio.run(
+        _sweep_backfill(
+            _raising_conn_factory,
+            aggregator,
+            _NullRedis(),
+            window_minutes=30,
+            to_thread=_inline_to_thread,
+        )
+    )
+    # No assertion beyond "didn't raise" -- see test above.
+
+
+def test_a_silence_trigger_survives_a_conn_factory_failure_and_keeps_ingesting_ticks(
+    db_conn, redis_client: redis.Redis
+) -> None:
+    """`_consume_ticks`'s own symbol lookup for the silence trigger --
+    `await to_thread(lambda: _query_crypto_spot_instruments(backfill_conn_factory()))`
+    -- runs on the tick-consuming task's own coroutine, not inside
+    `_silence_backfill`. Unguarded, `backfill_conn_factory()` raising
+    there would end tick consumption itself, not just fail to backfill
+    the gap. This sends two ticks for the same instrument with a real
+    wall-clock gap past `backfill_silence_seconds`, with a
+    `backfill_conn_factory` that always raises, and proves the second
+    tick still reaches `bars_intraday`."""
+    import psycopg
+
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    base = datetime.now(UTC) + timedelta(minutes=3)
+
+    def _raising_conn_factory():
+        raise psycopg.OperationalError("could not connect to server")
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(
+            async_redis,
+            db_conn,
+            sleep=_no_sleep,
+            max_bars_written=1,
+            pattern=pattern,
+            backfill_conn_factory=_raising_conn_factory,
+            backfill_silence_seconds=0.01,
+        )
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)  # give psubscribe time to land before we publish
+            redis_client.publish(channel, _tick_json(iid, base.isoformat(), "65000.00"))
+            await asyncio.sleep(0.1)  # exceed backfill_silence_seconds between real ticks
+            redis_client.publish(
+                channel,
+                _tick_json(iid, (base + timedelta(minutes=1, seconds=5)).isoformat(), "65010.00"),
+            )
+
+        asyncio.run(
+            asyncio.wait_for(_run_both(loop_task, _publish_after_subscribed()), timeout=10)
+        )
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    row = db_conn.execute(
+        "SELECT close FROM bars_intraday WHERE instrument_id = %s", (iid,)
+    ).fetchone()
+    assert row == (Decimal("65000.0000"),), (
+        "a silence-trigger conn_factory failure must not stop the loop from "
+        "processing the next tick into a closed bar"
+    )

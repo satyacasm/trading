@@ -20,12 +20,13 @@ import psycopg
 import structlog
 from psycopg import Connection
 from redis.asyncio import Redis
-from redis.asyncio.client import PubSub
 
 from trading.config import get_settings
 from trading.contracts import DataSource
+from trading.db import ReconnectingConnection
 from trading.sources.binance_spot import fetch_spot_klines, spot_symbol
 from trading.streaming.models import Bar, Tick
+from trading.streaming.resilient_pubsub import resilient_messages
 
 INTERVAL_SECONDS = 60
 
@@ -438,6 +439,118 @@ async def _startup_spot_backfill(
         )
 
 
+async def _silence_backfill(
+    conn_factory: Callable[[], Connection],
+    aggregator: BarAggregator,
+    redis: Redis,
+    *,
+    instrument_id: int,
+    symbol: str,
+    since: datetime,
+    until: datetime,
+    to_thread: Callable[..., Any],
+    fetch: Any = None,
+) -> None:
+    """A tick resumed after a long silence for `instrument_id` -- fetch
+    and announce whatever closed minutes fell in the gap. Symmetric
+    with `_startup_spot_backfill` but scoped to one instrument and one
+    window, so a silence on BTC never touches ETH's cursor.
+
+    Fired via `asyncio.create_task` from `_consume_ticks` and never
+    awaited by its caller, and also called per-instrument from
+    `_sweep_backfill` -- either way, nothing downstream may see this
+    raise. `conn_factory()` itself can raise `psycopg.OperationalError`
+    (Task 3's `ReconnectingConnection.get()` while Postgres is still
+    down), so it's inside the same try as the REST call, not before it.
+    """
+    # Imported here, not at module level -- same reasoning as
+    # _startup_spot_backfill's identical import (avoids a circular import
+    # with spot_backfill, which imports bucket_start from this module).
+    from trading.streaming.spot_backfill import backfill_window
+
+    fetch = fetch or fetch_spot_klines
+
+    def _do() -> list[Any]:
+        try:
+            conn = conn_factory()
+            return backfill_window(
+                conn, instrument_id, spot_symbol(symbol), since=since, until=until, fetch=fetch
+            )
+        except Exception as exc:  # noqa: BLE001 - a REST failure, or
+            # backfill_conn_factory() itself raising while Postgres is
+            # still down, must never kill tick consumption or the sweep
+            # task that also calls this helper.
+            log.warning(
+                "bar_aggregator.silence_backfill_failed",
+                instrument_id=instrument_id,
+                reason=str(exc),
+            )
+            return []
+
+    inserted = await to_thread(_do)
+    if inserted:
+        aggregator.seed_closed_through({instrument_id: max(k.ts for k in inserted)})
+    for kline in inserted:
+        await _announce_bar(
+            redis,
+            instrument_id=instrument_id,
+            ts=kline.ts,
+            open_=kline.open,
+            high=kline.high,
+            low=kline.low,
+            close=kline.close,
+            volume=kline.volume,
+            interval_seconds=INTERVAL_SECONDS,
+            source=DataSource.BINANCE_SPOT_KLINE,
+        )
+
+
+async def _sweep_backfill(
+    conn_factory: Callable[[], Connection],
+    aggregator: BarAggregator,
+    redis: Redis,
+    *,
+    window_minutes: int,
+    to_thread: Callable[..., Any],
+    fetch: Any = None,
+) -> None:
+    """Safety net: re-check the last `window_minutes` for every crypto
+    spot instrument, whether or not a silence was ever detected for it.
+    Catches a gap the silence trigger missed -- e.g. a tick stream that
+    never fully stopped but dropped individual minutes.
+
+    `_periodic_sweep_backfill` awaits this with no guard of its own, so
+    `conn_factory()` raising here (Postgres still down) must be caught
+    inside this function -- otherwise it would kill the sweep task and,
+    in production, the whole aggregation loop's `asyncio.gather`."""
+    fetch = fetch or fetch_spot_klines
+    now = datetime.now(UTC)
+    since = now - timedelta(minutes=window_minutes)
+
+    def _instruments() -> dict[int, str]:
+        try:
+            return _query_crypto_spot_instruments(conn_factory())
+        except Exception as exc:  # noqa: BLE001 - backfill_conn_factory()
+            # raising must never kill the sweep task -- it retries on the
+            # next interval instead.
+            log.warning("bar_aggregator.sweep_backfill_failed", reason=str(exc))
+            return {}
+
+    instruments = await to_thread(_instruments)
+    for instrument_id, symbol in instruments.items():
+        await _silence_backfill(
+            conn_factory,
+            aggregator,
+            redis,
+            instrument_id=instrument_id,
+            symbol=symbol,
+            since=since,
+            until=now,
+            to_thread=to_thread,
+            fetch=fetch,
+        )
+
+
 async def run_aggregation_loop(
     redis: Redis,
     conn: Connection,
@@ -452,6 +565,9 @@ async def run_aggregation_loop(
     backfill_conn_factory: Callable[[], Connection] | None = None,
     to_thread: Callable[..., Any] = asyncio.to_thread,
     spot_fetch: Any = None,
+    backfill_silence_seconds: float = 90.0,
+    backfill_sweep_seconds: float = 300.0,
+    backfill_sweep_window_minutes: int = 30,
 ) -> None:
     """Subscribe to `pattern` (`ticks:*` by default) and `bars_pattern`
     (`bars:*` by default), writing each resulting bar to `bars_intraday`.
@@ -596,9 +712,11 @@ async def run_aggregation_loop(
         if max_bars_written is not None and written >= max_bars_written:
             done.set()
 
-    async def _consume_ticks(pubsub: PubSub) -> None:
+    last_tick_at: dict[int, datetime] = {}
+
+    async def _consume_ticks() -> None:
         dropped_before = 0
-        async for message in pubsub.listen():
+        async for message in resilient_messages(redis, patterns=[pattern]):
             if message["type"] != "pmessage":
                 continue
             tick = _parse_tick(message["data"])
@@ -606,6 +724,45 @@ async def run_aggregation_loop(
                 continue
             if tick.instrument_id in excluded_instrument_ids:
                 continue
+            now = datetime.now(UTC)
+            previous = last_tick_at.get(tick.instrument_id)
+            last_tick_at[tick.instrument_id] = now
+            if (
+                backfill_conn_factory is not None
+                and previous is not None
+                and (now - previous).total_seconds() > backfill_silence_seconds
+            ):
+                # Off the event loop, like the startup and sweep paths:
+                # a DB round-trip here would stall every instrument's ticks.
+                try:
+                    symbol = (
+                        await to_thread(
+                            lambda: _query_crypto_spot_instruments(backfill_conn_factory())
+                        )
+                    ).get(tick.instrument_id)
+                except Exception as exc:  # noqa: BLE001 - backfill_conn_factory()
+                    # raising (Postgres still down) must never end tick
+                    # consumption -- the sweep repairs the gap later.
+                    log.warning(
+                        "bar_aggregator.silence_backfill_failed",
+                        instrument_id=tick.instrument_id,
+                        reason=str(exc),
+                    )
+                    symbol = None
+                if symbol is not None:
+                    asyncio.create_task(
+                        _silence_backfill(
+                            backfill_conn_factory,
+                            aggregator,
+                            redis,
+                            instrument_id=tick.instrument_id,
+                            symbol=symbol,
+                            since=previous,
+                            until=now,
+                            to_thread=to_thread,
+                            fetch=spot_fetch,
+                        )
+                    )
             await _write_all(aggregator.ingest(tick))
             # A tick for a minute already closed and announced. Dropping it
             # is right -- see `BarAggregator` -- but silently dropping data
@@ -621,8 +778,8 @@ async def run_aggregation_loop(
             if done.is_set():
                 return
 
-    async def _consume_bars(pubsub: PubSub) -> None:
-        async for message in pubsub.listen():
+    async def _consume_bars() -> None:
+        async for message in resilient_messages(redis, patterns=[bars_pattern]):
             if message["type"] != "pmessage":
                 continue
             bar = _parse_bar(message["data"])
@@ -637,31 +794,34 @@ async def run_aggregation_loop(
             await sleep(flush_check_seconds)
             await _write_all(aggregator.flush_stale(datetime.now(UTC)))
 
-    pubsub = redis.pubsub()
-    await pubsub.psubscribe(pattern)
-    bars_pubsub = redis.pubsub()
-    await bars_pubsub.psubscribe(bars_pattern)
-    consumer = asyncio.create_task(_consume_ticks(pubsub))
-    bars_consumer = asyncio.create_task(_consume_bars(bars_pubsub))
+    async def _periodic_sweep_backfill() -> None:
+        while not done.is_set():
+            await sleep(backfill_sweep_seconds)
+            if backfill_conn_factory is None:
+                continue
+            await _sweep_backfill(
+                backfill_conn_factory,
+                aggregator,
+                redis,
+                window_minutes=backfill_sweep_window_minutes,
+                to_thread=to_thread,
+                fetch=spot_fetch,
+            )
+
+    consumer = asyncio.create_task(_consume_ticks())
+    bars_consumer = asyncio.create_task(_consume_bars())
     flusher = asyncio.create_task(_periodic_flush())
+    sweep_task = asyncio.create_task(_periodic_sweep_backfill())
     try:
         if max_bars_written is None:
-            await asyncio.gather(consumer, bars_consumer, flusher)
+            await asyncio.gather(consumer, bars_consumer, flusher, sweep_task)
         else:
             await done.wait()
     finally:
         consumer.cancel()
         bars_consumer.cancel()
         flusher.cancel()
-        for one_pubsub in (pubsub, bars_pubsub):
-            try:
-                await one_pubsub.punsubscribe()
-                # redis-py's PubSub.aclose (unlike Redis.aclose) ships with no
-                # type annotations at all -- a real upstream stub gap, matching
-                # the same suppression stream_gateway already carries.
-                await one_pubsub.aclose()  # type: ignore[no-untyped-call]
-            except Exception:  # noqa: BLE001 - cleanup must never itself crash the loop
-                log.debug("bar_aggregator.pubsub_cleanup_failed", exc_info=True)
+        sweep_task.cancel()
         # Same reasoning as crypto_ingestor.run_ingestion_loop's identical
         # finally block: release any pooled connection(s) opened during this
         # run before control returns to the caller's event loop, so a
@@ -683,7 +843,20 @@ def main() -> None:
     conn = psycopg.connect(settings.database_url, autocommit=True)
     log.info("bar_aggregator.starting", interval_seconds=INTERVAL_SECONDS)
     try:
-        asyncio.run(run_aggregation_loop(redis, conn))
+        # One long-lived connection for every backfill thread, reconnecting
+        # if Postgres restarts. The backfill helpers never close what the
+        # factory returns, which is only correct because it is shared.
+        backfill_conn = ReconnectingConnection(settings.database_url)
+        asyncio.run(
+            run_aggregation_loop(
+                redis,
+                conn,
+                backfill_conn_factory=backfill_conn.get,
+                backfill_silence_seconds=settings.backfill_silence_seconds,
+                backfill_sweep_seconds=settings.backfill_sweep_seconds,
+                backfill_sweep_window_minutes=settings.backfill_sweep_window_minutes,
+            )
+        )
     except KeyboardInterrupt:
         log.info("bar_aggregator.interrupted")
     finally:

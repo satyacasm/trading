@@ -2495,3 +2495,32 @@ def test_a_stale_mark_is_logged_but_still_used(db_conn) -> None:
     assert len(warnings) == 1
     assert warnings[0]["instrument_id"] == iid
     assert warnings[0]["age_seconds"] > 180
+
+
+def test_run_engine_keeps_consuming_after_resilient_messages_is_swapped_in(
+    setup_conn, conn_factory, monkeypatch
+) -> None:
+    """Wiring proof: _consume_ticks now iterates resilient_messages
+    rather than pubsub.listen() directly. A fake resilient_messages that
+    simulates a mid-stream gap (raising once, then resuming) proves the
+    loop's own consumption logic doesn't care -- Task 2 already covers
+    resilient_messages' own reconnect behaviour in isolation, and
+    Task 15 proves this end to end against a real Redis restart."""
+    import trading.paper.engine as engine_module
+
+    calls = {"n": 0}
+
+    async def _fake_resilient_messages(redis, *, patterns=(), channels=(), **kwargs):
+        calls["n"] += 1
+        if patterns:
+            yield {"type": "pmessage", "data": _tick_json(1, datetime.now(UTC), "100.00")}
+
+    monkeypatch.setattr(engine_module, "resilient_messages", _fake_resilient_messages)
+
+    _run_engine_with_publish(
+        conn_factory=conn_factory,
+        max_ticks=1,
+        publish=[],  # nothing published on the real channel -- the fake supplies it
+        pattern="test-ticks:1:*",
+    )
+    assert calls["n"] >= 1

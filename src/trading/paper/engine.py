@@ -101,7 +101,6 @@ import structlog
 from psycopg import Connection
 from psycopg.errors import CheckViolation
 from redis.asyncio import Redis
-from redis.asyncio.client import PubSub
 
 from trading.config import get_settings
 from trading.paper.alerts import enqueue_alert
@@ -133,6 +132,7 @@ from trading.paper.liquidation import liquidate_open_positions
 from trading.paper.models import FillDecision, Order, Position
 from trading.paper.reference_price import StalePrice, latest_reference_price
 from trading.streaming.models import Tick
+from trading.streaming.resilient_pubsub import resilient_messages
 
 # Instruments with no session to close: a DAY order on one has nothing to
 # expire at. Perpetuals join crypto here for the same reason -- they trade
@@ -1021,9 +1021,9 @@ async def run_engine(
     processed = 0
     done = asyncio.Event()
 
-    async def _consume_ticks(pubsub: PubSub) -> None:
+    async def _consume_ticks() -> None:
         nonlocal processed
-        async for message in pubsub.listen():
+        async for message in resilient_messages(redis, patterns=[pattern]):
             if message["type"] != "pmessage":
                 continue
             try:
@@ -1035,8 +1035,8 @@ async def run_engine(
                 done.set()
                 return
 
-    async def _consume_control(pubsub: PubSub) -> None:
-        async for message in pubsub.listen():
+    async def _consume_control() -> None:
+        async for message in resilient_messages(redis, channels=[control_channel]):
             if message["type"] != "message":
                 continue
             try:
@@ -1161,13 +1161,8 @@ async def run_engine(
             finally:
                 reconcile_conn.close()
 
-    tick_pubsub = redis.pubsub()
-    await tick_pubsub.psubscribe(pattern)
-    control_pubsub = redis.pubsub()
-    await control_pubsub.subscribe(control_channel)
-
-    tick_task = asyncio.create_task(_consume_ticks(tick_pubsub))
-    control_task = asyncio.create_task(_consume_control(control_pubsub))
+    tick_task = asyncio.create_task(_consume_ticks())
+    control_task = asyncio.create_task(_consume_control())
     sweep_task = asyncio.create_task(_periodic_sweep())
     breaker_task = asyncio.create_task(_periodic_breaker_check())
     reconcile_task = asyncio.create_task(_periodic_reconcile())
@@ -1194,19 +1189,6 @@ async def run_engine(
         reconcile_task.cancel()
         funding_task.cancel()
         liquidation_task.cancel()
-        try:
-            await tick_pubsub.punsubscribe()
-            await tick_pubsub.aclose()  # type: ignore[no-untyped-call]
-        except Exception:  # noqa: BLE001 - cleanup must never itself crash the loop
-            log.debug("paper_engine.tick_pubsub_cleanup_failed", exc_info=True)
-        try:
-            await control_pubsub.unsubscribe()
-            await control_pubsub.aclose()  # type: ignore[no-untyped-call]
-        except Exception:  # noqa: BLE001 - cleanup must never itself crash the loop
-            log.debug("paper_engine.control_pubsub_cleanup_failed", exc_info=True)
-        # Same reasoning as crypto_ingestor.run_ingestion_loop's identical
-        # finally block: release any pooled connection(s) opened during this
-        # run before control returns to the caller's event loop.
         await redis.connection_pool.disconnect()
 
 

@@ -63,12 +63,27 @@ infrastructure, not just fakes. What shipped:
   it keeps backing off (capped at 30s) and retrying forever. The bar
   aggregator's own tick-path write connection reconnects the same way
   (it used to hold one connection for its whole life, so a Postgres
-  restart broke every write until the process itself restarted).
-  Known limitation, not fixed by any of this: `reconcile()` marks any
-  strategy container exit `CRASHED`, a terminal status the supervisor
-  never auto-relaunches -- a sandbox VM or Docker hiccup after the Mac
-  sleeps (not a Redis/Postgres disconnect, which this fixes) ends the
-  affected run(s), and they have to be restarted manually via the API.
+  restart broke every write until the process itself restarted) --
+  fetched off the event loop, inside `to_thread`, since
+  `ReconnectingConnection.get()` sleeps its backoff synchronously and
+  can still raise; a fetch failure is logged
+  (`bar_aggregator.db_unavailable`) and that one write batch is skipped
+  rather than killing the loop, and a batch is only fetched at all when
+  there is something in it to write (most ticks close nothing).
+  Known limitations, not fixed by any of this:
+  - `reconcile()` marks any strategy container exit `CRASHED`, a
+    terminal status the supervisor never auto-relaunches -- a sandbox
+    VM or Docker hiccup after the Mac sleeps (not a Redis/Postgres
+    disconnect, which this fixes) ends the affected run(s), and they
+    have to be restarted manually via the API.
+  - The live supervisor's own pubsub reconnect (`SyncResilientPubSub`,
+    used for the `closed_bars:*` wake-up) is synchronous and blocks its
+    single-threaded loop for as long as Redis stays down: no delivery
+    timer fires and `stop_run` isn't honoured until Redis is back and
+    the reconnect returns. Since Redis runs locally, a Wi-Fi outage
+    doesn't trigger this -- a Redis/colima restart does, and recovery
+    is still bounded by the same 1s-30s backoff, just not concurrent
+    with anything else the supervisor is doing meanwhile.
 - **A real `select()`-based reply timeout** and a **stale-price guard**
   close off the blocking-`readline()` and no-staleness-check rows of the
   bug table.

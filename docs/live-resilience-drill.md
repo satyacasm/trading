@@ -112,14 +112,19 @@ before and after), and no bar was duplicated or skipped across the
 relaunch. `live_run_cursors` only holds each instrument's *latest*
 delivered `ts`, not a history, so check this instead: note
 `bars_seen` just before the kill, then after the run has caught back up
-compare its growth against the number of 1-minute bars actually in the
-window --
+compare its growth against the *sum, across every instrument the run
+trades*, of the 1-minute bars actually in the window -- `bars_seen`
+increments once per bar delivered, and a run with more than one
+instrument would otherwise undercount against a single-instrument
+query --
 
 ```bash
 psql "$DATABASE_URL" -c \
   "SELECT count(*) FROM bars_intraday
-   WHERE instrument_id = <instrument_id> AND interval_sec = 60
-     AND ts > '<kill_time>'"
+   WHERE interval_sec = 60 AND ts > '<kill_time>'
+     AND instrument_id IN (
+       SELECT DISTINCT instrument_id FROM live_run_cursors
+       WHERE live_run_id = <live_run_id>)"
 ```
 
 should equal the increase in `SELECT bars_seen FROM live_runs WHERE
@@ -146,6 +151,18 @@ restart needed -- `GET /health` should show every component recovering
 back to `true` without any launchd `KeepAlive` relaunch being triggered
 (check `logs/*.log` for `resilient_pubsub.reconnecting` entries instead
 of a fresh process-start banner).
+
+Known limitation: the live supervisor's pubsub reconnect
+(`SyncResilientPubSub`) is synchronous and blocks its single-threaded
+loop for as long as Redis stays down -- `reconcile()`, the delivery
+timer, and honouring `stop` all wait behind it too, not just the
+`closed_bars:*` wake-up. Recovery is still bounded by the same 1s-30s
+backoff (check `logs/live_supervisor.log` for
+`resilient_pubsub.sync_disconnected`/`sync_resubscribe_failed`
+entries), it just isn't concurrent with the loop's other work while it
+runs. Since Redis is local (`trading_redis`, not reached over Wi-Fi), a
+Wi-Fi outage never triggers this -- a Redis container restart (this
+step) or a colima restart does.
 
 ## 8. Clean up
 

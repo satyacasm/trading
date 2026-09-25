@@ -8,7 +8,12 @@ from decimal import Decimal
 
 import httpx
 
-from trading.sources.binance_spot import SpotKline, fetch_spot_klines, parse_spot_klines, spot_symbol
+from trading.sources.binance_spot import (
+    SpotKline,
+    fetch_spot_klines,
+    parse_spot_klines,
+    spot_symbol,
+)
 
 
 def test_spot_symbol_strips_the_dash_and_uppercases():
@@ -57,7 +62,22 @@ def test_zero_trade_minute_parses_with_zero_volume_and_zero_trades():
     must parse, not be skipped, or the backfill's whole point (no
     holes) is lost."""
     raw = json.dumps(
-        [[1758700800000, "63000", "63000", "63000", "63000", "0", 1758700859999, "0", 0, "0", "0", "0"]]
+        [
+            [
+                1758700800000,
+                "63000",
+                "63000",
+                "63000",
+                "63000",
+                "0",
+                1758700859999,
+                "0",
+                0,
+                "0",
+                "0",
+                "0",
+            ]
+        ]
     ).encode()
 
     bars = parse_spot_klines(raw)
@@ -83,40 +103,44 @@ def test_fetch_spot_klines_paginates_and_stops_after_short_page():
             rows = []
             for i in range(1000):
                 open_time = 1758700800000 + (i * 60_000)
-                rows.append([
-                    open_time,
-                    "63000",
-                    "63100",
-                    "62900",
-                    "63050",
-                    "10.5",
-                    open_time + 59999,
-                    "661650",
-                    100,
-                    "5.0",
-                    "315000",
-                    "0",
-                ])
+                rows.append(
+                    [
+                        open_time,
+                        "63000",
+                        "63100",
+                        "62900",
+                        "63050",
+                        "10.5",
+                        open_time + 59999,
+                        "661650",
+                        100,
+                        "5.0",
+                        "315000",
+                        "0",
+                    ]
+                )
             return httpx.Response(200, content=json.dumps(rows).encode())
         elif request_count == 2:
             # Second page: 440 rows (short page, stops pagination)
             rows = []
             for i in range(440):
                 open_time = 1758700800000 + (1000 * 60_000) + (i * 60_000)
-                rows.append([
-                    open_time,
-                    "63000",
-                    "63100",
-                    "62900",
-                    "63050",
-                    "10.5",
-                    open_time + 59999,
-                    "661650",
-                    100,
-                    "5.0",
-                    "315000",
-                    "0",
-                ])
+                rows.append(
+                    [
+                        open_time,
+                        "63000",
+                        "63100",
+                        "62900",
+                        "63050",
+                        "10.5",
+                        open_time + 59999,
+                        "661650",
+                        100,
+                        "5.0",
+                        "315000",
+                        "0",
+                    ]
+                )
             return httpx.Response(200, content=json.dumps(rows).encode())
         else:
             raise AssertionError(f"Unexpected request #{request_count}")
@@ -138,7 +162,6 @@ def test_fetch_spot_klines_paginates_and_stops_after_short_page():
 
     # Second request's startTime = first page's last open time + 60_000
     assert request_count == 2
-    first_request = captured_requests[0]
     second_request = captured_requests[1]
     first_last_open_time = 1758700800000 + (999 * 60_000)
     expected_second_start = first_last_open_time + 60_000

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.satyam.trading.paper_alerts</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__UV__</string>
+    <string>run</string>
+    <string>python</string>
+    <string>-m</string>
+    <string>trading.paper.alerts</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__REPO__/logs/paper_alerts.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO__/logs/paper_alerts.log</string>
+</dict>
+</plist>

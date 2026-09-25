@@ -2,6 +2,7 @@ services:
   timescaledb:
     image: timescale/timescaledb-ha:pg17
     container_name: trading_tsdb
+    restart: unless-stopped
     environment:
       POSTGRES_USER: trading
       POSTGRES_PASSWORD: trading_local
@@ -16,6 +17,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: trading_redis
+    restart: unless-stopped
     ports: ["6379:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]

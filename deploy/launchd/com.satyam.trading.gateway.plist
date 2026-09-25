@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The market-data/paper-trading gateway (FastAPI, served by uvicorn).
+  KeepAlive+RunAtLoad: if it exits for any reason, including a crash,
+  launchd starts it again. ThrottleInterval stops a crash-loop from
+  spinning the CPU. Installed by deploy/install-live-stack.sh, which
+  substitutes __REPO__ and __UV__.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.satyam.trading.gateway</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__UV__</string>
+    <string>run</string>
+    <string>uvicorn</string>
+    <string>trading.streaming.gateway:app</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8000</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__REPO__/logs/gateway.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO__/logs/gateway.log</string>
+</dict>
+</plist>

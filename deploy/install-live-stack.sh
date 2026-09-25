@@ -10,6 +10,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCHD_SRC="$REPO/deploy/launchd"
 LAUNCHD_DST="$HOME/Library/LaunchAgents"
 UV_PATH="$(command -v uv || true)"
+NPM_PATH="$(command -v npm || true)"
 
 # shellcheck source=deploy/resolve_launchd_path.sh
 source "$REPO/deploy/resolve_launchd_path.sh"
@@ -24,6 +25,7 @@ LABELS=(
   com.satyam.trading.live_supervisor
   com.satyam.trading.perp_ingestor
   com.satyam.trading.mcp
+  com.satyam.trading.web
 )
 
 # `launchctl bootout` returns before the job is actually gone, and
@@ -47,10 +49,14 @@ case "$cmd" in
       echo "uv not found on PATH -- install it first (https://docs.astral.sh/uv/)" >&2
       exit 1
     fi
+    if [ -z "$NPM_PATH" ]; then
+      echo "npm not found on PATH -- install Node.js first (the web app needs it)" >&2
+      exit 1
+    fi
     LAUNCHD_PATH="$(resolve_launchd_path)" || exit 1
     mkdir -p "$LAUNCHD_DST" "$REPO/logs"
     for label in "${LABELS[@]}"; do
-      sed -e "s|__REPO__|$REPO|g" -e "s|__UV__|$UV_PATH|g" -e "s|__PATH__|$LAUNCHD_PATH|g" \
+      sed -e "s|__REPO__|$REPO|g" -e "s|__UV__|$UV_PATH|g" -e "s|__NPM__|$NPM_PATH|g" -e "s|__PATH__|$LAUNCHD_PATH|g" \
         "$LAUNCHD_SRC/$label.plist" > "$LAUNCHD_DST/$label.plist"
       launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
       wait_until_unloaded "$label"

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The trading web app (Next.js production build on port 3010), started by
+  deploy/start-web.sh; it talks to the gateway on 127.0.0.1:8010.
+  KeepAlive+RunAtLoad: if it exits for any reason, including a crash,
+  launchd starts it again. ThrottleInterval stops a crash-loop from
+  spinning the CPU. Installed by deploy/install-live-stack.sh, which
+  substitutes __REPO__, __NPM__, and __PATH__.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.satyam.trading.web</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO__/deploy/start-web.sh</string>
+    <string>__NPM__</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__REPO__/logs/web.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO__/logs/web.log</string>
+</dict>
+</plist>

@@ -95,7 +95,8 @@ infrastructure, not just fakes. What shipped:
 - **Deployment**: launchd agents for the whole live stack plus a Docker
   restart policy, in `deploy/` (`install-live-stack.sh`,
   `start-colima.sh`, `provision-sandbox-vm.sh`, and the plists), including
-  the trading MCP server on `127.0.0.1:8931/mcp` (the port Claude Code's
+  the web app on `127.0.0.1:3010` (production build, rebuilt on every
+  start by `deploy/start-web.sh`) and the trading MCP server on `127.0.0.1:8931/mcp` (the port Claude Code's
   `trading` server entry points at; the MCP plan's 8081 is stale). Every
   plist carries a PATH (installed from the operator's own PATH at
   install time) -- launchd's own default PATH is just

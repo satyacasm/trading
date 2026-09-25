@@ -25,6 +25,7 @@ _SERVICE_NAMES = (
     "live_supervisor",
     "perp_ingestor",
     "mcp",
+    "web",
 )
 
 _ALL_LAUNCHD_NAMES = _SERVICE_NAMES + ("colima",)
@@ -134,6 +135,7 @@ def test_docker_compose_restarts_timescaledb_and_redis_but_not_redis_test() -> N
         "deploy/start-colima.sh",
         "deploy/provision-sandbox-vm.sh",
         "deploy/install-live-stack.sh",
+        "deploy/start-web.sh",
     ],
 )
 def test_shell_scripts_are_syntactically_valid(script: str) -> None:
@@ -150,3 +152,22 @@ def test_install_waits_for_bootout_before_bootstrapping() -> None:
     text = (REPO_ROOT / "deploy" / "install-live-stack.sh").read_text()
     install = text[text.index("  install)") : text.index("  uninstall)")]
     assert install.index("wait_until_unloaded") < install.index("launchctl bootstrap")
+
+
+def test_web_runs_the_start_script_with_the_installed_npm() -> None:
+    """The web app runs a production build (next build, then next start on
+    3010); npm's absolute path is filled in at install time like uv's."""
+    args = _plist("web")["ProgramArguments"]
+    assert args == ["/bin/bash", "__REPO__/deploy/start-web.sh", "__NPM__"]
+
+
+def test_start_web_builds_then_starts_and_puts_npm_on_path() -> None:
+    text = (REPO_ROOT / "deploy" / "start-web.sh").read_text()
+    assert 'export PATH="$(dirname "$NPM"):$PATH"' in text  # npm's shebang needs node
+    assert text.index('"$NPM" run build') < text.index('exec "$NPM" run start')
+
+
+def test_install_substitutes_npm_and_requires_it() -> None:
+    text = (REPO_ROOT / "deploy" / "install-live-stack.sh").read_text()
+    assert "s|__NPM__|$NPM_PATH|g" in text
+    assert "npm not found on PATH" in text

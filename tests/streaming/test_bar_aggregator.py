@@ -1265,19 +1265,93 @@ def test_main_turns_backfill_on_with_the_configured_thresholds(monkeypatch) -> N
     async def fake_loop(redis, conn, **kwargs):  # noqa: ANN001, ANN003, ANN202
         captured.update(kwargs)
 
+    class _FakeReconnectingConnection:
+        """I5: main() now opens the tick-path write connection via
+        ReconnectingConnection too, not a bare psycopg.connect -- fake the
+        class itself rather than psycopg.connect, since
+        ReconnectingConnection.__init__'s own `connect` default argument
+        was already bound to the real psycopg.connect at import time and
+        wouldn't see a psycopg.connect patch applied here, after that."""
+
+        def __init__(self, *a, **k):  # noqa: ANN002, ANN003
+            pass
+
+        def get(self):  # noqa: ANN201
+            return MagicMock()
+
     monkeypatch.setattr(bar_aggregator, "run_aggregation_loop", fake_loop)
-    monkeypatch.setattr(bar_aggregator.psycopg, "connect", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(bar_aggregator, "ReconnectingConnection", _FakeReconnectingConnection)
     monkeypatch.setattr(bar_aggregator.Redis, "from_url", lambda *a, **k: MagicMock())
 
     bar_aggregator.main()
 
     settings = bar_aggregator.get_settings()
     assert callable(captured["backfill_conn_factory"])
+    assert callable(captured["write_conn_factory"])
     assert captured["backfill_silence_seconds"] == settings.backfill_silence_seconds
     assert captured["backfill_sweep_seconds"] == settings.backfill_sweep_seconds
     assert (
         captured["backfill_sweep_window_minutes"] == settings.backfill_sweep_window_minutes
     )
+
+
+def test_write_conn_factory_is_fetched_fresh_per_write_batch(
+    db_conn, redis_client: redis.Redis
+) -> None:
+    """I5: the tick path used to hold one plain psycopg connection for
+    the whole process's life -- a Postgres/colima restart broke every
+    write until the process itself restarted. run_aggregation_loop must
+    call write_conn_factory() per write batch, not once at startup --
+    proven here by a counting fake factory, with both bars still landing
+    correctly. ReconnectingConnection's own "a closed connection is
+    replaced" behaviour is already proven in isolation by
+    tests/test_db.py; this is the integration point that regressed."""
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    base = datetime.now(UTC) + timedelta(minutes=3)
+
+    calls: list[int] = []
+
+    def _write_conn_factory():
+        calls.append(1)
+        return db_conn
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(
+            async_redis,
+            db_conn,
+            sleep=_no_sleep,
+            max_bars_written=2,
+            pattern=pattern,
+            write_conn_factory=_write_conn_factory,
+        )
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)
+            redis_client.publish(channel, _tick_json(iid, base.isoformat(), "1.00"))
+            redis_client.publish(
+                channel,
+                _tick_json(iid, (base + timedelta(minutes=1, seconds=5)).isoformat(), "2.00"),
+            )
+            redis_client.publish(
+                channel,
+                _tick_json(iid, (base + timedelta(minutes=2, seconds=5)).isoformat(), "3.00"),
+            )
+
+        asyncio.run(_run_both(loop_task, _publish_after_subscribed()))
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    # 1 at startup (the excluded-instrument-ids query) + 1 per write batch
+    # (2 closed bars here, each its own batch) -- never cached statically.
+    assert len(calls) >= 3
+    rows = db_conn.execute(
+        "SELECT close FROM bars_intraday WHERE instrument_id = %s ORDER BY ts", (iid,)
+    ).fetchall()
+    assert rows == [(Decimal("1.0000"),), (Decimal("2.0000"),)]
 
 
 def test_silence_backfill_survives_a_conn_factory_failure(db_conn) -> None:

@@ -16,7 +16,6 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-import psycopg
 import redis as _sync_redis
 import structlog
 from psycopg import Connection
@@ -641,6 +640,7 @@ async def run_aggregation_loop(
     backfill_sweep_seconds: float = 300.0,
     backfill_sweep_window_minutes: int = 30,
     backfill_wait_timeout_seconds: float = 30.0,
+    write_conn_factory: Callable[[], Connection] | None = None,
 ) -> None:
     """Subscribe to `pattern` (`ticks:*` by default) and `bars_pattern`
     (`bars:*` by default), writing each resulting bar to `bars_intraday`.
@@ -702,7 +702,14 @@ async def run_aggregation_loop(
     first_complete_bucket = bucket_start(datetime.now(UTC), interval_seconds) + timedelta(
         seconds=interval_seconds
     )
-    excluded_instrument_ids = _query_upstox_bound_instrument_ids(conn)
+    # I5: main() passes a ReconnectingConnection.get here so a Postgres
+    # restart doesn't wedge every tick-path write for the rest of this
+    # process's life -- fetched fresh per write batch (never held), same
+    # discipline backfill_conn_factory already uses. Tests that pass a
+    # plain `conn` and no factory get the exact old behaviour: the same
+    # static connection every time.
+    get_write_conn: Callable[[], Connection] = write_conn_factory or (lambda: conn)
+    excluded_instrument_ids = _query_upstox_bound_instrument_ids(get_write_conn())
     log.info(
         "bar_aggregator.excluding_tick_aggregation",
         count=len(excluded_instrument_ids),
@@ -759,6 +766,10 @@ async def run_aggregation_loop(
 
     async def _write_all(closed_bars: list[ClosedBar]) -> None:
         nonlocal written
+        # Fetched once per batch (I5), not held for the process's life --
+        # a ReconnectingConnection.get() here repairs a dead connection
+        # (e.g. a Postgres restart) before the next batch's writes.
+        write_conn = get_write_conn()
         for closed in closed_bars:
             backfill_task = in_flight_backfills.get(closed.instrument_id)
             if backfill_task is not None:
@@ -785,7 +796,9 @@ async def run_aggregation_loop(
                 )
                 continue
             try:
-                write_closed_bar(conn, closed, interval_seconds=interval_seconds, source=source)
+                write_closed_bar(
+                    write_conn, closed, interval_seconds=interval_seconds, source=source
+                )
             except Exception as exc:  # noqa: BLE001 - a single unwritable bar (e.g.
                 # a ForeignKeyViolation for an instrument_id absent from
                 # `instruments`, the same real production crash
@@ -812,8 +825,9 @@ async def run_aggregation_loop(
 
     async def _write_upstox_bar(bar: Bar) -> None:
         nonlocal written
+        write_conn = get_write_conn()  # fetched per batch (I5), same as _write_all
         try:
-            write_upstox_bar(conn, bar, interval_seconds=interval_seconds)
+            write_upstox_bar(write_conn, bar, interval_seconds=interval_seconds)
         except Exception as exc:  # noqa: BLE001 - a single unwritable bar (e.g.
             # a ForeignKeyViolation for an instrument_id absent from
             # `instruments`, the real production crash this guards against)
@@ -983,13 +997,17 @@ def main() -> None:
     )
 
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
-    # autocommit=True: each closed bar is its own independent unit of work
-    # over a long-running connection -- unlike seed_instruments.py's
-    # one-shot atomic batch, there is no reason one bar's write should roll
-    # back because a later bar's write fails. This is also what keeps
-    # write_closed_bar() safe to call against `db_conn` in tests without any
-    # special-casing: it never commits itself either way.
-    conn = psycopg.connect(settings.database_url, autocommit=True)
+    # I5: a ReconnectingConnection, not a plain psycopg.connect -- the
+    # tick path used to hold one connection for the process's whole life,
+    # so a Postgres/colima restart broke every write until the process
+    # itself restarted. autocommit=True (ReconnectingConnection's
+    # default): each closed bar is its own independent unit of work over
+    # a long-running connection -- unlike seed_instruments.py's one-shot
+    # atomic batch, there is no reason one bar's write should roll back
+    # because a later bar's write fails. This is also what keeps
+    # write_closed_bar() safe to call against `db_conn` in tests without
+    # any special-casing: it never commits itself either way.
+    write_conn = ReconnectingConnection(settings.database_url)
     log.info("bar_aggregator.starting", interval_seconds=INTERVAL_SECONDS)
     try:
         # One long-lived connection for every backfill thread, reconnecting
@@ -999,7 +1017,8 @@ def main() -> None:
         asyncio.run(
             run_aggregation_loop(
                 redis,
-                conn,
+                write_conn.get(),
+                write_conn_factory=write_conn.get,
                 backfill_conn_factory=backfill_conn.get,
                 backfill_silence_seconds=settings.backfill_silence_seconds,
                 backfill_sweep_seconds=settings.backfill_sweep_seconds,
@@ -1008,8 +1027,6 @@ def main() -> None:
         )
     except KeyboardInterrupt:
         log.info("bar_aggregator.interrupted")
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":

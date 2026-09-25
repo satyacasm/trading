@@ -300,6 +300,21 @@ def main() -> int:
     return 0
 
 
+def _encode_state(state: dict[str, Any], max_bytes: int) -> tuple[str | None, str | None]:
+    """`ctx.state`, serialised and size-checked (design §5.2). Returns
+    `(json_text, None)` on success, or `(None, message)` naming which
+    limit was broken -- not-JSON-serialisable and too-large are
+    distinguished, since the fix for each is different."""
+    try:
+        text = json.dumps(state)
+    except (TypeError, ValueError) as exc:
+        return None, f"ctx.state is not JSON-serialisable: {exc}"
+    size = len(text.encode("utf-8"))
+    if size > max_bytes:
+        return None, f"ctx.state is {size} bytes; the limit is {max_bytes}"
+    return text, None
+
+
 def _run_live(payload, instance, manifest, strategy_cls):  # noqa: ANN001, ANN202
     """Drive the strategy a bar at a time, from frames on stdin.
 

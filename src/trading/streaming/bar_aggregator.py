@@ -432,6 +432,7 @@ async def _startup_spot_backfill(
                     reason=str(exc),
                 )
                 continue
+            _log_late_fill(instrument_id, latest, inserted)
             for kline in inserted:
                 seeded[instrument_id] = max(seeded[instrument_id], kline.ts)
                 announced.append((instrument_id, kline))
@@ -451,6 +452,45 @@ async def _startup_spot_backfill(
             volume=kline.volume,
             interval_seconds=INTERVAL_SECONDS,
             source=DataSource.BINANCE_SPOT_KLINE,
+        )
+
+
+async def _run_tracked_backfill(
+    in_flight: dict[int, asyncio.Task[None]], instrument_id: int, coro: Any
+) -> None:
+    """Run a backfill coroutine as a Task registered in `in_flight` for
+    the duration of the call (I1a). `_write_all` checks this dict before
+    writing a newer tick-aggregated bar for the same instrument, so a
+    slow backfill (silence trigger or sweep) can't land behind a tick bar
+    that raced ahead of it in Postgres. Removes its own entry when done,
+    whether it succeeds or raises (backfill helpers already swallow their
+    own exceptions, but this must never leave a stale entry behind on the
+    off chance one doesn't)."""
+    task = asyncio.ensure_future(coro)
+    in_flight[instrument_id] = task
+    try:
+        await task
+    finally:
+        if in_flight.get(instrument_id) is task:
+            del in_flight[instrument_id]
+
+
+def _log_late_fill(instrument_id: int, before: datetime | None, inserted: list[Any]) -> None:
+    """I1(b): if a backfill just inserted bars older than the newest bar
+    already in `bars_intraday` for this instrument (captured in `before`
+    right before the backfill ran), a live run's cursor (`ts > last_ts`)
+    has already advanced past them and will never receive them. Nothing
+    at this layer can fix that -- it can only be made visible."""
+    if before is None or not inserted:
+        return
+    late = [k for k in inserted if k.ts < before]
+    if late:
+        log.warning(
+            "bar_aggregator.late_fill",
+            instrument_id=instrument_id,
+            count=len(late),
+            min_ts=min(k.ts for k in late).isoformat(),
+            max_ts=max(k.ts for k in late).isoformat(),
         )
 
 
@@ -481,16 +521,19 @@ async def _silence_backfill(
     # Imported here, not at module level -- same reasoning as
     # _startup_spot_backfill's identical import (avoids a circular import
     # with spot_backfill, which imports bucket_start from this module).
-    from trading.streaming.spot_backfill import backfill_window
+    from trading.streaming.spot_backfill import backfill_window, last_bar_ts
 
     fetch = fetch or fetch_spot_klines
 
     def _do() -> list[Any]:
         try:
             conn = conn_factory()
-            return backfill_window(
+            before = last_bar_ts(conn, instrument_id)
+            inserted = backfill_window(
                 conn, instrument_id, spot_symbol(symbol), since=since, until=until, fetch=fetch
             )
+            _log_late_fill(instrument_id, before, inserted)
+            return inserted
         except Exception as exc:  # noqa: BLE001 - a REST failure, or
             # backfill_conn_factory() itself raising while Postgres is
             # still down, must never kill tick consumption or the sweep
@@ -528,6 +571,7 @@ async def _sweep_backfill(
     window_minutes: int,
     to_thread: Callable[..., Any],
     fetch: Any = None,
+    in_flight: dict[int, asyncio.Task[None]] | None = None,
 ) -> None:
     """Safety net: re-check the last `window_minutes` for every crypto
     spot instrument, whether or not a silence was ever detected for it.
@@ -537,10 +581,19 @@ async def _sweep_backfill(
     `_periodic_sweep_backfill` awaits this with no guard of its own, so
     `conn_factory()` raising here (Postgres still down) must be caught
     inside this function -- otherwise it would kill the sweep task and,
-    in production, the whole aggregation loop's `asyncio.gather`."""
+    in production, the whole aggregation loop's `asyncio.gather`.
+
+    `until` stops one full bucket short of `now` (M1): the tick path may
+    still be flushing the just-closed minute (via `_periodic_flush` or an
+    `ingest()` rollover) when the sweep runs, and racing it for the same
+    row is pointless -- that minute is the tick path's job, not the
+    sweep's. `in_flight`, when given, registers each per-instrument call
+    the same way `_consume_ticks`'s silence trigger does (I1a), so a
+    concurrent tick-bar write for the same instrument waits for it."""
     fetch = fetch or fetch_spot_klines
     now = datetime.now(UTC)
     since = now - timedelta(minutes=window_minutes)
+    until = bucket_start(now, INTERVAL_SECONDS) - timedelta(seconds=INTERVAL_SECONDS)
 
     def _instruments() -> dict[int, str]:
         try:
@@ -553,17 +606,21 @@ async def _sweep_backfill(
 
     instruments = await to_thread(_instruments)
     for instrument_id, symbol in instruments.items():
-        await _silence_backfill(
+        coro = _silence_backfill(
             conn_factory,
             aggregator,
             redis,
             instrument_id=instrument_id,
             symbol=symbol,
             since=since,
-            until=now,
+            until=until,
             to_thread=to_thread,
             fetch=fetch,
         )
+        if in_flight is None:
+            await coro
+        else:
+            await _run_tracked_backfill(in_flight, instrument_id, coro)
 
 
 async def run_aggregation_loop(
@@ -583,6 +640,7 @@ async def run_aggregation_loop(
     backfill_silence_seconds: float = 90.0,
     backfill_sweep_seconds: float = 300.0,
     backfill_sweep_window_minutes: int = 30,
+    backfill_wait_timeout_seconds: float = 30.0,
 ) -> None:
     """Subscribe to `pattern` (`ticks:*` by default) and `bars_pattern`
     (`bars:*` by default), writing each resulting bar to `bars_intraday`.
@@ -652,15 +710,78 @@ async def run_aggregation_loop(
     )
     written = 0
     done = asyncio.Event()
+    # Per-instrument in-flight backfill tasks (silence trigger, sweep, and
+    # the targeted startup-gap backfill below) -- I1a: a tick bar write
+    # for an instrument with a backfill still running waits for it first,
+    # so Postgres keeps receiving ts in order for that instrument instead
+    # of a slow backfill landing behind a tick bar that raced ahead of it.
+    in_flight_backfills: dict[int, asyncio.Task[None]] = {}
+
+    async def _backfill_discarded_startup_bucket(instrument_id: int, bucket: datetime) -> None:
+        """I2: the bucket already running at startup is discarded above
+        as not honestly complete -- but by the time it closes, Binance's
+        kline for that exact minute has too. A targeted backfill for
+        `[bucket, bucket + interval_seconds)`, registered in
+        `in_flight_backfills` like any other backfill, fills it in before
+        the next tick bar for this instrument is written."""
+        if backfill_conn_factory is None:
+            return
+        try:
+            symbol = (
+                await to_thread(lambda: _query_crypto_spot_instruments(backfill_conn_factory()))
+            ).get(instrument_id)
+        except Exception as exc:  # noqa: BLE001 - backfill_conn_factory() raising
+            # (Postgres still down) must never block tick consumption --
+            # the sweep repairs the gap later.
+            log.warning(
+                "bar_aggregator.startup_gap_backfill_failed",
+                instrument_id=instrument_id,
+                reason=str(exc),
+            )
+            return
+        if symbol is None:
+            return
+        await _run_tracked_backfill(
+            in_flight_backfills,
+            instrument_id,
+            _silence_backfill(
+                backfill_conn_factory,
+                aggregator,
+                redis,
+                instrument_id=instrument_id,
+                symbol=symbol,
+                since=bucket,
+                until=bucket + timedelta(seconds=interval_seconds),
+                to_thread=to_thread,
+                fetch=spot_fetch,
+            ),
+        )
 
     async def _write_all(closed_bars: list[ClosedBar]) -> None:
         nonlocal written
         for closed in closed_bars:
+            backfill_task = in_flight_backfills.get(closed.instrument_id)
+            if backfill_task is not None:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(backfill_task), timeout=backfill_wait_timeout_seconds
+                    )
+                except Exception as exc:  # noqa: BLE001 - a timeout (the common case)
+                    # or any other failure waiting on the backfill must never
+                    # block writing the newer tick bar -- log and proceed.
+                    log.warning(
+                        "bar_aggregator.backfill_wait_failed",
+                        instrument_id=closed.instrument_id,
+                        reason=str(exc),
+                    )
             if closed.bucket < first_complete_bucket:
                 log.info(
                     "bar_aggregator.discarding_partial_startup_bar",
                     instrument_id=closed.instrument_id,
                     bucket=closed.bucket.isoformat(),
+                )
+                asyncio.create_task(
+                    _backfill_discarded_startup_bucket(closed.instrument_id, closed.bucket)
                 )
                 continue
             try:
@@ -766,16 +887,20 @@ async def run_aggregation_loop(
                     symbol = None
                 if symbol is not None:
                     asyncio.create_task(
-                        _silence_backfill(
-                            backfill_conn_factory,
-                            aggregator,
-                            redis,
-                            instrument_id=tick.instrument_id,
-                            symbol=symbol,
-                            since=previous,
-                            until=now,
-                            to_thread=to_thread,
-                            fetch=spot_fetch,
+                        _run_tracked_backfill(
+                            in_flight_backfills,
+                            tick.instrument_id,
+                            _silence_backfill(
+                                backfill_conn_factory,
+                                aggregator,
+                                redis,
+                                instrument_id=tick.instrument_id,
+                                symbol=symbol,
+                                since=previous,
+                                until=now,
+                                to_thread=to_thread,
+                                fetch=spot_fetch,
+                            ),
                         )
                     )
             await _write_all(aggregator.ingest(tick))
@@ -821,6 +946,7 @@ async def run_aggregation_loop(
                 window_minutes=backfill_sweep_window_minutes,
                 to_thread=to_thread,
                 fetch=spot_fetch,
+                in_flight=in_flight_backfills,
             )
 
     consumer = asyncio.create_task(_consume_ticks())

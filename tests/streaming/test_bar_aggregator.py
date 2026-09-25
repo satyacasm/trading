@@ -1414,3 +1414,403 @@ def test_a_silence_trigger_survives_a_conn_factory_failure_and_keeps_ingesting_t
         "a silence-trigger conn_factory failure must not stop the loop from "
         "processing the next tick into a closed bar"
     )
+
+
+def test_a_tick_bar_write_waits_for_an_in_flight_backfill_of_the_same_instrument(
+    db_conn, redis_client: redis.Redis, monkeypatch
+) -> None:
+    """I1(a): the silence backfill is fired via asyncio.create_task and
+    never awaited by its caller, while _write_all keeps writing newer
+    tick-aggregated bars concurrently. A slow backfill could otherwise
+    land in Postgres AFTER a newer tick bar for the same instrument,
+    breaking the "cursors see ts in non-decreasing order" assumption
+    (I1). _write_all must wait for an in-flight backfill of the same
+    instrument before writing a newer tick bar -- proven here by
+    recording write order: the (slow) backfill's row must be written
+    before the tick's."""
+    import time as time_module
+
+    from trading.sources.binance_spot import SpotKline
+    from trading.streaming import bar_aggregator as bar_aggregator_module
+    from trading.streaming import spot_backfill as spot_backfill_module
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    base = datetime.now(UTC) + timedelta(minutes=3)
+
+    write_order: list[str] = []
+    real_backfill_window = spot_backfill_module.backfill_window
+    real_write_closed_bar = bar_aggregator_module.write_closed_bar
+
+    def _slow_backfill_window(conn, instrument_id, symbol, since, until, *, fetch, **kwargs):
+        time_module.sleep(0.3)  # a slow REST call, off the event loop via to_thread
+        result = real_backfill_window(
+            conn, instrument_id, symbol, since=since, until=until, fetch=fetch
+        )
+        write_order.append("backfill")
+        return result
+
+    def _tracking_write_closed_bar(conn, closed, **kwargs):
+        real_write_closed_bar(conn, closed, **kwargs)
+        write_order.append("tick")
+
+    monkeypatch.setattr(spot_backfill_module, "backfill_window", _slow_backfill_window)
+    monkeypatch.setattr(bar_aggregator_module, "write_closed_bar", _tracking_write_closed_bar)
+
+    def _fake_fetch(symbol, *, start_ms, end_ms, client=None):
+        return [
+            SpotKline(
+                ts=base - timedelta(minutes=2),
+                open=Decimal("1"),
+                high=Decimal("1"),
+                low=Decimal("1"),
+                close=Decimal("1"),
+                volume=Decimal("0"),
+                trades=0,
+            )
+        ]
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(
+            async_redis,
+            db_conn,
+            # real sleep -- keeps the sweep from spinning (backfill_sweep_seconds=300)
+            sleep=asyncio.sleep,
+            max_bars_written=1,
+            pattern=pattern,
+            backfill_conn_factory=lambda: db_conn,
+            backfill_silence_seconds=0.07,
+            spot_fetch=_fake_fetch,
+        )
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)  # give psubscribe time to land
+            # Opens a bucket -- establishes last_tick_at for this instrument.
+            redis_client.publish(channel, _tick_json(iid, base.isoformat(), "1.00"))
+            await asyncio.sleep(0.1)  # exceed backfill_silence_seconds=0.07
+            # A real wall-clock gap past the threshold -- fires the (slow)
+            # silence backfill for this instrument, same bucket as above so
+            # this tick itself doesn't close anything yet.
+            redis_client.publish(channel, _tick_json(iid, base.isoformat(), "2.00"))
+            await asyncio.sleep(0.05)  # let the backfill task register itself
+            # Closes the bucket opened above via rollover -- must wait for
+            # the still-running backfill before writing.
+            redis_client.publish(
+                channel,
+                _tick_json(iid, (base + timedelta(minutes=1, seconds=5)).isoformat(), "3.00"),
+            )
+
+        asyncio.run(
+            asyncio.wait_for(_run_both(loop_task, _publish_after_subscribed()), timeout=10)
+        )
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    assert write_order == ["backfill", "tick"]
+
+
+def test_a_tick_bar_write_proceeds_after_a_backfill_wait_times_out(
+    db_conn, redis_client: redis.Redis, monkeypatch
+) -> None:
+    """I1(a): the wait for an in-flight backfill is bounded
+    (backfill_wait_timeout_seconds). A backfill still running past that
+    timeout must not block the newer tick bar forever -- the timeout is
+    logged and the write proceeds anyway."""
+    import time as time_module
+
+    import structlog.testing
+
+    from trading.sources.binance_spot import SpotKline
+    from trading.streaming import bar_aggregator as bar_aggregator_module
+    from trading.streaming import spot_backfill as spot_backfill_module
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    base = datetime.now(UTC) + timedelta(minutes=3)
+
+    write_order: list[str] = []
+    real_backfill_window = spot_backfill_module.backfill_window
+    real_write_closed_bar = bar_aggregator_module.write_closed_bar
+
+    def _slow_backfill_window(conn, instrument_id, symbol, since, until, *, fetch, **kwargs):
+        time_module.sleep(0.3)  # far longer than this test's 0.05s wait timeout
+        result = real_backfill_window(
+            conn, instrument_id, symbol, since=since, until=until, fetch=fetch
+        )
+        write_order.append("backfill")
+        return result
+
+    def _tracking_write_closed_bar(conn, closed, **kwargs):
+        real_write_closed_bar(conn, closed, **kwargs)
+        write_order.append("tick")
+
+    monkeypatch.setattr(spot_backfill_module, "backfill_window", _slow_backfill_window)
+    monkeypatch.setattr(bar_aggregator_module, "write_closed_bar", _tracking_write_closed_bar)
+
+    def _fake_fetch(symbol, *, start_ms, end_ms, client=None):
+        return [
+            SpotKline(
+                ts=base - timedelta(minutes=2),
+                open=Decimal("1"),
+                high=Decimal("1"),
+                low=Decimal("1"),
+                close=Decimal("1"),
+                volume=Decimal("0"),
+                trades=0,
+            )
+        ]
+
+    with structlog.testing.capture_logs() as cap:
+        async_redis: AsyncRedis = AsyncRedis.from_url(
+            get_settings().redis_url, decode_responses=True
+        )
+        try:
+            loop_task = run_aggregation_loop(
+                async_redis,
+                db_conn,
+                # real sleep -- keeps the sweep from spinning (backfill_sweep_seconds=300)
+            sleep=asyncio.sleep,
+                max_bars_written=1,
+                pattern=pattern,
+                backfill_conn_factory=lambda: db_conn,
+                backfill_silence_seconds=0.07,
+                backfill_wait_timeout_seconds=0.05,
+                spot_fetch=_fake_fetch,
+            )
+
+            async def _publish_after_subscribed() -> None:
+                await asyncio.sleep(0.2)
+                redis_client.publish(channel, _tick_json(iid, base.isoformat(), "1.00"))
+                await asyncio.sleep(0.1)
+                redis_client.publish(channel, _tick_json(iid, base.isoformat(), "2.00"))
+                await asyncio.sleep(0.05)
+                redis_client.publish(
+                    channel,
+                    _tick_json(
+                        iid, (base + timedelta(minutes=1, seconds=5)).isoformat(), "3.00"
+                    ),
+                )
+                # Let the slow backfill finish in its own thread before the
+                # loop shuts down -- avoids a "Task was destroyed but it is
+                # pending" warning for the still-running orphaned backfill.
+                await asyncio.sleep(0.4)
+
+            asyncio.run(
+                asyncio.wait_for(_run_both(loop_task, _publish_after_subscribed()), timeout=10)
+            )
+        finally:
+            asyncio.run(async_redis.aclose())
+
+    assert write_order == ["tick", "backfill"], (
+        "the tick write must proceed once the wait times out, not block for the full backfill"
+    )
+    timeout_logs = [e for e in cap if e.get("event") == "bar_aggregator.backfill_wait_failed"]
+    assert len(timeout_logs) == 1
+    assert timeout_logs[0]["instrument_id"] == iid
+
+
+def test_silence_backfill_logs_late_fill_when_it_lands_behind_a_newer_bar(db_conn) -> None:
+    """I1(b): the silence backfill is fire-and-forget while the tick path
+    keeps writing newer bars concurrently -- if it inserts something
+    OLDER than a bar already present in bars_intraday for that
+    instrument, a live run's cursor (`ts > last_ts`) has already advanced
+    past it and will never receive it. Nothing at this layer can prevent
+    that race, only make it visible."""
+    import structlog.testing
+
+    from trading.sources.binance_spot import SpotKline
+    from trading.streaming.bar_aggregator import _silence_backfill
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    # A bar already newer than what the backfill is about to insert --
+    # simulating the live tick path having raced ahead while the
+    # backfill's REST call was in flight.
+    db_conn.execute(
+        "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+        "close, volume, trades, source) VALUES (%s, %s, 60, 1, 1, 1, 1, 1, 1, 6)",
+        (iid, datetime(2026, 9, 25, 10, 5, tzinfo=UTC)),
+    )
+
+    def _fake_fetch(symbol, *, start_ms, end_ms, client=None):
+        return [
+            SpotKline(
+                ts=datetime(2026, 9, 25, 10, 0, tzinfo=UTC),  # older than the 10:05 bar above
+                open=Decimal("1"),
+                high=Decimal("1"),
+                low=Decimal("1"),
+                close=Decimal("1"),
+                volume=Decimal("0"),
+                trades=0,
+            )
+        ]
+
+    async def _inline_to_thread(fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    class _NullRedis:
+        async def publish(self, *a, **k):
+            return None
+
+    aggregator = BarAggregator()
+    with structlog.testing.capture_logs() as cap:
+        asyncio.run(
+            _silence_backfill(
+                lambda: db_conn,
+                aggregator,
+                _NullRedis(),
+                instrument_id=iid,
+                symbol="BTC-USDT",
+                since=datetime(2026, 9, 25, 10, 0, tzinfo=UTC),
+                until=datetime(2026, 9, 25, 10, 1, tzinfo=UTC),
+                to_thread=_inline_to_thread,
+                fetch=_fake_fetch,
+            )
+        )
+
+    late_fill_logs = [e for e in cap if e.get("event") == "bar_aggregator.late_fill"]
+    assert len(late_fill_logs) == 1
+    assert late_fill_logs[0]["instrument_id"] == iid
+    assert late_fill_logs[0]["count"] == 1
+
+
+def test_a_discarded_startup_bucket_schedules_a_targeted_backfill_the_next_tick_bar_waits_for(
+    db_conn, redis_client: redis.Redis, monkeypatch
+) -> None:
+    """I2: every aggregator restart used to drop the startup minute from
+    every live run -- the partial bucket open at startup is discarded
+    (never honestly complete). A targeted backfill for exactly
+    `[bucket, bucket+interval_seconds)` must be scheduled for it, in the
+    same in-flight dict I1(a) uses, so the next tick bar's write waits
+    for it. `_silence_backfill` itself is mocked (a slow fake, proven by
+    write order, same technique as I1(a)'s tests) rather than exercised
+    for real through `backfill_window`'s own wall-clock clamp -- that
+    clamp only lets a window through once real time has crossed a real
+    minute boundary past it, which `_silence_backfill`'s own tests
+    already cover and which this test would otherwise have to wait out
+    for real."""
+    from trading.streaming import bar_aggregator as bar_aggregator_module
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    now = datetime.now(UTC)
+    startup_bucket = bucket_start(now, 60)
+    partial_tick_ts = now  # the bucket already running when the loop starts
+    later_tick_ts = now + timedelta(minutes=2)  # forces the partial bucket closed (discarded)
+    even_later_tick_ts = now + timedelta(minutes=3)  # forces the later bucket closed too
+
+    write_order: list[str] = []
+    captured_windows: list[tuple[int, datetime, datetime]] = []
+    real_write_closed_bar = bar_aggregator_module.write_closed_bar
+
+    async def _slow_fake_silence_backfill(
+        conn_factory,
+        aggregator,
+        redis,
+        *,
+        instrument_id,
+        symbol,
+        since,
+        until,
+        to_thread,
+        fetch=None,
+    ):
+        captured_windows.append((instrument_id, since, until))
+        await asyncio.sleep(0.2)  # simulates a slow REST call
+        write_order.append("backfill")
+
+    def _tracking_write_closed_bar(conn, closed, **kwargs):
+        real_write_closed_bar(conn, closed, **kwargs)
+        write_order.append("tick")
+
+    monkeypatch.setattr(bar_aggregator_module, "_silence_backfill", _slow_fake_silence_backfill)
+    monkeypatch.setattr(bar_aggregator_module, "write_closed_bar", _tracking_write_closed_bar)
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(
+            async_redis,
+            db_conn,
+            # real sleep -- keeps the sweep from spinning (backfill_sweep_seconds=300)
+            sleep=asyncio.sleep,
+            max_bars_written=1,
+            pattern=pattern,
+            backfill_conn_factory=lambda: db_conn,
+        )
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)
+            redis_client.publish(channel, _tick_json(iid, partial_tick_ts.isoformat(), "100.00"))
+            redis_client.publish(channel, _tick_json(iid, later_tick_ts.isoformat(), "200.00"))
+            await asyncio.sleep(0.05)  # let the targeted backfill register itself
+            redis_client.publish(
+                channel, _tick_json(iid, even_later_tick_ts.isoformat(), "300.00")
+            )
+
+        asyncio.run(
+            asyncio.wait_for(_run_both(loop_task, _publish_after_subscribed()), timeout=10)
+        )
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    assert write_order == ["backfill", "tick"]
+    assert captured_windows == [
+        (iid, startup_bucket, startup_bucket + timedelta(seconds=60))
+    ]
+    row = db_conn.execute(
+        "SELECT ts, close FROM bars_intraday WHERE instrument_id = %s", (iid,)
+    ).fetchone()
+    # Only the tick path's own (later) bar landed -- this test's fake
+    # _silence_backfill never writes to the DB itself, matching the real
+    # one's contract which _silence_backfill's own tests already cover.
+    assert row == (bucket_start(later_tick_ts, 60), Decimal("200.0000"))
+
+
+def test_sweep_backfill_stops_one_bucket_short_of_now(monkeypatch, db_conn) -> None:
+    """M1: _sweep_backfill must never race the tick path's flush of the
+    just-closed minute -- its upper bound is bucket_start(now) - 60s, not
+    `now` itself. trading_test carries other, already-seeded crypto spot
+    instruments beyond this test's own, so every captured call (not just
+    one) must agree -- they all come from the same `now` inside one
+    `_sweep_backfill` call."""
+    from trading.streaming import bar_aggregator as bar_aggregator_module
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])
+
+    captured: list[dict] = []
+
+    async def _fake_silence_backfill(*args, **kwargs):
+        captured.append(kwargs)
+
+    monkeypatch.setattr(bar_aggregator_module, "_silence_backfill", _fake_silence_backfill)
+
+    async def _inline_to_thread(fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    class _NullRedis:
+        async def publish(self, *a, **k):
+            return None
+
+    aggregator = BarAggregator()
+    asyncio.run(
+        bar_aggregator_module._sweep_backfill(
+            lambda: db_conn,
+            aggregator,
+            _NullRedis(),
+            window_minutes=30,
+            to_thread=_inline_to_thread,
+        )
+    )
+
+    assert captured  # at least this test's own seeded instrument
+    for kwargs in captured:
+        since = kwargs["since"]
+        until = kwargs["until"]
+        implied_now = since + timedelta(minutes=30)
+        assert until == bucket_start(implied_now, 60) - timedelta(seconds=60)
+        assert until < implied_now

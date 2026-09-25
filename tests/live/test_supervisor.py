@@ -404,6 +404,101 @@ def test_a_catchup_bars_orders_are_refused_not_placed(db_conn, monkeypatch) -> N
     assert run.last_refusal == "catch-up bar: price no longer tradeable"
 
 
+def test_a_catchup_refusal_is_logged(db_conn, monkeypatch) -> None:
+    """I6/M2: the docs point an operator at this log (plus
+    live_runs.orders_refused/last_refusal) to check that catch-up refusal
+    is actually happening, instead of a claim about the paper API that
+    isn't true (it only checks the latest bar)."""
+    from trading.live import supervisor
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    started_at = datetime(2026, 9, 25, 10, 0, tzinfo=UTC)
+    live_run_id = _seed_live_run(db_conn, started_at=started_at)
+    db_conn.execute(
+        "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+        "close, volume, trades, source) VALUES (%s, %s, 60, 1, 1, 1, 1, 1, 1, 6)",
+        (iid, datetime(2026, 9, 25, 10, 1, tzinfo=UTC)),
+    )
+    monkeypatch.setattr(supervisor, "place_order", lambda *a, **k: True)
+    run = _run(
+        [encode_frame(FRAME_ORDERS, ts="t", orders=[_intent()], alive=True)],
+        live_run_id=live_run_id,
+    )
+    run.instrument_ids = {iid}
+    run.started_at = started_at
+
+    with structlog.testing.capture_logs() as cap:
+        ok = supervisor.deliver_pending(
+            db_conn, "http://x", run, datetime(2026, 9, 25, 10, 10, tzinfo=UTC)
+        )
+
+    assert ok is True
+    refusal_logs = [e for e in cap if e.get("event") == "live.catchup_refused"]
+    assert len(refusal_logs) == 1
+    assert refusal_logs[0]["live_run_id"] == live_run_id
+    assert refusal_logs[0]["instrument_id"] == iid
+    assert refusal_logs[0]["bar_ts"] == datetime(2026, 9, 25, 10, 1, tzinfo=UTC).isoformat()
+
+
+def test_catchup_is_recomputed_per_bar_immediately_before_it_is_sent(db_conn, monkeypatch) -> None:
+    """I3: `pending_bars` fixes `catchup` once, at query time, for the
+    whole pass. A long replay across several bars takes real wall time to
+    dispatch (each one a subprocess round trip) -- a bar that was fresh
+    when queried can go stale by the time its own turn to be sent comes
+    up, and the paper API's guard only checks the latest bar, not this
+    one. `deliver_pending` must recompute `catchup` immediately before
+    each `handle_bar`, using a real send-time clock, and only ever
+    escalate it (never un-flag a bar the query already marked catch-up)."""
+    from trading.live import supervisor
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    started_at = datetime(2026, 9, 25, 10, 0, tzinfo=UTC)
+    live_run_id = _seed_live_run(db_conn, started_at=started_at)
+    for minute in (1, 2):
+        db_conn.execute(
+            "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+            "close, volume, trades, source) VALUES (%s, %s, 60, 1, 1, 1, 1, 1, 1, 6)",
+            (iid, datetime(2026, 9, 25, 10, minute, tzinfo=UTC)),
+        )
+    placed: list[int] = []
+    monkeypatch.setattr(supervisor, "place_order", lambda *a, **k: (placed.append(1), True)[1])
+    run = _run(
+        [
+            encode_frame(FRAME_ORDERS, ts="t", orders=[_intent()], alive=True),
+            encode_frame(FRAME_ORDERS, ts="t", orders=[_intent()], alive=True),
+        ],
+        live_run_id=live_run_id,
+    )
+    run.instrument_ids = {iid}
+    run.started_at = started_at
+
+    # At query time ("now"=10:03), both bars are fresh: bar1 closes at
+    # 10:02 (60s before now), bar2 closes at 10:03 (0s before now) --
+    # neither exceeds the 120s catchup_after threshold.
+    query_now = datetime(2026, 9, 25, 10, 3, tzinfo=UTC)
+    # The send-time clock: fresh for bar1's send, then jumps far past the
+    # threshold before bar2's send -- as if dispatching bar1 took a long
+    # time (a slow container round trip).
+    clock_values = iter(
+        [
+            datetime(2026, 9, 25, 10, 3, tzinfo=UTC),
+            datetime(2026, 9, 25, 10, 20, tzinfo=UTC),
+        ]
+    )
+
+    ok = supervisor.deliver_pending(
+        db_conn, "http://x", run, query_now, clock=lambda: next(clock_values)
+    )
+
+    assert ok is True
+    assert placed == [1]  # only bar1's order was placed
+    assert run.orders_placed == 1
+    assert run.orders_refused == 1  # bar2, stale by send time, was refused
+    assert run.last_refusal == "catch-up bar: price no longer tradeable"
+
+
 def test_catchup_orders_do_not_count_toward_the_rate_limit(db_conn, monkeypatch) -> None:
     """A long replay dispatches many bars in seconds. Orders refused as
     catch-up are never placed, so counting them would trip the

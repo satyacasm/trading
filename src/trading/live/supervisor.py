@@ -30,6 +30,7 @@ import select
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -388,6 +389,12 @@ def handle_bar(conn: Connection, api_url: str, run: LiveRun, bar: dict[str, Any]
             if catchup:
                 run.orders_refused += 1
                 run.last_refusal = "catch-up bar: price no longer tradeable"
+                log.info(
+                    "live.catchup_refused",
+                    live_run_id=run.live_run_id,
+                    instrument_id=bar.get("instrument_id"),
+                    bar_ts=bar.get("ts"),
+                )
                 continue
             run.note_order()
             if run.over_rate_limit():
@@ -426,12 +433,29 @@ def handle_bar(conn: Connection, api_url: str, run: LiveRun, bar: dict[str, Any]
     return True
 
 
-def deliver_pending(conn: Connection, api_url: str, run: LiveRun, now: datetime) -> bool:
+def deliver_pending(
+    conn: Connection,
+    api_url: str,
+    run: LiveRun,
+    now: datetime,
+    *,
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> bool:
     """Everything design §4 means by "on any notification (or a timer),
     the supervisor sends everything after the cursor, oldest first" --
     the single mechanism covering a missed closed_bars:* message, an
     aggregator restart, and a supervisor restart. Returns False the
     moment any bar's handle_bar says the run should stop.
+
+    `pending_bars` fixes each bar's `catchup` flag once, at query time
+    (`now`). A long replay dispatches many bars in a row, each one a real
+    subprocess round trip -- a bar that was fresh when queried can go
+    stale by the time its own turn to be sent comes up, and the paper
+    API's own guard only checks the latest bar, not this one (I3). So
+    `catchup` is recomputed here, immediately before each `handle_bar`,
+    against `clock()` -- real wall time by default, injectable for tests
+    -- and only ever escalated: a bar the query already flagged stays
+    flagged, it is never un-flagged by a stale-but-lucky recompute.
     """
     settings = get_settings()
     pending, gap_note = pending_bars(
@@ -454,7 +478,17 @@ def deliver_pending(conn: Connection, api_url: str, run: LiveRun, now: datetime)
                 "UPDATE live_runs SET last_gap_note=%s WHERE live_run_id=%s",
                 (gap_note, run.live_run_id),
             )
-    return all(handle_bar(conn, api_url, run, item.frame) for item in pending)
+    catchup_after = timedelta(seconds=settings.live_catchup_after_seconds)
+    for item in pending:
+        frame = item.frame
+        bar_close = datetime.fromisoformat(frame["ts"]) + timedelta(
+            seconds=frame["interval_sec"]
+        )
+        if (clock() - bar_close) > catchup_after:
+            frame["catchup"] = True
+        if not handle_bar(conn, api_url, run, frame):
+            return False
+    return True
 
 
 _SELECT_RUNNING = """

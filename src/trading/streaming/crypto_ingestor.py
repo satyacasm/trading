@@ -12,11 +12,13 @@ import asyncio
 from collections.abc import Awaitable, Callable
 
 import psycopg
+import redis as _sync_redis
 import structlog
 from redis.asyncio import Redis
 
 from trading.config import get_settings
 from trading.streaming.binance_feed import BinanceFeed, LiveBinanceFeed, parse_trade_message
+from trading.streaming.heartbeat import start_heartbeat_thread
 from trading.streaming.seed_instruments import seed_crypto_instruments
 
 log = structlog.get_logger(__name__)
@@ -101,6 +103,13 @@ async def run_ingestion_loop(
 
 def main() -> None:
     settings = get_settings()
+
+    start_heartbeat_thread(
+        lambda: _sync_redis.Redis.from_url(settings.redis_url, decode_responses=True),
+        "crypto_ingestor",
+        ttl=settings.heartbeat_ttl_seconds,
+        every=settings.heartbeat_refresh_seconds,
+    )
 
     conn = psycopg.connect(settings.database_url, autocommit=False)
     try:

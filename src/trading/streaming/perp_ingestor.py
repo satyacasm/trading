@@ -39,6 +39,7 @@ from redis import Redis
 from trading.config import get_settings
 from trading.contracts import DataSource
 from trading.sources.binance_futures import KLINES_URL, PerpBar, parse_klines
+from trading.streaming.heartbeat import start_heartbeat_thread
 from trading.streaming.perp_backfill import write_bars
 from trading.streaming.seed_perp_instruments import PERP_UNIVERSE, platform_symbol
 
@@ -301,6 +302,14 @@ def run_ingestion_loop(
 def main() -> None:
     structlog.configure(processors=[structlog.dev.ConsoleRenderer()])
     settings = get_settings()
+
+    start_heartbeat_thread(
+        lambda: Redis.from_url(settings.redis_url, decode_responses=True),
+        "perp_ingestor",
+        ttl=settings.heartbeat_ttl_seconds,
+        every=settings.heartbeat_refresh_seconds,
+    )
+
     conn = psycopg.connect(settings.database_url, autocommit=False)
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
     instrument_ids = _seeded_instruments(conn, PERP_UNIVERSE)

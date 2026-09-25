@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import psycopg
+import redis as sync_redis  # sync client, distinct from the websocket route's async one
 import structlog
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -130,6 +131,37 @@ def instruments(conn: Connection = Depends(get_db_connection)) -> list[Instrumen
         InstrumentSummary(instrument_id=row[0], symbol=row[1], asset_class=row[2], exchange=row[3])
         for row in rows
     ]
+
+
+_HEALTH_COMPONENTS = (
+    "crypto_ingestor",
+    "bar_aggregator",
+    "paper_engine",
+    "paper_alerts",
+    "live_supervisor",
+    "perp_ingestor",
+)
+
+
+class HealthResponse(BaseModel):
+    components: dict[str, bool]
+    ok: bool
+
+
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
+    # Sync def, read-only: GETs never write on this platform. A fresh
+    # short-lived client rather than a shared one -- this route is hit
+    # rarely enough that connection reuse buys nothing, and a shared
+    # client would be one more thing this route could leave dangling.
+    client = sync_redis.Redis.from_url(get_settings().redis_url)
+    try:
+        components = {
+            name: client.exists(f"health:{name}") == 1 for name in _HEALTH_COMPONENTS
+        }
+    finally:
+        client.close()
+    return HealthResponse(components=components, ok=all(components.values()))
 
 
 # One connection-lifetime pattern subscription instead of per-instrument

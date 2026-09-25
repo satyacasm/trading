@@ -55,6 +55,7 @@ from trading.live.protocol import (
     encode_frame,
 )
 from trading.runtime.payload import MODE_LIVE, SmokePayload, encode_payload
+from trading.streaming.heartbeat import start_heartbeat_thread
 from trading.streaming.resilient_pubsub import SyncResilientPubSub
 
 log = structlog.get_logger(__name__)
@@ -690,6 +691,13 @@ def run_supervisor(stop: threading.Event | None = None) -> None:
 def main() -> int:
     structlog.configure(processors=[structlog.dev.ConsoleRenderer()])
     log.info("live.starting_process")
+    settings = get_settings()
+    start_heartbeat_thread(
+        lambda: redis.Redis.from_url(settings.redis_url, decode_responses=True),
+        "live_supervisor",
+        ttl=settings.heartbeat_ttl_seconds,
+        every=settings.heartbeat_refresh_seconds,
+    )
     run_supervisor()
     return 0
 

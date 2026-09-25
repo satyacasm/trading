@@ -97,6 +97,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import psycopg
+import redis as _sync_redis
 import structlog
 from psycopg import Connection
 from psycopg.errors import CheckViolation
@@ -131,6 +132,7 @@ from trading.paper.ledger import quantize_money as quantize_fill_price
 from trading.paper.liquidation import liquidate_open_positions
 from trading.paper.models import FillDecision, Order, Position
 from trading.paper.reference_price import StalePrice, latest_reference_price
+from trading.streaming.heartbeat import start_heartbeat_thread
 from trading.streaming.models import Tick
 from trading.streaming.resilient_pubsub import resilient_messages
 
@@ -1215,6 +1217,14 @@ async def run_engine(
 
 def main() -> None:
     settings = get_settings()
+
+    start_heartbeat_thread(
+        lambda: _sync_redis.Redis.from_url(settings.redis_url, decode_responses=True),
+        "paper_engine",
+        ttl=settings.heartbeat_ttl_seconds,
+        every=settings.heartbeat_refresh_seconds,
+    )
+
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
     log.info("paper_engine.starting_process")
     try:

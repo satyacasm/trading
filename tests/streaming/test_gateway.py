@@ -270,3 +270,22 @@ def test_instruments_endpoint_lists_perpetuals_distinguishably(
     )
     assert perp["instrument_id"] != spot["instrument_id"]
     assert perp["exchange"] == "BINANCE_FUTURES"
+
+
+def test_health_reports_each_component_present_or_absent(client: TestClient, redis_client) -> None:
+    redis_client.set("health:bar_aggregator", "1", ex=30)
+    # crypto_ingestor's key is deliberately absent/expired.
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["components"]["bar_aggregator"] is True
+    assert body["components"]["crypto_ingestor"] is False
+    assert body["ok"] is False  # not every component is up
+
+
+def test_health_performs_no_writes(client: TestClient, redis_client) -> None:
+    before = redis_client.dbsize()
+    client.get("/health")
+    assert redis_client.dbsize() == before

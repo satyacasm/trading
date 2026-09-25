@@ -86,10 +86,12 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 import psycopg
+import redis
 import structlog
 from psycopg import Connection
 
 from trading.config import get_settings
+from trading.streaming.heartbeat import start_heartbeat_thread
 
 if TYPE_CHECKING:
     from trading.config import Settings
@@ -294,6 +296,14 @@ def build_telegram_sender(
 
 def main() -> None:
     settings = get_settings()
+
+    start_heartbeat_thread(
+        lambda: redis.Redis.from_url(settings.redis_url, decode_responses=True),
+        "paper_alerts",
+        ttl=settings.heartbeat_ttl_seconds,
+        every=settings.heartbeat_refresh_seconds,
+    )
+
     sender = build_telegram_sender(settings)
     log.info("alerts.starting", enabled=sender is not None)
     conn = psycopg.connect(settings.database_url, autocommit=False)

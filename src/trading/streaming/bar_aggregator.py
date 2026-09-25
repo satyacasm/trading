@@ -17,6 +17,7 @@ from decimal import Decimal
 from typing import Any
 
 import psycopg
+import redis as _sync_redis
 import structlog
 from psycopg import Connection
 from redis.asyncio import Redis
@@ -25,6 +26,7 @@ from trading.config import get_settings
 from trading.contracts import DataSource
 from trading.db import ReconnectingConnection
 from trading.sources.binance_spot import fetch_spot_klines, spot_symbol
+from trading.streaming.heartbeat import start_heartbeat_thread
 from trading.streaming.models import Bar, Tick
 from trading.streaming.resilient_pubsub import resilient_messages
 
@@ -846,6 +848,14 @@ async def run_aggregation_loop(
 
 def main() -> None:
     settings = get_settings()
+
+    start_heartbeat_thread(
+        lambda: _sync_redis.Redis.from_url(settings.redis_url, decode_responses=True),
+        "bar_aggregator",
+        ttl=settings.heartbeat_ttl_seconds,
+        every=settings.heartbeat_refresh_seconds,
+    )
+
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
     # autocommit=True: each closed bar is its own independent unit of work
     # over a long-running connection -- unlike seed_instruments.py's

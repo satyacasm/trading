@@ -1,7 +1,66 @@
 # Where this project stands
 
-**Updated:** 2026-09-06, ~18:05 IST. Keep this file current — it is the
+**Updated:** 2026-09-25, ~23:15 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
+
+## Live-stack resilience plan merged (2026-09-25)
+
+Design: `docs/superpowers/specs/2026-09-25-live-stack-resilience-design.md`.
+Every bug in its §1 table (silent `listen()` exit, no REST backfill,
+in-memory-only delivery cursor, `ConnectionError` killing the supervisor,
+blocking `readline()`, no staleness check, `ctx.state` never saved, no
+deployment story) is fixed and tested, including now against real
+infrastructure, not just fakes. What shipped:
+
+- **Gap backfill** (`spot_backfill.py`): 1-minute bars are pulled from
+  Binance REST spot klines on three triggers -- at aggregator startup,
+  after 90s of silence on a stream, and via a 5-minute sweep re-checking
+  the last 30 minutes. Known limitation: ticks that arrive *during* a
+  startup backfill are not captured, so the first live minute after a
+  restart can be built from a partial tick set.
+- **Per-run delivery cursors** (`live_run_cursors`) replace pub/sub as
+  the record of what a live run has seen: a `closed_bars:*` message is
+  only a wake-up now, never the thing actually trusted, so a dropped
+  message during a reconnect is harmless -- the next poll or sweep
+  notices the gap on its own. Postgres is the record (design §2).
+- **`ctx.state` persistence**: strategy state (capped at 64 KB) is saved
+  and round-tripped through a container relaunch, so a strategy's memory
+  survives a supervisor restart instead of starting over as if it were
+  its first bar.
+- **Catch-up bars and their enforcement**: the supervisor replays missed
+  bars per run, flags each one `catchup = true`, and separately the
+  paper API refuses any MARKET order whose reference bar closed more
+  than 180s ago -- so a catch-up bar can't trade even if the supervisor's
+  own flag is ignored somewhere downstream. Replay is capped at 24h; a
+  skip past that cap is logged as `live.replay_gap` and stored in
+  `live_runs.last_gap_note`.
+- **Resilient Redis/Postgres reconnection** in every long-running
+  process (`resilient_pubsub.py`, `ReconnectingConnection`): a
+  disconnect backs off and resubscribes instead of silently ending the
+  consuming loop or killing the process.
+- **A real `select()`-based reply timeout** and a **stale-price guard**
+  close off the blocking-`readline()` and no-staleness-check rows of the
+  bug table.
+- **Heartbeats and `GET /health`**: six `health:<name>` keys (30s TTL,
+  refreshed every 10s) prove each process is alive. A heartbeat only
+  proves the process is alive, not that its loop is making progress --
+  for bar flow specifically, check that the latest row in
+  `bars_intraday` is recent.
+- **Deployment**: launchd agents for the whole live stack plus a Docker
+  restart policy, in `deploy/` (`install-live-stack.sh`,
+  `start-colima.sh`, `provision-sandbox-vm.sh`, and the plists).
+  `provision-sandbox-vm.sh` is idempotent -- it merges `daemon.json`
+  rather than overwriting it, backs up before writing, and prints
+  "already provisioned" when `runsc` is already registered. None of
+  this has been installed or run yet; the operator installs it.
+
+**What remains:** the live drill itself. `docs/live-resilience-drill.md`
+is the runbook (start the stack, start a run, confirm no gap, kill Wi-Fi
+for 10 minutes, kick the supervisor, restart Redis) but it has not yet
+been run for real against an actual outage. That is the next thing to
+do -- everything above is proven by unit and integration tests (including
+one that restarts the real `trading_redis_test` container mid-stream),
+not yet by a live rehearsal.
 
 ---
 

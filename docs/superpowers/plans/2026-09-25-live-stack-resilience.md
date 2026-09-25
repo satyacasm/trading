@@ -273,7 +273,7 @@
       it is called -- exactly the seam resilient_messages watches."""
 
       def __init__(self, behaviors):
-          self._behaviors = list(behaviors)
+          self._behaviors = behaviors  # shared with the client: consumption must advance across reconnects
           self.subscribed_patterns: list[str] = []
           self.closed = 0
 
@@ -398,7 +398,7 @@
 
       class _FakeSyncPubSub:
           def __init__(self, behaviors):
-              self._behaviors = list(behaviors)
+              self._behaviors = behaviors  # shared with the client: consumption must advance across reconnects
 
           def psubscribe(self, *patterns):
               pass

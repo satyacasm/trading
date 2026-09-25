@@ -151,6 +151,7 @@ def start_run(
             slippage_bps=slippage_bps,
             charge_schedules=tuple(schedules),
             leverage=leverage,
+            state_max_bytes=get_settings().live_state_max_bytes,
         )
     )
     process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell

@@ -662,3 +662,98 @@ def test_handle_bar_persists_the_orders_frames_state_column(db_conn, monkeypatch
         "SELECT strategy_state FROM live_runs WHERE live_run_id=%s", (live_run_id,)
     ).fetchone()
     assert row[0] == {"seen": 1}
+
+
+def test_start_run_carries_state_max_bytes_from_settings(monkeypatch) -> None:
+    """The actual bug: start_run (the fresh-launch path) built SmokePayload
+    without state_max_bytes=get_settings().live_state_max_bytes, unlike
+    _launch -- so tuning Settings.live_state_max_bytes only ever affected a
+    relaunch, never a strategy's first run."""
+    import subprocess
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from trading.live import supervisor
+
+    captured: dict[str, object] = {}
+
+    def _fake_encode_payload(payload):  # noqa: ANN001
+        captured["state_max_bytes"] = payload.state_max_bytes
+        return b"x"
+
+    monkeypatch.setattr(supervisor, "encode_payload", _fake_encode_payload)
+    monkeypatch.setattr(
+        supervisor, "get_settings", lambda: SimpleNamespace(live_state_max_bytes=131072)
+    )
+    fake_process = MagicMock(spec=subprocess.Popen)
+    fake_process.stdin = MagicMock()
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: fake_process)
+
+    conn = MagicMock()
+    conn.execute.return_value.fetchone.return_value = (1, datetime(2026, 9, 4, tzinfo=UTC))
+
+    supervisor.start_run(
+        conn,
+        strategy_id=1,
+        portfolio_id=1,
+        source="x",
+        instrument_ids=[1],
+        schedules=(),
+        starting_cash=Decimal("1000"),
+        slippage_bps=Decimal("5"),
+    )
+
+    assert captured["state_max_bytes"] == 131072
+
+
+def test_a_relaunched_runs_next_order_never_reuses_an_idempotency_key(
+    db_conn, monkeypatch
+) -> None:
+    """End-to-end characterization: a run relaunched with restored counters
+    places its next order under an idempotency key that was never used
+    before the restart. place_order builds the key as
+    f"live-{run.live_run_id}-{seq}" where handle_bar passes
+    run.orders_placed (the count of orders already placed) as seq -- so a
+    run restored with orders_placed=42 must send seq=42, never repeating
+    any of the 42 keys (0..41) already used before the crash."""
+    import urllib.request
+
+    from trading.live import supervisor
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    live_run_id = _seed_live_run(db_conn, started_at=datetime(2026, 9, 25, tzinfo=UTC))
+    db_conn.execute(
+        "UPDATE live_runs SET bars_seen=%s, orders_placed=%s WHERE live_run_id=%s",
+        (100, 42, live_run_id),
+    )
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status = 201
+
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    def _urlopen(request, timeout=None):  # noqa: ANN001, ANN202, ARG001
+        captured.update(json.loads(request.data))
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+
+    run = _run(
+        [encode_frame(FRAME_ORDERS, ts="t", orders=[_intent()], alive=True)],
+        live_run_id=live_run_id,
+    )
+    run.orders_placed = 42
+    run.instrument_ids = {iid}
+
+    bar = {**_bar(), "instrument_id": iid}
+    assert supervisor.handle_bar(db_conn, "http://x", run, bar) is True
+
+    assert captured["idempotency_key"] == f"live-{live_run_id}-42"
+    assert run.orders_placed == 43

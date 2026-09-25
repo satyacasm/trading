@@ -23,7 +23,10 @@ Run it with `python -m trading.live.supervisor`.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import select
 import subprocess
 import threading
 import time
@@ -46,7 +49,6 @@ from trading.live.protocol import (
     FRAME_BAR,
     FRAME_ERROR,
     FRAME_ORDERS,
-    FRAME_READY,
     FRAME_STOP,
     decode_frame,
     encode_frame,
@@ -91,6 +93,12 @@ class LiveRun:
     # requires it for a perpetual and refuses it as meaningless otherwise.
     leverage: Decimal | None = None
     _order_times: list[float] = field(default_factory=list)
+    # Bytes read from stdout past the frame `read_frames` last returned
+    # on. A single os.read() can pull in more than one frame's worth of
+    # bytes at once -- without carrying the remainder to the next call,
+    # a frame already drained from the kernel pipe would be lost rather
+    # than merely delayed.
+    _stdout_buffer: bytes = b""
 
     def over_rate_limit(self) -> bool:
         cutoff = time.monotonic() - 60
@@ -218,29 +226,52 @@ def feed_bar(run: LiveRun, bar: dict[str, Any]) -> None:
 
 
 def read_frames(run: LiveRun, timeout: float = 30.0) -> list[dict[str, Any]]:
-    """Frames the strategy emitted for the bar just fed.
+    """Frames the strategy emitted for the bar just fed, read via
+    select() against a real deadline -- not a blocking readline(),
+    whose 30s bound used to be checked only BETWEEN reads, so a hung
+    container froze every run indefinitely (design §6).
 
-    Reads until an `orders` frame arrives, which the runner emits exactly
-    once per dispatched bar, so the supervisor stays in lockstep with the
-    strategy rather than guessing how long a bar takes.
+    Reads until an `orders`/`error` frame arrives, which the runner
+    emits exactly once per dispatched bar, so the supervisor stays in
+    lockstep with the strategy rather than guessing how long a bar
+    takes. On the deadline with nothing conclusive yet, returns
+    whatever frames were parsed so far (often none).
+
+    A single `os.read()` can return more bytes than one frame's line --
+    e.g. a READY frame and the ORDERS frame that follows it, flushed
+    together. Anything past the line that ends this call is next bar's
+    data, not garbage, so it is carried on `run._stdout_buffer` to the
+    next call rather than read again from (and re-lost from) the pipe.
     """
     frames: list[dict[str, Any]] = []
     if run.process.stdout is None:
         return frames
+    fd = run.process.stdout.fileno()
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        line = run.process.stdout.readline()
-        if not line:
-            break
-        frame = decode_frame(line.decode("utf-8", "replace"))
-        if frame is None:
-            continue
-        frames.append(frame)
-        if frame["type"] in {FRAME_ORDERS, FRAME_ERROR}:
-            break
-        if frame["type"] == FRAME_READY:
-            continue
-    return frames
+    buffer = run._stdout_buffer
+    while True:
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            frame = decode_frame(line.decode("utf-8", "replace"))
+            if frame is None:
+                continue
+            frames.append(frame)
+            if frame["type"] in {FRAME_ORDERS, FRAME_ERROR}:
+                run._stdout_buffer = buffer
+                return frames
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            run._stdout_buffer = buffer
+            return frames
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            run._stdout_buffer = buffer
+            return frames
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            run._stdout_buffer = buffer
+            return frames  # EOF -- the process closed its stdout
+        buffer += chunk
 
 
 def _refusal_text(detail: str) -> str:
@@ -330,9 +361,13 @@ def handle_bar(conn: Connection, api_url: str, run: LiveRun, bar: dict[str, Any]
     """
     catchup = bool(bar.get("catchup", False))
     feed_bar(run, bar)
-    frames = read_frames(run)
+    timeout = get_settings().live_reply_timeout_seconds
+    frames = read_frames(run, timeout=timeout)
     if not frames:
-        stop_run(conn, run, "CRASHED", "the strategy stopped responding")
+        # A process already dead is not worth failing over.
+        with contextlib.suppress(Exception):
+            run.process.kill()
+        stop_run(conn, run, "CRASHED", f"no reply in {timeout}s")
         return False
 
     for frame in frames:

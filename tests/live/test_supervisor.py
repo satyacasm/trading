@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import MagicMock
@@ -17,12 +19,23 @@ from trading.live.protocol import FRAME_ERROR, FRAME_ORDERS, encode_frame
 from trading.live.supervisor import MAX_ORDERS_PER_MINUTE, LiveRun, handle_bar
 
 
+def _pipe_stdout(lines: list[str]):  # noqa: ANN201
+    """A real OS pipe standing in for process.stdout. All lines are
+    written and the write end is closed immediately -- reading sees
+    everything at once (tests need no real wait) and then EOF, the
+    same end-of-output signal the old MagicMock's trailing b"" gave."""
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(write_fd, "wb") as w:
+        for line in lines:
+            w.write(line.encode())
+    return os.fdopen(read_fd, "rb", buffering=0)
+
+
 def _run(stdout_lines: list[str], *, live_run_id: int = 1) -> LiveRun:
     process = MagicMock(spec=subprocess.Popen)
     process.poll.return_value = None
     process.stdin = MagicMock()
-    process.stdout = MagicMock()
-    process.stdout.readline.side_effect = [line.encode() for line in stdout_lines] + [b""]
+    process.stdout = _pipe_stdout(stdout_lines)
     return LiveRun(
         live_run_id=live_run_id,
         strategy_id=1,
@@ -58,6 +71,36 @@ def _bar() -> dict[str, object]:
         "close": "100",
         "volume": None,
     }
+
+
+def test_read_frames_returns_at_the_deadline_when_nothing_is_written() -> None:
+    """The actual production bug (design §6): a blocking readline()'s
+    30s bound was only checked BETWEEN reads, so a hung container froze
+    every run indefinitely. select() enforces the deadline directly."""
+    from trading.live import supervisor
+
+    read_fd, write_fd = os.pipe()  # write_fd deliberately never written or closed
+    process = MagicMock(spec=subprocess.Popen)
+    process.poll.return_value = None
+    process.stdout = os.fdopen(read_fd, "rb", buffering=0)
+    run = LiveRun(
+        live_run_id=1,
+        strategy_id=1,
+        portfolio_id=1,
+        process=process,
+        instrument_ids={1},
+        runtime="runsc",
+        kernel_isolated=True,
+        started_at=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+
+    start = time.monotonic()
+    frames = supervisor.read_frames(run, timeout=0.2)
+    elapsed = time.monotonic() - start
+    os.close(write_fd)
+
+    assert frames == []
+    assert elapsed < 0.7  # timeout (0.2s) + 0.5s slack
 
 
 def test_the_rate_limit_stops_a_runaway_and_says_so(monkeypatch) -> None:  # noqa: ANN001

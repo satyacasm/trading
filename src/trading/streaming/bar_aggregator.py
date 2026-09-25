@@ -114,8 +114,21 @@ class BarAggregator:
         previous process instance already closed and announced it -- is
         dropped rather than reopening and republishing an already-final
         bar (design §1 row 4; `_closed_through` was in-memory only, and
-        a restart forgot it)."""
-        self._closed_through.update(mapping)
+        a restart forgot it).
+
+        `_closed_through` is a never-reopen watermark and only ever moves
+        forward, so this is a monotonic max-merge, never a blind
+        `dict.update()`. The silence and sweep backfills (Task 6) call
+        this concurrently with live tick ingestion: if live ticks have
+        already closed a newer bucket by the time a slower backfill's
+        seed lands, a blind overwrite would move the watermark backward
+        and let the next late tick for the gap in between reopen an
+        already-settled bucket and overwrite it via `ON CONFLICT DO
+        UPDATE`."""
+        for instrument_id, ts in mapping.items():
+            self._closed_through[instrument_id] = max(
+                self._closed_through.get(instrument_id, ts), ts
+            )
 
     def ingest(self, tick: Tick) -> list[ClosedBar]:
         bucket = bucket_start(tick.ts, self._interval_seconds)

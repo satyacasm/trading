@@ -1032,6 +1032,64 @@ def test_seed_closed_through_drops_a_late_tick_for_an_already_written_minute():
     assert aggregator.late_ticks_dropped == 1
 
 
+def test_seed_closed_through_never_moves_the_watermark_backward():
+    """A silence/sweep backfill runs concurrently with live tick ingestion
+    (Task 6). If live ticks have already closed a newer bucket while a
+    slower backfill is still in flight, the backfill's seed must not move
+    `_closed_through` backward -- that would let the next late tick for
+    the gap in between reopen an already-settled bucket and overwrite it
+    via `ON CONFLICT DO UPDATE`. `seed_closed_through` must be a
+    monotonic max-merge, never a blind `dict.update()`."""
+    from trading.streaming.bar_aggregator import BarAggregator
+    from trading.streaming.models import Tick
+
+    aggregator = BarAggregator()
+    m = datetime(2026, 9, 25, 10, 0, tzinfo=UTC)
+
+    # Live ticks close M and M+1, advancing _closed_through to M+1 (the
+    # bucket M+2 is left open, so flush_stale/ingest closes M+1 via the
+    # M+2 tick opening a new bucket).
+    aggregator.ingest(Tick(instrument_id=1, ts=m, price=Decimal("100"), quantity=Decimal("1")))
+    aggregator.ingest(
+        Tick(
+            instrument_id=1,
+            ts=m + timedelta(minutes=1),
+            price=Decimal("100"),
+            quantity=Decimal("1"),
+        )
+    )
+    aggregator.ingest(
+        Tick(
+            instrument_id=1,
+            ts=m + timedelta(minutes=2),
+            price=Decimal("100"),
+            quantity=Decimal("1"),
+        )
+    )
+    assert aggregator._closed_through[1] == m + timedelta(minutes=1)
+
+    # A slower backfill, started before those live ticks arrived, now
+    # seeds an older watermark for the same instrument.
+    aggregator.seed_closed_through({1: m})
+
+    assert aggregator._closed_through[1] == m + timedelta(minutes=1), (
+        "seed_closed_through moved the watermark backward"
+    )
+
+    # A late tick for M+1 -- already settled by live ticks -- must still
+    # be dropped, not reopened.
+    closed = aggregator.ingest(
+        Tick(
+            instrument_id=1,
+            ts=m + timedelta(minutes=1, seconds=30),
+            price=Decimal("999"),
+            quantity=Decimal("1"),
+        )
+    )
+    assert closed == []
+    assert aggregator.late_ticks_dropped == 1
+
+
 def test_startup_backfill_writes_and_announces_with_a_fake_fetch(db_conn, redis_client) -> None:
     """Exercises the extracted helper directly rather than the whole
     run_aggregation_loop -- that loop only terminates on a tick/bar

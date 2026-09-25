@@ -137,3 +137,7 @@ def test_portfolio_cash_and_equity_are_visible() -> None:
     assert ctx.portfolio.cash == Decimal("100000")
     assert ctx.portfolio.equity == Decimal("100000")
     assert ctx.portfolio.positions == {}
+
+
+def test_is_catchup_defaults_false() -> None:
+    assert _ctx().is_catchup is False

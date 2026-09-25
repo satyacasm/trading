@@ -304,6 +304,11 @@ class Context:
         self.data = DataAccess()
         self.portfolio = PortfolioView()
         self.state: dict[str, Any] = {}
+        # True for a bar delivered late enough that its price is no
+        # longer tradeable (design §5.1) -- indicators and ctx.state
+        # still update normally on it, but any order it produces is
+        # refused by the supervisor, not by this process.
+        self.is_catchup: bool = False
 
     @property
     def now(self) -> datetime:

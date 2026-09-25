@@ -85,6 +85,15 @@ class SmokePayload:
     # position can never be liquidated, and every over-levered strategy
     # survives a move that would have ended it.
     margin_tiers: tuple[dict[str, str], ...] = ()
+    # ctx.state as of the last bar this run processed, restored into the
+    # container's Context before the first bar on relaunch (design
+    # §5.2). None for a fresh run -- there is nothing to restore.
+    strategy_state: dict[str, Any] | None = None
+    # The runner's own ceiling on ctx.state's serialised size, carried
+    # in the payload rather than hardcoded in the container image so an
+    # operator can tune it the same way every other threshold here is
+    # tuned, from Settings.
+    state_max_bytes: int = 65536
 
 
 def _money(value: Decimal | None) -> str | None:
@@ -173,6 +182,8 @@ def encode_payload(payload: SmokePayload) -> bytes:
         "perp_instruments": list(payload.perp_instruments),
         "funding_rates": [dict(row) for row in payload.funding_rates],
         "margin_tiers": [dict(row) for row in payload.margin_tiers],
+        "strategy_state": payload.strategy_state,
+        "state_max_bytes": payload.state_max_bytes,
     }
     return gzip.compress(json.dumps(document, separators=(",", ":")).encode("utf-8"))
 
@@ -216,4 +227,6 @@ def decode_payload(raw: bytes) -> SmokePayload:
             if document.get("max_drawdown_pct") is None
             else Decimal(document["max_drawdown_pct"])
         ),
+        strategy_state=document.get("strategy_state"),
+        state_max_bytes=int(document.get("state_max_bytes", 65536)),
     )

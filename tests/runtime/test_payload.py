@@ -217,3 +217,21 @@ def test_risk_limit_overrides_survive_the_payload_round_trip() -> None:
     neither = decode_payload(encode_payload(SmokePayload(mode="smoke", source="x")))
     assert neither.max_daily_loss is None
     assert neither.max_drawdown_pct is None
+
+
+def test_strategy_state_and_state_max_bytes_survive_the_round_trip() -> None:
+    payload = SmokePayload(
+        mode="live",
+        source="x",
+        strategy_state={"entry_price": "63000.50", "count": 3},
+        state_max_bytes=131072,
+    )
+    restored = decode_payload(encode_payload(payload))
+    assert restored.strategy_state == {"entry_price": "63000.50", "count": 3}
+    assert restored.state_max_bytes == 131072
+
+
+def test_strategy_state_defaults_to_none_and_state_max_bytes_to_65536() -> None:
+    restored = decode_payload(encode_payload(SmokePayload(mode="smoke", source="x")))
+    assert restored.strategy_state is None
+    assert restored.state_max_bytes == 65536

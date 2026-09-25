@@ -122,6 +122,7 @@ class LiveContext(platform_sdk.Context):
         self.data = LiveDataAccess(state, bars)
         self.portfolio = LivePortfolioView(state)
         self.state: dict[str, Any] = {}
+        self.is_catchup: bool = False
 
     @property
     def now(self):  # type: ignore[no-untyped-def]

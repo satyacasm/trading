@@ -26,6 +26,19 @@ LABELS=(
   com.satyam.trading.mcp
 )
 
+# `launchctl bootout` returns before the job is actually gone, and
+# bootstrapping the same label meanwhile fails with "Bootstrap failed: 5:
+# Input/output error". Poll (bounded, ~10s) until launchd forgets it.
+wait_until_unloaded() {
+  local label="$1"
+  for _ in $(seq 1 50); do
+    launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+  echo "timed out waiting for $label to unload" >&2
+  return 1
+}
+
 cmd="${1:-}"
 
 case "$cmd" in
@@ -40,6 +53,7 @@ case "$cmd" in
       sed -e "s|__REPO__|$REPO|g" -e "s|__UV__|$UV_PATH|g" -e "s|__PATH__|$LAUNCHD_PATH|g" \
         "$LAUNCHD_SRC/$label.plist" > "$LAUNCHD_DST/$label.plist"
       launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+      wait_until_unloaded "$label"
       launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_DST/$label.plist"
       echo "installed $label"
     done

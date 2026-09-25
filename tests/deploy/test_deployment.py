@@ -141,3 +141,12 @@ def test_shell_scripts_are_syntactically_valid(script: str) -> None:
         ["bash", "-n", str(REPO_ROOT / script)], capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_install_waits_for_bootout_before_bootstrapping() -> None:
+    """`launchctl bootout` returns before the job is gone; bootstrapping the
+    same label immediately fails with "Bootstrap failed: 5: Input/output
+    error" -- which is what the first reinstall hit."""
+    text = (REPO_ROOT / "deploy" / "install-live-stack.sh").read_text()
+    install = text[text.index("  install)") : text.index("  uninstall)")]
+    assert install.index("wait_until_unloaded") < install.index("launchctl bootstrap")

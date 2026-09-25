@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
@@ -81,6 +81,7 @@ from trading.paper.charges import (
 )
 from trading.paper.enums import OrderStatus, OrderType, Product, Side, TimeInForce
 from trading.paper.models import Order, Portfolio, Position
+from trading.paper.reference_price import StalePrice, latest_reference_price
 from trading.streaming.db import get_db_connection
 
 router = APIRouter()
@@ -274,11 +275,13 @@ def _require_sufficient_cash(
 ) -> None:
     price = body.limit_price
     if price is None:
-        row = conn.execute(
-            "SELECT close FROM bars_intraday WHERE instrument_id = %s ORDER BY ts DESC LIMIT 1",
-            (body.instrument_id,),
-        ).fetchone()
-        if row is None:
+        result = latest_reference_price(
+            conn,
+            body.instrument_id,
+            now=datetime.now(UTC),
+            max_age=timedelta(seconds=get_settings().stale_price_seconds),
+        )
+        if result is None:
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -286,7 +289,15 @@ def _require_sufficient_cash(
                     "cannot validate this MARKET order's cash requirement"
                 ),
             )
-        price = row[0]
+        if isinstance(result, StalePrice):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"reference price stale for instrument_id={body.instrument_id}: "
+                    f"last bar is {result.age_seconds:.0f}s old"
+                ),
+            )
+        price, _ts = result
     needed = body.quantity * price
     if needed > cash_balance:
         raise HTTPException(

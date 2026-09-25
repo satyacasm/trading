@@ -22,7 +22,7 @@ from decimal import Decimal
 
 import pytest
 import redis
-from fastapi import BackgroundTasks, Depends, FastAPI
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from tests.paper.helpers import make_order, make_portfolio
@@ -1066,3 +1066,31 @@ def test_background_task_runs_before_yield_dependency_teardown() -> None:
         "FastAPI's background-task-vs-teardown ordering changed: "
         f"observed {events!r}. Revisit IMP-1's source fix (ruling 27)."
     )
+
+
+def test_a_market_order_is_refused_when_the_reference_price_is_stale(db_conn) -> None:
+    from datetime import UTC, datetime
+
+    from trading.paper.api import CreateOrderRequest, _require_sufficient_cash
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    db_conn.execute(
+        "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+        "close, volume, trades, source) VALUES (%s, %s, 60, 100, 100, 100, 100, 1, 1, 6)",
+        (iid, datetime(2020, 1, 1, tzinfo=UTC)),  # ancient
+    )
+    body = CreateOrderRequest(
+        portfolio_id=1,
+        instrument_id=iid,
+        side="BUY",
+        order_type="MARKET",
+        quantity=Decimal("1"),
+        product="DELIVERY",
+        rationale="test",
+        idempotency_key="test-stale-reference-price",
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        _require_sufficient_cash(db_conn, body, Decimal("1000000"))
+    assert exc_info.value.status_code == 400
+    assert "reference price stale" in exc_info.value.detail

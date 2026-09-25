@@ -131,6 +131,7 @@ from trading.paper.ledger import OrderNoLongerFillable, apply_fill
 from trading.paper.ledger import quantize_money as quantize_fill_price
 from trading.paper.liquidation import liquidate_open_positions
 from trading.paper.models import FillDecision, Order, Position
+from trading.paper.reference_price import StalePrice, latest_reference_price
 from trading.streaming.models import Tick
 
 # Instruments with no session to close: a DAY order on one has nothing to
@@ -256,26 +257,39 @@ def _load_positions(conn: Connection, portfolio_id: int) -> list[Position]:
 
 
 def _load_marks(conn: Connection, positions: Sequence[Position]) -> dict[int, Decimal]:
-    """Latest `bars_intraday` close per held instrument -- the same
-    "reference price" source `trading.paper.api._require_sufficient_cash`
-    already uses for a MARKET order's submit-time cash estimate. A
-    position with `quantity == 0` needs no mark (see `compute_equity`),
-    so it's skipped here too rather than spending a query on it. A
-    position with no `bars_intraday` row at all is simply left out of the
-    returned mapping -- `compute_equity` is what turns that into a loud
-    `MissingMark`, not this loader.
-    """
+    """Latest `bars_intraday` close per held instrument. A stale mark
+    (older than `stale_price_seconds`) is logged, not withheld: equity
+    must not vanish because a feed paused -- a position held through a
+    stale patch is still a position, and `MissingMark`'s job is only
+    for a mark that was never there at all."""
     marks: dict[int, Decimal] = {}
+    max_age = timedelta(seconds=get_settings().stale_price_seconds)
+    now = datetime.now(UTC)
     for position in positions:
         if position.quantity == 0:
             continue
-        row = conn.execute(
-            "SELECT close FROM bars_intraday WHERE instrument_id = %s ORDER BY ts DESC LIMIT 1",
-            (position.instrument_id,),
-        ).fetchone()
-        if row is not None:
-            marks[position.instrument_id] = row[0]
+        result = latest_reference_price(conn, position.instrument_id, now=now, max_age=max_age)
+        if result is None:
+            continue
+        if isinstance(result, StalePrice):
+            log.warning(
+                "paper_engine.stale_mark",
+                instrument_id=position.instrument_id,
+                age_seconds=result.age_seconds,
+            )
+            marks[position.instrument_id] = _bars_close_for(conn, position.instrument_id)
+            continue
+        marks[position.instrument_id], _ts = result
     return marks
+
+
+def _bars_close_for(conn: Connection, instrument_id: int) -> Decimal:
+    row = conn.execute(
+        "SELECT close FROM bars_intraday WHERE instrument_id = %s ORDER BY ts DESC LIMIT 1",
+        (instrument_id,),
+    ).fetchone()
+    assert row is not None  # latest_reference_price already proved a row exists
+    return row[0]
 
 
 def _drop_portfolio_orders_from_book(book: OpenOrderBook, portfolio_id: int) -> list[int]:

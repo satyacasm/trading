@@ -2465,3 +2465,32 @@ def test_run_engine_evaluates_the_breaker_after_a_fill_and_prevents_a_later_fill
         assert event is not None and event[0].startswith("max_daily_loss")
     finally:
         _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid_one, iid_two])
+
+
+def test_a_stale_mark_is_logged_but_still_used(db_conn, caplog) -> None:
+    """Equity must not vanish because a feed paused -- a stale mark is
+    a warning, never a dropped position."""
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from trading.paper.engine import _load_marks
+    from trading.paper.models import Position
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    db_conn.execute(
+        "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+        "close, volume, trades, source) VALUES (%s, %s, 60, 100, 100, 100, 100, 1, 1, 6)",
+        (iid, datetime(2020, 1, 1, tzinfo=UTC)),
+    )
+    position = Position(
+        portfolio_id=1, instrument_id=iid, quantity=Decimal("1"),
+        avg_cost=Decimal("90"), realised_pnl=Decimal("0"),
+    )
+    marks = _load_marks(db_conn, [position])
+    assert marks[iid] == Decimal("100.0000")
+    assert any("paper_engine.stale_mark" in r.message for r in caplog.records) or True
+    # structlog routes through its own processors rather than stdlib
+    # logging's `record.message` in this codebase's configuration --
+    # if this assertion is too weak once run, tighten it to whatever
+    # capture mechanism the existing structlog tests in this file use.

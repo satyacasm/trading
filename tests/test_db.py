@@ -4,7 +4,6 @@ next .get(), with the same 1s-30s backoff resilient_pubsub uses."""
 from __future__ import annotations
 
 import psycopg
-import pytest
 
 from trading.db import ReconnectingConnection
 

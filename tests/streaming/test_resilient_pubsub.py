@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
 import redis
 import redis.asyncio as aioredis
 
@@ -18,7 +17,8 @@ class _FakePubSub:
     it is called -- exactly the seam resilient_messages watches."""
 
     def __init__(self, behaviors):
-        self._behaviors = behaviors  # shared with the client: consumption must advance across reconnects
+        # shared with the client: consumption must advance across reconnects
+        self._behaviors = behaviors
         self.subscribed_patterns: list[str] = []
         self.closed = 0
 
@@ -170,7 +170,8 @@ def test_sync_resilient_pubsub_reconnects_on_a_connection_error():
 
     class _FakeSyncPubSub:
         def __init__(self, behaviors):
-            self._behaviors = behaviors  # shared with the client: consumption must advance across reconnects
+            # shared with the client: consumption must advance across reconnects
+            self._behaviors = behaviors
 
         def psubscribe(self, *patterns):
             pass
@@ -196,6 +197,58 @@ def test_sync_resilient_pubsub_reconnects_on_a_connection_error():
     assert sub.get_message(timeout=1.0) is None  # the reconnect attempt itself
     assert sub.get_message(timeout=1.0) == {"type": "pmessage", "data": "ok"}
     assert calls == [1.0]
+
+
+def test_resubscribe_retries_with_backoff_instead_of_raising_when_redis_is_still_down():
+    """I4: the old code called `_subscribe` for the reconnect outside any
+    try/except, so a psubscribe that fails because Redis is still down
+    (not yet the listen() call, the resubscribe itself) escaped
+    resilient_messages entirely and killed the consumer. psubscribe fails
+    twice here before succeeding; no exception must escape, and each
+    failed attempt must still back off and escalate like a listen()
+    failure does."""
+    calls: list[float] = []
+
+    class _FlakyResubscribePubSub(_FakePubSub):
+        def __init__(self, behaviors, fail_counter):
+            super().__init__(behaviors)
+            self._fail_counter = fail_counter
+
+        async def psubscribe(self, *patterns):
+            if self._fail_counter[0] > 0:
+                self._fail_counter[0] -= 1
+                raise ConnectionError("still down")
+            await super().psubscribe(*patterns)
+
+    class _FlakyResubscribeRedis:
+        def __init__(self, behaviors, fail_counter):
+            self._behaviors = behaviors
+            self._fail_counter = fail_counter
+            self.pubsub_calls = 0
+
+        def pubsub(self):
+            self.pubsub_calls += 1
+            return _FlakyResubscribePubSub(self._behaviors, self._fail_counter)
+
+    async def _sleep(seconds):
+        calls.append(seconds)
+
+    behaviors = ["raise", [{"type": "pmessage", "data": "after-reconnect"}]]
+    fail_counter = [2]  # the reconnect's psubscribe fails twice, then succeeds
+    fake = _FlakyResubscribeRedis(behaviors, fail_counter)
+    # Hand in an already-subscribed pubsub for the *first* connection (same
+    # seam the "pre-subscribed" test above uses) so only the reconnect's
+    # resubscribe goes through the flaky fake.pubsub() -- isolating the one
+    # thing this test is about.
+    pre_subscribed = _FakePubSub(behaviors)
+    agen = resilient_messages(fake, patterns=["ticks:*"], sleep=_sleep, pubsub=pre_subscribed)
+
+    out = asyncio.run(_collect(agen, 1))
+    assert out == [{"type": "pmessage", "data": "after-reconnect"}]
+    # 1.0 for the original disconnect, then 2.0 and 4.0 for the two failed
+    # resubscribe attempts -- one continuously escalating backoff, not a
+    # reset in between.
+    assert calls == [1.0, 2.0, 4.0]
 
 
 def test_confirm_only_sessions_still_back_off_and_escalate():
@@ -238,7 +291,8 @@ def test_sync_resilient_pubsub_confirmation_does_not_reset_an_escalated_backoff(
 
     class _FakeConfirmSyncPubSub:
         def __init__(self, behaviors):
-            self._behaviors = behaviors  # shared with the client: consumption must advance across reconnects
+            # shared with the client: consumption must advance across reconnects
+            self._behaviors = behaviors
 
         def psubscribe(self, *patterns):
             pass
@@ -268,3 +322,50 @@ def test_sync_resilient_pubsub_confirmation_does_not_reset_an_escalated_backoff(
     # backoff kept escalating (1.0 -> 2.0) -- the confirmation must not have
     # reset it back to 1.0 between the two failures.
     assert calls == [1.0, 2.0]
+
+
+def test_sync_reconnect_retries_with_backoff_instead_of_raising_when_redis_is_still_down():
+    """I4's sync twin: the old code called `self._connect()` in the
+    except branch outside any try, so a reconnect attempt failing because
+    Redis is still down (not yet the next get_message()) raised straight
+    out of get_message() and killed the supervisor. `client.pubsub()`
+    fails twice here before succeeding; no exception must escape."""
+    calls: list[float] = []
+
+    class _FlakyReconnectSyncPubSub:
+        def __init__(self, behaviors):
+            # shared with the client: consumption must advance across reconnects
+            self._behaviors = behaviors
+
+        def psubscribe(self, *patterns):
+            pass
+
+        def get_message(self, timeout=None):
+            behavior = self._behaviors.pop(0)
+            if behavior == "raise":
+                raise redis.exceptions.ConnectionError("reset")
+            return behavior
+
+    class _FlakyReconnectSyncClient:
+        def __init__(self, behaviors, fail_counter):
+            self._behaviors = behaviors
+            self._fail_counter = fail_counter
+
+        def pubsub(self):
+            if self._fail_counter[0] > 0:
+                self._fail_counter[0] -= 1
+                raise redis.exceptions.ConnectionError("still down")
+            return _FlakyReconnectSyncPubSub(self._behaviors)
+
+    behaviors = ["raise", {"type": "pmessage", "data": "ok"}]
+    fail_counter = [0]  # construction itself must succeed
+    sub = SyncResilientPubSub(
+        lambda: _FlakyReconnectSyncClient(behaviors, fail_counter),
+        patterns=["ticks:*"],
+        sleep=calls.append,
+    )
+    fail_counter[0] = 2  # only the reconnect after the first failure struggles
+
+    assert sub.get_message(timeout=1.0) is None  # the reconnect attempt itself, twice-flaky
+    assert sub.get_message(timeout=1.0) == {"type": "pmessage", "data": "ok"}
+    assert calls == [1.0, 2.0, 4.0]

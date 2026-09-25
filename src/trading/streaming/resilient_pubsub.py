@@ -107,7 +107,20 @@ async def resilient_messages(
             log.warning("resilient_pubsub.reconnecting", backoff=backoff)
             await sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
-        pubsub = await _subscribe(redis_client, patterns, channels)
+        # I4: resubscribing can itself fail if Redis is still down -- that
+        # used to raise straight out of this generator and end the
+        # consumer for good. Retry with the same escalating backoff
+        # (continuing it, not resetting) until it succeeds; this loop
+        # never raises.
+        while True:
+            try:
+                pubsub = await _subscribe(redis_client, patterns, channels)
+                break
+            except Exception as exc:  # noqa: BLE001 - a failed resubscribe must
+                # never escape and kill the consumer -- back off and retry.
+                log.warning("resilient_pubsub.resubscribe_failed", reason=str(exc))
+                await sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
 
 
 class SyncResilientPubSub:
@@ -151,9 +164,7 @@ class SyncResilientPubSub:
             message = self._pubsub.get_message(timeout=timeout)
         except redis.exceptions.RedisError as exc:
             log.warning("resilient_pubsub.sync_disconnected", reason=str(exc))
-            self._sleep(self._backoff)
-            self._backoff = min(self._backoff * 2, self._max_backoff)
-            self._pubsub = self._connect()
+            self._reconnect_with_backoff()
             return None
         if message is None:
             return None
@@ -161,3 +172,23 @@ class SyncResilientPubSub:
             return None  # subscribe/psubscribe confirmation -- not a real message, no backoff reset
         self._backoff = _INITIAL_BACKOFF
         return message
+
+    def _reconnect_with_backoff(self) -> None:
+        """I4: reconnecting can itself fail if Redis is still down -- that
+        used to raise straight out of get_message() and kill the caller
+        (the live supervisor). Retry with the same escalating backoff
+        until it succeeds; this never raises. M4: close the old pubsub
+        first (best-effort) so a repeated disconnect doesn't leak one
+        socket per attempt."""
+        try:
+            self._pubsub.close()
+        except Exception:  # noqa: BLE001 - cleanup must never itself crash the caller
+            log.debug("resilient_pubsub.sync_cleanup_failed", exc_info=True)
+        while True:
+            self._sleep(self._backoff)
+            self._backoff = min(self._backoff * 2, self._max_backoff)
+            try:
+                self._pubsub = self._connect()
+                return
+            except redis.exceptions.RedisError as exc:
+                log.warning("resilient_pubsub.sync_resubscribe_failed", reason=str(exc))

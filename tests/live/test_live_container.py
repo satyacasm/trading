@@ -176,3 +176,101 @@ def test_a_redelivered_bar_neither_kills_the_run_nor_trades_twice() -> None:
     assert duplicate["alive"] is True
     # Three distinct minutes, three buys -- not four.
     assert sum(len(f["orders"]) for f in order_frames) == 3
+
+
+STATEFUL_STRATEGY = (
+    textwrap.dedent(
+        """
+        from decimal import Decimal
+        from platform_sdk import DataRequest, InstrumentRef, Strategy, StrategyManifest
+
+
+        class MyStrategy(Strategy):
+            def configure(self):
+                return StrategyManifest(
+                    name="stateful-probe",
+                    version="1.0.0",
+                    universe=[InstrumentRef(exchange="NSE", segment="CM", symbol="RELIANCE")],
+                    data=DataRequest(bars="1m", history_bars=1),
+                    capital=Decimal("100000"),
+                    base_currency="INR",
+                )
+
+            def on_bar(self, ctx, bars):
+                ctx.state["seen"] = ctx.state.get("seen", 0) + 1
+                ctx.state["last_catchup"] = ctx.is_catchup
+        """
+    ).strip()
+    + "\n"
+)
+
+
+def _run_stateful_container(stream: bytes) -> list[dict]:
+    proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        _docker_args(SandboxLimits(), "live-state-test"),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = proc.communicate(input=stream, timeout=90)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    frames = [f for f in (decode_frame(line) for line in stdout.decode().splitlines()) if f]
+    order_frames = [f for f in frames if f["type"] == FRAME_ORDERS]
+    assert order_frames, (stdout.decode()[:1500], stderr.decode()[:1500])
+    return order_frames
+
+
+def test_ctx_state_is_included_in_every_orders_frame() -> None:
+    payload = encode_payload(
+        SmokePayload(
+            mode=MODE_LIVE, source=STATEFUL_STRATEGY, starting_cash=Decimal("100000"),
+            slippage_bps=Decimal("0"),
+        )
+    )
+    stream = (
+        b"%d\n" % len(payload) + payload
+        + _bar_frame(0, "100").encode()
+        + _bar_frame(1, "101").encode()
+        + encode_frame(FRAME_STOP).encode()
+    )
+    frames = _run_stateful_container(stream)
+    assert [f["state"]["seen"] for f in frames] == [1, 2]
+    assert [f["state"]["last_catchup"] for f in frames] == [False, False]
+
+
+def test_a_relaunched_run_sees_its_previous_ctx_state() -> None:
+    """The container test design §5.2 asks for by name: a relaunch
+    restores ctx.state rather than starting the strategy cold."""
+    first_payload = encode_payload(
+        SmokePayload(
+            mode=MODE_LIVE, source=STATEFUL_STRATEGY, starting_cash=Decimal("100000"),
+            slippage_bps=Decimal("0"),
+        )
+    )
+    first_stream = (
+        b"%d\n" % len(first_payload) + first_payload
+        + _bar_frame(0, "100").encode()
+        + encode_frame(FRAME_STOP).encode()
+    )
+    first_frames = _run_stateful_container(first_stream)
+    carried_state = first_frames[-1]["state"]
+    assert carried_state["seen"] == 1
+
+    second_payload = encode_payload(
+        SmokePayload(
+            mode=MODE_LIVE, source=STATEFUL_STRATEGY, starting_cash=Decimal("100000"),
+            slippage_bps=Decimal("0"), strategy_state=carried_state,
+        )
+    )
+    second_stream = (
+        b"%d\n" % len(second_payload) + second_payload
+        + _bar_frame(1, "101").encode()
+        + encode_frame(FRAME_STOP).encode()
+    )
+    second_frames = _run_stateful_container(second_stream)
+    # A fresh container would show seen=1; a relaunch restoring state
+    # shows it continuing from where the first container left off.
+    assert second_frames[0]["state"]["seen"] == 2

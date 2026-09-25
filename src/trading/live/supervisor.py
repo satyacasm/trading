@@ -679,7 +679,7 @@ def run_supervisor(stop: threading.Event | None = None) -> None:
     wake-up for ANY instrument is reason enough to check every run.
     """
     settings = get_settings()
-    api_url = "http://localhost:8000"
+    api_url = settings.gateway_url
     db = ReconnectingConnection(settings.database_url, autocommit=True)
     pubsub = SyncResilientPubSub(
         lambda: redis.Redis.from_url(settings.redis_url, decode_responses=True),

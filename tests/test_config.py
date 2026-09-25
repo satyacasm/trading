@@ -133,3 +133,19 @@ def test_live_resilience_thresholds_have_spec_defaults(monkeypatch, tmp_path):
     assert s.stale_price_seconds == 180
     assert s.heartbeat_ttl_seconds == 30
     assert s.heartbeat_refresh_seconds == 10
+
+
+def test_gateway_url_defaults_to_loopback_8010_and_mcp_follows_it(monkeypatch, tmp_path):
+    """8000 collides with another project's container on this machine, and
+    `localhost` can resolve to ::1 where that container listens -- so the
+    gateway lives on 127.0.0.1:8010, and the MCP server finds it there."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+    monkeypatch.delenv("GATEWAY_URL", raising=False)
+    monkeypatch.delenv("MCP_GATEWAY_URL", raising=False)
+
+    s = Settings(_env_file=None)
+
+    assert s.gateway_url == "http://127.0.0.1:8010"
+    assert s.mcp_gateway_url == s.gateway_url

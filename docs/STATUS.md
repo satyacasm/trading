@@ -404,8 +404,8 @@ Run it with:
 
 ```bash
 uv run python -m trading.live.supervisor
-curl -X POST localhost:8000/strategies/{id}/live -d '{"portfolio_id":9}'
-curl -X POST localhost:8000/live/{run_id}/stop
+curl -X POST 127.0.0.1:8010/strategies/{id}/live -d '{"portfolio_id":9}'
+curl -X POST 127.0.0.1:8010/live/{run_id}/stop
 ```
 
 ### How it works, and why not the way §166 says
@@ -1062,7 +1062,7 @@ schema fails every fill insert); `0010` adds the strategy registry. Both
 
 ```bash
 uv run alembic upgrade head
-uv run uvicorn trading.streaming.gateway:app --reload --port 8000
+uv run uvicorn trading.streaming.gateway:app --reload --host 127.0.0.1 --port 8010
 uv run python -m trading.streaming.crypto_ingestor      # Binance, 24/7
 uv run python -m trading.streaming.bar_aggregator
 uv run python -m trading.streaming.upstox_ingestor      # NSE session only

@@ -15,7 +15,7 @@ bash deploy/install-live-stack.sh install
 Verify every component is up:
 
 ```bash
-curl -s http://localhost:8000/health | python3 -m json.tool
+curl -s http://127.0.0.1:8010/health | python3 -m json.tool
 ```
 
 `"ok": true` and every component `true`. If any is `false`, check
@@ -30,10 +30,10 @@ recent (step 4's query, with the time window narrowed to a minute or two).
 ## 2. Start a paper run
 
 ```bash
-curl -s -X POST http://localhost:8000/strategies -H 'content-type: application/json' \
+curl -s -X POST http://127.0.0.1:8010/strategies -H 'content-type: application/json' \
   -d '{"source": "<a strategy trading BTC-USDT 1m>"}'
 # note the returned strategy_id, then:
-curl -s -X POST "http://localhost:8000/strategies/<strategy_id>/live" \
+curl -s -X POST "http://127.0.0.1:8010/strategies/<strategy_id>/live" \
   -H 'content-type: application/json' -d '{"portfolio_id": <a portfolio id>}'
 # note the returned live_run_id
 ```
@@ -41,7 +41,7 @@ curl -s -X POST "http://localhost:8000/strategies/<strategy_id>/live" \
 ## 3. Verify it's actually running
 
 ```bash
-curl -s "http://localhost:8000/live/<live_run_id>" | python3 -m json.tool
+curl -s "http://127.0.0.1:8010/live/<live_run_id>" | python3 -m json.tool
 psql "$DATABASE_URL" -c \
   "SELECT instrument_id, last_ts FROM live_run_cursors WHERE live_run_id=<live_run_id>"
 ```
@@ -167,6 +167,6 @@ step) or a colima restart does.
 ## 8. Clean up
 
 ```bash
-curl -s -X POST "http://localhost:8000/strategies/<strategy_id>/live/stop"
+curl -s -X POST "http://127.0.0.1:8010/strategies/<strategy_id>/live/stop"
 bash deploy/install-live-stack.sh uninstall   # only if this was a one-off drill
 ```

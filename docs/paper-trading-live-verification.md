@@ -27,7 +27,7 @@ trading calendar. Check `trading_calendar` for today before starting; if
 ```bash
 docker compose up -d                      # timescaledb, redis, redis_test
 uv run alembic upgrade head               # must include 0009_fills_tds_charge
-uv run uvicorn trading.streaming.gateway:app --port 8000
+uv run uvicorn trading.streaming.gateway:app --host 127.0.0.1 --port 8010
 uv run python -m trading.streaming.crypto_ingestor
 uv run python -m trading.streaming.bar_aggregator
 uv run python -m trading.streaming.upstox_ingestor      # NSE session only

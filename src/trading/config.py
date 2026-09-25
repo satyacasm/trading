@@ -76,7 +76,13 @@ class Settings(BaseSettings):
     # routes a browser uses rather than touching the database, so that
     # every invariant -- market hours, sufficient cash, contract filters,
     # the breaker -- keeps exactly one enforcement path.
-    mcp_gateway_url: str = "http://localhost:8000"
+    mcp_gateway_url: str = "http://127.0.0.1:8010"
+
+    # Where the gateway listens (deploy/launchd/...gateway.plist must
+    # match) and where the live supervisor places orders. Not 8000: that
+    # port is taken by another project's container on this machine, and
+    # `localhost` can resolve to ::1, where that container listens.
+    gateway_url: str = "http://127.0.0.1:8010"
 
     # Comma-separated `token:portfolio_id` pairs, in the style of
     # `cors_allow_origins`. A token binds an agent to exactly one

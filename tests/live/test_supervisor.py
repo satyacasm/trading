@@ -852,3 +852,37 @@ def test_a_relaunched_runs_next_order_never_reuses_an_idempotency_key(
 
     assert captured["idempotency_key"] == f"live-{live_run_id}-42"
     assert run.orders_placed == 43
+
+
+def test_run_supervisor_places_orders_through_the_configured_gateway_url(monkeypatch) -> None:  # noqa: ANN001
+    """The supervisor used to hardcode http://localhost:8000."""
+    from trading.config import get_settings
+    from trading.live import supervisor
+
+    stop = threading.Event()
+
+    class _FakeDB:
+        def get(self):  # noqa: ANN202
+            return MagicMock()
+
+    class _FakePubSub:
+        def get_message(self, timeout):  # noqa: ANN001, ANN202, ARG002
+            return None
+
+    monkeypatch.setattr(supervisor, "ReconnectingConnection", lambda *a, **k: _FakeDB())  # noqa: ARG005
+    monkeypatch.setattr(supervisor, "SyncResilientPubSub", lambda *a, **k: _FakePubSub())  # noqa: ARG005
+    run = _run([], live_run_id=1)
+    monkeypatch.setattr(supervisor, "reconcile", lambda conn, runs: runs.setdefault(1, run))  # noqa: ARG005
+
+    seen: list[str] = []
+
+    def _fake_deliver(conn, api_url, run, now):  # noqa: ANN001, ANN202, ARG001
+        seen.append(api_url)
+        stop.set()
+        return True
+
+    monkeypatch.setattr(supervisor, "deliver_pending", _fake_deliver)
+
+    supervisor.run_supervisor(stop)
+
+    assert seen == [get_settings().gateway_url]

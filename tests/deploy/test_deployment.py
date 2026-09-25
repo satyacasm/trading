@@ -61,13 +61,19 @@ def test_no_other_service_is_prefixed_with_caffeinate() -> None:
         assert args[0] != "/usr/bin/caffeinate"
 
 
-def test_gateway_runs_uvicorn_on_loopback_8000() -> None:
+def test_gateway_runs_uvicorn_on_the_configured_loopback_port() -> None:
+    """The plist's --host/--port must match Settings.gateway_url, which the
+    supervisor and the MCP server use to reach it."""
+    from urllib.parse import urlsplit
+
+    from trading.config import Settings
+
+    url = urlsplit(Settings.model_fields["gateway_url"].default)
     args = _plist("gateway")["ProgramArguments"]
-    joined = " ".join(args)
-    assert "uvicorn" in joined
-    assert "trading.streaming.gateway:app" in joined
-    assert "127.0.0.1" in joined
-    assert "8000" in joined
+    assert "uvicorn" in args
+    assert "trading.streaming.gateway:app" in args
+    assert args[args.index("--host") + 1] == url.hostname == "127.0.0.1"
+    assert args[args.index("--port") + 1] == str(url.port)
 
 
 def test_mcp_runs_uvicorn_on_loopback_8931() -> None:

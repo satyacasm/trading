@@ -2467,7 +2467,7 @@ def test_run_engine_evaluates_the_breaker_after_a_fill_and_prevents_a_later_fill
         _cleanup(setup_conn, portfolio_ids=[pid], instrument_ids=[iid_one, iid_two])
 
 
-def test_a_stale_mark_is_logged_but_still_used(db_conn, caplog) -> None:
+def test_a_stale_mark_is_logged_but_still_used(db_conn) -> None:
     """Equity must not vanish because a feed paused -- a stale mark is
     a warning, never a dropped position."""
     from datetime import UTC, datetime
@@ -2487,10 +2487,11 @@ def test_a_stale_mark_is_logged_but_still_used(db_conn, caplog) -> None:
         portfolio_id=1, instrument_id=iid, quantity=Decimal("1"),
         avg_cost=Decimal("90"), realised_pnl=Decimal("0"),
     )
-    marks = _load_marks(db_conn, [position])
+    with structlog.testing.capture_logs() as cap:
+        marks = _load_marks(db_conn, [position])
     assert marks[iid] == Decimal("100.0000")
-    assert any("paper_engine.stale_mark" in r.message for r in caplog.records) or True
-    # structlog routes through its own processors rather than stdlib
-    # logging's `record.message` in this codebase's configuration --
-    # if this assertion is too weak once run, tighten it to whatever
-    # capture mechanism the existing structlog tests in this file use.
+
+    warnings = [e for e in cap if e.get("event") == "paper_engine.stale_mark"]
+    assert len(warnings) == 1
+    assert warnings[0]["instrument_id"] == iid
+    assert warnings[0]["age_seconds"] > 180

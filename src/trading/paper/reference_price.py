@@ -33,15 +33,25 @@ def latest_reference_price(
 ) -> tuple[Decimal, datetime] | StalePrice | None:
     """The latest `bars_intraday` close for `instrument_id`, or `None`
     if there has never been one, or a `StalePrice` if the latest is
-    older than `max_age` as of `now`."""
+    older than `max_age` as of `now`.
+
+    `bars_intraday.ts` is the bar's *open* time, not when it closed --
+    a just-closed 1m bar is already `interval_sec` seconds old the
+    instant it lands. Staleness is therefore measured from the bar's
+    close (`ts + interval_sec`), not from `ts` itself, or a fresh bar
+    would be reported stale by up to one interval's width before it
+    ever could be.
+    """
     row = conn.execute(
-        "SELECT close, ts FROM bars_intraday WHERE instrument_id = %s ORDER BY ts DESC LIMIT 1",
+        "SELECT close, ts, interval_sec FROM bars_intraday"
+        " WHERE instrument_id = %s ORDER BY ts DESC LIMIT 1",
         (instrument_id,),
     ).fetchone()
     if row is None:
         return None
-    close, ts = row
-    age = (now - ts).total_seconds()
+    close, ts, interval_sec = row
+    closed_at = ts + timedelta(seconds=interval_sec)
+    age = (now - closed_at).total_seconds()
     if age > max_age.total_seconds():
         return StalePrice(instrument_id=instrument_id, ts=ts, age_seconds=age)
     return close, ts

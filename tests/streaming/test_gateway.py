@@ -8,7 +8,7 @@ import pytest
 import redis
 from fastapi.testclient import TestClient
 
-from trading.streaming.gateway import app, get_db_connection
+from trading.streaming.gateway import _HEALTH_COMPONENTS, app, get_db_connection
 from trading.streaming.seed_instruments import CRYPTO_PAIRS, seed_crypto_instruments
 from trading.streaming.seed_upstox_instruments import UPSTOX_WATCHLIST
 
@@ -283,6 +283,7 @@ def test_health_reports_each_component_present_or_absent(client: TestClient, red
     assert body["components"]["bar_aggregator"] is True
     assert body["components"]["crypto_ingestor"] is False
     assert body["ok"] is False  # not every component is up
+    assert set(body["components"]) == set(_HEALTH_COMPONENTS)
 
 
 def test_health_performs_no_writes(client: TestClient, redis_client) -> None:

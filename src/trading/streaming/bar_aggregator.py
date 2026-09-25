@@ -455,23 +455,36 @@ async def _startup_spot_backfill(
 
 
 async def _run_tracked_backfill(
-    in_flight: dict[int, asyncio.Task[None]], instrument_id: int, coro: Any
+    in_flight: dict[int, set[asyncio.Task[None]]], instrument_id: int, coro: Any
 ) -> None:
     """Run a backfill coroutine as a Task registered in `in_flight` for
     the duration of the call (I1a). `_write_all` checks this dict before
     writing a newer tick-aggregated bar for the same instrument, so a
     slow backfill (silence trigger or sweep) can't land behind a tick bar
-    that raced ahead of it in Postgres. Removes its own entry when done,
-    whether it succeeds or raises (backfill helpers already swallow their
-    own exceptions, but this must never leave a stale entry behind on the
-    off chance one doesn't)."""
+    that raced ahead of it in Postgres.
+
+    A *set* per instrument, not a single slot: the silence trigger and
+    the sweep can both have a backfill running for the same instrument
+    at once (found live -- a plain single-task slot let the second
+    registration silently overwrite the first, so a tick write waiting
+    on "the" in-flight task could stop waiting the moment the *second*
+    one finished, while the first was still racing it into Postgres).
+    The set itself holds the only strong reference to each task between
+    `create_task` and this coroutine's own `await`, keeping it alive.
+    Each task removes only itself when done, whether it succeeds or
+    raises (backfill helpers already swallow their own exceptions, but
+    this must never leave a stale entry behind on the off chance one
+    doesn't)."""
     task = asyncio.ensure_future(coro)
-    in_flight[instrument_id] = task
+    in_flight.setdefault(instrument_id, set()).add(task)
     try:
         await task
     finally:
-        if in_flight.get(instrument_id) is task:
-            del in_flight[instrument_id]
+        tasks = in_flight.get(instrument_id)
+        if tasks is not None:
+            tasks.discard(task)
+            if not tasks:
+                del in_flight[instrument_id]
 
 
 def _log_late_fill(instrument_id: int, before: datetime | None, inserted: list[Any]) -> None:
@@ -570,7 +583,7 @@ async def _sweep_backfill(
     window_minutes: int,
     to_thread: Callable[..., Any],
     fetch: Any = None,
-    in_flight: dict[int, asyncio.Task[None]] | None = None,
+    in_flight: dict[int, set[asyncio.Task[None]]] | None = None,
 ) -> None:
     """Safety net: re-check the last `window_minutes` for every crypto
     spot instrument, whether or not a silence was ever detected for it.
@@ -722,7 +735,11 @@ async def run_aggregation_loop(
     # for an instrument with a backfill still running waits for it first,
     # so Postgres keeps receiving ts in order for that instrument instead
     # of a slow backfill landing behind a tick bar that raced ahead of it.
-    in_flight_backfills: dict[int, asyncio.Task[None]] = {}
+    # A set per instrument (not a single task): the silence trigger and
+    # the sweep can both have one running for the same instrument at
+    # once, and a write must wait for all of them, not just whichever
+    # registered last.
+    in_flight_backfills: dict[int, set[asyncio.Task[None]]] = {}
 
     async def _backfill_discarded_startup_bucket(instrument_id: int, bucket: datetime) -> None:
         """I2: the bucket already running at startup is discarded above
@@ -766,20 +783,49 @@ async def run_aggregation_loop(
 
     async def _write_all(closed_bars: list[ClosedBar]) -> None:
         nonlocal written
-        # Fetched once per batch (I5), not held for the process's life --
-        # a ReconnectingConnection.get() here repairs a dead connection
-        # (e.g. a Postgres restart) before the next batch's writes.
-        write_conn = get_write_conn()
+        if not closed_bars:
+            # _write_all runs on every tick (most close nothing) and every
+            # periodic flush check (most find nothing stale) -- fetching a
+            # connection here unconditionally meant a SELECT 1 probe round
+            # trip per tick even when there was nothing to write. Nothing
+            # below this needs a connection when there's nothing to write.
+            return
+        # Fetched off the event loop (I5 follow-up), inside try/except:
+        # ReconnectingConnection.get() sleeps its backoff synchronously
+        # when Postgres is down, then can still raise -- on the event
+        # loop that would block everything else scheduled on it (every
+        # other tick, the flush, the sweep) for the backoff's duration
+        # and then kill the whole gather/process. A failure here is
+        # logged and this batch is skipped: BarAggregator has already
+        # dropped these closed_bars from its own open-bucket state (a
+        # closed bucket is not re-opened), so they are not requeued
+        # anywhere -- the sweep's REST re-check repairs the gap for
+        # crypto spot instruments once Postgres is back, the same as any
+        # other missed write.
+        try:
+            write_conn = await to_thread(get_write_conn)
+        except Exception as exc:  # noqa: BLE001 - a DB outage must never kill the consumer
+            log.warning(
+                "bar_aggregator.db_unavailable",
+                instrument_ids=sorted({closed.instrument_id for closed in closed_bars}),
+                reason=str(exc),
+            )
+            return
         for closed in closed_bars:
-            backfill_task = in_flight_backfills.get(closed.instrument_id)
-            if backfill_task is not None:
+            backfill_tasks = list(in_flight_backfills.get(closed.instrument_id, ()))
+            if backfill_tasks:
                 try:
                     await asyncio.wait_for(
-                        asyncio.shield(backfill_task), timeout=backfill_wait_timeout_seconds
+                        asyncio.shield(
+                            asyncio.gather(*backfill_tasks, return_exceptions=True)
+                        ),
+                        timeout=backfill_wait_timeout_seconds,
                     )
                 except Exception as exc:  # noqa: BLE001 - a timeout (the common case)
-                    # or any other failure waiting on the backfill must never
-                    # block writing the newer tick bar -- log and proceed.
+                    # or any other failure waiting on the backfill(s) must
+                    # never block writing the newer tick bar -- log and
+                    # proceed. One bound covers all of this instrument's
+                    # in-flight tasks together, not one bound per task.
                     log.warning(
                         "bar_aggregator.backfill_wait_failed",
                         instrument_id=closed.instrument_id,
@@ -825,7 +871,17 @@ async def run_aggregation_loop(
 
     async def _write_upstox_bar(bar: Bar) -> None:
         nonlocal written
-        write_conn = get_write_conn()  # fetched per batch (I5), same as _write_all
+        # Off the event loop, inside try/except -- same reasoning as
+        # _write_all's identical fetch (I5 follow-up).
+        try:
+            write_conn = await to_thread(get_write_conn)
+        except Exception as exc:  # noqa: BLE001 - a DB outage must never kill the consumer
+            log.warning(
+                "bar_aggregator.db_unavailable",
+                instrument_ids=[bar.instrument_id],
+                reason=str(exc),
+            )
+            return
         try:
             write_upstox_bar(write_conn, bar, interval_seconds=interval_seconds)
         except Exception as exc:  # noqa: BLE001 - a single unwritable bar (e.g.

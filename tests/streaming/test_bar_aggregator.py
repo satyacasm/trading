@@ -1354,6 +1354,141 @@ def test_write_conn_factory_is_fetched_fresh_per_write_batch(
     assert rows == [(Decimal("1.0000"),), (Decimal("2.0000"),)]
 
 
+def test_write_conn_factory_failure_is_logged_and_the_batch_is_skipped_not_fatal(
+    db_conn, redis_client: redis.Redis
+) -> None:
+    """I5 follow-up: `_write_all` used to call `write_conn_factory()`
+    (a `ReconnectingConnection.get()` in production) directly on the
+    event loop -- when Postgres is down it sleeps its backoff
+    synchronously there, then can still raise, which used to kill the
+    whole `asyncio.gather`/process. It must now be fetched off the loop
+    and any failure logged and skipped, never fatal -- the loop must
+    survive and the *next* batch's write must land once the factory
+    recovers. This batch's own closed bar is not requeued anywhere
+    (BarAggregator has already dropped it from its own state); a real
+    crypto instrument's gap would be repaired by the sweep instead."""
+    import psycopg
+    import structlog.testing
+
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    base = datetime.now(UTC) + timedelta(minutes=3)
+
+    calls = {"n": 0}
+
+    def _write_conn_factory():
+        calls["n"] += 1
+        # Call 1 is the startup excluded-instrument-ids query (must
+        # succeed so the loop starts at all); call 2 is the first
+        # write batch -- that one fails.
+        if calls["n"] == 2:
+            raise psycopg.OperationalError("could not connect to server")
+        return db_conn
+
+    with structlog.testing.capture_logs() as cap:
+        async_redis: AsyncRedis = AsyncRedis.from_url(
+            get_settings().redis_url, decode_responses=True
+        )
+        try:
+            loop_task = run_aggregation_loop(
+                async_redis,
+                db_conn,
+                sleep=_no_sleep,
+                max_bars_written=1,
+                pattern=pattern,
+                write_conn_factory=_write_conn_factory,
+            )
+
+            async def _publish_after_subscribed() -> None:
+                await asyncio.sleep(0.2)
+                redis_client.publish(channel, _tick_json(iid, base.isoformat(), "1.00"))
+                redis_client.publish(
+                    channel,
+                    _tick_json(
+                        iid, (base + timedelta(minutes=1, seconds=5)).isoformat(), "2.00"
+                    ),
+                )
+                redis_client.publish(
+                    channel,
+                    _tick_json(
+                        iid, (base + timedelta(minutes=2, seconds=5)).isoformat(), "3.00"
+                    ),
+                )
+
+            asyncio.run(_run_both(loop_task, _publish_after_subscribed()))
+        finally:
+            asyncio.run(async_redis.aclose())
+
+    rows = db_conn.execute(
+        "SELECT close FROM bars_intraday WHERE instrument_id = %s ORDER BY ts", (iid,)
+    ).fetchall()
+    # The first batch (tick1's bucket) was lost -- its connection fetch
+    # raised. The second batch (tick2's bucket) landed once the factory
+    # recovered, and the loop never crashed.
+    assert rows == [(Decimal("2.0000"),)]
+    unavailable_logs = [e for e in cap if e.get("event") == "bar_aggregator.db_unavailable"]
+    assert len(unavailable_logs) == 1
+    assert unavailable_logs[0]["instrument_ids"] == [iid]
+
+
+def test_write_all_skips_the_connection_fetch_when_there_is_nothing_to_write(
+    db_conn, redis_client: redis.Redis
+) -> None:
+    """I5 follow-up: `_write_all` ran on every tick (most close nothing)
+    and every periodic flush check (most find nothing stale) -- fetching
+    a connection unconditionally meant a `SELECT 1` probe round trip per
+    tick even with nothing to write. Runs the real loop against a
+    counting `write_conn_factory`, publishes one tick that only *opens*
+    a bucket (closes nothing), then cancels: the factory must have been
+    called exactly once -- the startup `_query_upstox_bound_instrument_ids`
+    query -- and never again."""
+    import contextlib
+
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    base = datetime.now(UTC) + timedelta(minutes=3)
+
+    calls = {"n": 0}
+
+    def _write_conn_factory():
+        calls["n"] += 1
+        return db_conn
+
+    async def _run() -> None:
+        async_redis: AsyncRedis = AsyncRedis.from_url(
+            get_settings().redis_url, decode_responses=True
+        )
+        try:
+            loop_task = asyncio.ensure_future(
+                run_aggregation_loop(
+                    async_redis,
+                    db_conn,
+                    sleep=asyncio.sleep,
+                    flush_check_seconds=10.0,  # keeps the periodic flush from firing here
+                    pattern=pattern,
+                    write_conn_factory=_write_conn_factory,
+                )
+            )
+            await asyncio.sleep(0.2)  # let psubscribe land
+            redis_client.publish(channel, _tick_json(iid, base.isoformat(), "1.00"))
+            await asyncio.sleep(0.3)  # give _write_all([]) a chance to run
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop_task
+        finally:
+            await async_redis.connection_pool.disconnect()
+
+    asyncio.run(_run())
+
+    # Exactly the one startup query -- the tick opened a bucket but
+    # closed nothing, so _write_all([]) never fetched a connection.
+    assert calls["n"] == 1
+
+
 def test_silence_backfill_survives_a_conn_factory_failure(db_conn) -> None:
     """`_silence_backfill` is fired via `asyncio.create_task` from
     `_consume_ticks` and never awaited by its caller -- an unhandled
@@ -1888,3 +2023,96 @@ def test_sweep_backfill_stops_one_bucket_short_of_now(monkeypatch, db_conn) -> N
         implied_now = since + timedelta(minutes=30)
         assert until == bucket_start(implied_now, 60) - timedelta(seconds=60)
         assert until < implied_now
+
+
+def test_a_tick_write_waits_for_all_in_flight_backfills_of_the_same_instrument(
+    db_conn, redis_client: redis.Redis, monkeypatch
+) -> None:
+    """Minor race fix: the in-flight backfill registry used to be one
+    task slot per instrument -- the silence trigger firing twice in a
+    row for the same instrument (a real scenario: it fires again on any
+    later real-time gap past the threshold) overwrote the first
+    registration with the second, so a tick write that checked the
+    registry could stop waiting the moment the *second*, faster backfill
+    finished, while the *first*, slower one was still racing it into
+    Postgres. The registry is now a set per instrument; a write must
+    wait for all of an instrument's in-flight backfills, not just
+    whichever registered last. Here the second-triggered backfill
+    finishes first (fast); the tick write must still wait for the first
+    (slow) one."""
+    from trading.streaming import bar_aggregator as bar_aggregator_module
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    base = datetime.now(UTC) + timedelta(minutes=3)
+
+    write_order: list[str] = []
+    call_index = {"n": 0}
+    real_write_closed_bar = bar_aggregator_module.write_closed_bar
+
+    async def _fake_silence_backfill(
+        conn_factory,
+        aggregator,
+        redis,
+        *,
+        instrument_id,
+        symbol,
+        since,
+        until,
+        to_thread,
+        fetch=None,
+    ):
+        call_index["n"] += 1
+        if call_index["n"] == 1:
+            await asyncio.sleep(0.4)  # the first-triggered backfill: slow
+            write_order.append("backfill1")
+        else:
+            await asyncio.sleep(0.05)  # the second-triggered backfill: fast, finishes first
+            write_order.append("backfill2")
+
+    def _tracking_write_closed_bar(conn, closed, **kwargs):
+        real_write_closed_bar(conn, closed, **kwargs)
+        write_order.append("tick")
+
+    monkeypatch.setattr(bar_aggregator_module, "_silence_backfill", _fake_silence_backfill)
+    monkeypatch.setattr(bar_aggregator_module, "write_closed_bar", _tracking_write_closed_bar)
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(
+            async_redis,
+            db_conn,
+            # real sleep -- keeps the sweep from spinning (backfill_sweep_seconds=300)
+            sleep=asyncio.sleep,
+            max_bars_written=1,
+            pattern=pattern,
+            backfill_conn_factory=lambda: db_conn,
+            backfill_silence_seconds=0.1,
+        )
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)
+            redis_client.publish(channel, _tick_json(iid, base.isoformat(), "1.00"))
+            await asyncio.sleep(0.2)  # exceed backfill_silence_seconds -- triggers backfill #1
+            redis_client.publish(channel, _tick_json(iid, base.isoformat(), "2.00"))
+            await asyncio.sleep(0.2)  # exceed it again -- triggers backfill #2
+            redis_client.publish(channel, _tick_json(iid, base.isoformat(), "3.00"))
+            # Let both backfill tasks register -- stays under
+            # backfill_silence_seconds (0.1) so this doesn't itself
+            # trigger a third, spurious backfill.
+            await asyncio.sleep(0.05)
+            # Closes the bucket via rollover -- must wait for BOTH
+            # in-flight backfills, not just whichever is still registered.
+            redis_client.publish(
+                channel,
+                _tick_json(iid, (base + timedelta(minutes=1, seconds=5)).isoformat(), "4.00"),
+            )
+
+        asyncio.run(
+            asyncio.wait_for(_run_both(loop_task, _publish_after_subscribed()), timeout=10)
+        )
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    assert write_order == ["backfill2", "backfill1", "tick"]

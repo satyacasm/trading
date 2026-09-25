@@ -94,7 +94,9 @@ infrastructure, not just fakes. What shipped:
   `bars_intraday` is recent.
 - **Deployment**: launchd agents for the whole live stack plus a Docker
   restart policy, in `deploy/` (`install-live-stack.sh`,
-  `start-colima.sh`, `provision-sandbox-vm.sh`, and the plists). Every
+  `start-colima.sh`, `provision-sandbox-vm.sh`, and the plists), including
+  the trading MCP server on `127.0.0.1:8931/mcp` (the port Claude Code's
+  `trading` server entry points at; the MCP plan's 8081 is stale). Every
   plist carries a PATH (installed from the operator's own PATH at
   install time) -- launchd's own default PATH is just
   `/usr/bin:/bin:/usr/sbin:/sbin`, which hid `colima` and `docker` from

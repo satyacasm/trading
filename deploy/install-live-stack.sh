@@ -23,6 +23,7 @@ LABELS=(
   com.satyam.trading.paper_alerts
   com.satyam.trading.live_supervisor
   com.satyam.trading.perp_ingestor
+  com.satyam.trading.mcp
 )
 
 cmd="${1:-}"

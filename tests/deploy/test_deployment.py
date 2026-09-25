@@ -24,6 +24,7 @@ _SERVICE_NAMES = (
     "paper_alerts",
     "live_supervisor",
     "perp_ingestor",
+    "mcp",
 )
 
 _ALL_LAUNCHD_NAMES = _SERVICE_NAMES + ("colima",)
@@ -67,6 +68,23 @@ def test_gateway_runs_uvicorn_on_loopback_8000() -> None:
     assert "trading.streaming.gateway:app" in joined
     assert "127.0.0.1" in joined
     assert "8000" in joined
+
+
+def test_mcp_runs_uvicorn_on_loopback_8931() -> None:
+    """Claude Code's `trading` MCP client points at http://127.0.0.1:8931/mcp."""
+    args = _plist("mcp")["ProgramArguments"]
+    joined = " ".join(args)
+    assert "uvicorn" in joined
+    assert "trading.mcp.serve_http:app" in joined
+    assert "127.0.0.1" in joined
+    assert "8931" in joined
+
+
+@pytest.mark.parametrize("name", _ALL_LAUNCHD_NAMES)
+def test_install_script_installs_every_plist(name: str) -> None:
+    """A plist that exists but isn't in LABELS is never installed."""
+    text = (REPO_ROOT / "deploy" / "install-live-stack.sh").read_text()
+    assert f"  com.satyam.trading.{name}\n" in text
 
 
 @pytest.mark.parametrize("name", _ALL_LAUNCHD_NAMES)

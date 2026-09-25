@@ -956,6 +956,58 @@ def test_a_tick_for_a_new_bucket_still_opens_one_after_a_flush() -> None:
     assert aggregator.late_ticks_dropped == 0
 
 
+def test_run_aggregation_loop_still_processes_ticks_when_startup_backfill_fails(
+    db_conn, redis_client: redis.Redis
+) -> None:
+    """The DB (or Binance) can be unreachable when this process starts.
+    A startup backfill failure must be logged and swallowed -- never
+    propagate out of run_aggregation_loop and stop live aggregation
+    from starting at all. The spec's silence trigger and sweep (Task 6)
+    repair the gap later."""
+    import psycopg
+
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    channel, pattern = _isolated_channel_and_pattern(iid)
+    base = datetime.now(UTC) + timedelta(minutes=3)
+
+    def _raising_conn_factory():
+        raise psycopg.OperationalError("could not connect to server")
+
+    async_redis: AsyncRedis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        loop_task = run_aggregation_loop(
+            async_redis,
+            db_conn,
+            sleep=_no_sleep,
+            max_bars_written=1,
+            pattern=pattern,
+            backfill_conn_factory=_raising_conn_factory,
+        )
+
+        async def _publish_after_subscribed() -> None:
+            await asyncio.sleep(0.2)  # give psubscribe time to land before we publish
+            redis_client.publish(channel, _tick_json(iid, base.isoformat(), "65000.00"))
+            redis_client.publish(
+                channel,
+                _tick_json(iid, (base + timedelta(minutes=1, seconds=5)).isoformat(), "65010.00"),
+            )
+
+        asyncio.run(_run_both(loop_task, _publish_after_subscribed()))
+    finally:
+        asyncio.run(async_redis.aclose())
+
+    row = db_conn.execute(
+        "SELECT open, trades FROM bars_intraday WHERE instrument_id = %s",
+        (iid,),
+    ).fetchone()
+    assert row == (Decimal("65000.0000"), 1), (
+        "a startup backfill failure must not stop the loop from subscribing and "
+        "processing live ticks into bars"
+    )
+
+
 def test_seed_closed_through_drops_a_late_tick_for_an_already_written_minute():
     """The actual production bug (design §1 row 4): _closed_through is
     in-memory only, so a late tick after a restart reopened an

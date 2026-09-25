@@ -495,9 +495,21 @@ async def run_aggregation_loop(
     """
     aggregator = BarAggregator(interval_seconds)
     if backfill_conn_factory is not None:
-        await _startup_spot_backfill(
-            backfill_conn_factory, aggregator, redis, to_thread=to_thread, fetch=spot_fetch
-        )
+        # Best-effort: the DB or Binance can be unreachable when this
+        # process starts. A startup backfill failure is logged and
+        # swallowed here -- it must never stop live aggregation from
+        # starting (per-instrument REST/backfill failures are already
+        # caught inside _startup_spot_backfill; this catches the wider
+        # failure of the connection/instrument-query step itself, e.g. a
+        # ReconnectingConnection.get() that can't reconnect at all). The
+        # spec's silence trigger and sweep (Task 6) repair the gap later.
+        try:
+            await _startup_spot_backfill(
+                backfill_conn_factory, aggregator, redis, to_thread=to_thread, fetch=spot_fetch
+            )
+        except Exception as exc:  # noqa: BLE001 - a startup backfill failure must
+            # never block live aggregation from starting
+            log.warning("bar_aggregator.startup_backfill_failed", reason=str(exc))
     first_complete_bucket = bucket_start(datetime.now(UTC), interval_seconds) + timedelta(
         seconds=interval_seconds
     )

@@ -1,6 +1,6 @@
 # Where this project stands
 
-**Updated:** 2026-09-25, ~23:15 IST. Keep this file current — it is the
+**Updated:** 2026-09-26, ~00:03 IST. Keep this file current — it is the
 first thing to read when picking the work back up.
 
 ## Live-stack resilience plan merged (2026-09-25)
@@ -13,11 +13,23 @@ deployment story) is fixed and tested, including now against real
 infrastructure, not just fakes. What shipped:
 
 - **Gap backfill** (`spot_backfill.py`): 1-minute bars are pulled from
-  Binance REST spot klines on three triggers -- at aggregator startup,
-  after 90s of silence on a stream, and via a 5-minute sweep re-checking
-  the last 30 minutes. Known limitation: ticks that arrive *during* a
-  startup backfill are not captured, so the first live minute after a
-  restart can be built from a partial tick set.
+  Binance REST spot klines on four triggers -- at aggregator startup,
+  for the exact minute still open at that same startup once its
+  tick-built bar is discarded as incomplete, after 90s of silence on a
+  stream, and via a 5-minute sweep re-checking the last 30 minutes (the
+  sweep stops one bucket short of `now` so it never races the tick
+  path's own flush of the just-closed minute). A tick bar write waits
+  (bounded, 30s) for any in-flight backfill of the same instrument, so
+  Postgres still receives bars in ts order for that instrument; a
+  backfill that still lands behind a newer bar is logged
+  (`bar_aggregator.late_fill`) since a live run's cursor has by then
+  already moved past it. Known limitation: ticks that arrive *during*
+  the outage that closes the bar (both the bar mid-outage and the first
+  bar after reconnection) are still built from whatever partial set this
+  process actually saw and are never corrected afterward -- a backfilled
+  bar for a minute a tick already wrote is skipped
+  (`ON CONFLICT DO NOTHING`). The first bar after reconnection is traded
+  on live, not just recorded.
 - **Per-run delivery cursors** (`live_run_cursors`) replace pub/sub as
   the record of what a live run has seen: a `closed_bars:*` message is
   only a wake-up now, never the thing actually trusted, so a dropped
@@ -28,16 +40,35 @@ infrastructure, not just fakes. What shipped:
   survives a supervisor restart instead of starting over as if it were
   its first bar.
 - **Catch-up bars and their enforcement**: the supervisor replays missed
-  bars per run, flags each one `catchup = true`, and separately the
-  paper API refuses any MARKET order whose reference bar closed more
-  than 180s ago -- so a catch-up bar can't trade even if the supervisor's
-  own flag is ignored somewhere downstream. Replay is capped at 24h; a
+  bars per run and flags each one `catchup = true` -- recomputed
+  immediately before that bar is sent, not just once per replay pass, so
+  a bar that was fresh when queried but went stale before its own turn
+  to be dispatched (a long replay is many subprocess round trips) is
+  still caught. This flag, checked by the supervisor itself before
+  placing the order, is what actually blocks a catch-up bar from
+  trading -- the paper API's own staleness guard checks the
+  instrument's *latest* known bar, not each order's own reference bar,
+  so it does not by itself catch a catch-up order once the feed is live
+  again. Every refusal is logged (`live.catchup_refused`: `live_run_id`,
+  `instrument_id`, `bar_ts`) and reflected in
+  `live_runs.orders_refused`/`last_refusal`. Replay is capped at 24h; a
   skip past that cap is logged as `live.replay_gap` and stored in
   `live_runs.last_gap_note`.
 - **Resilient Redis/Postgres reconnection** in every long-running
   process (`resilient_pubsub.py`, `ReconnectingConnection`): a
-  disconnect backs off and resubscribes instead of silently ending the
-  consuming loop or killing the process.
+  disconnect backs off and resubscribes/reconnects instead of silently
+  ending the consuming loop or killing the process -- including when
+  the reconnect attempt itself fails because Redis or Postgres is still
+  down, which used to raise straight through and crash the process; now
+  it keeps backing off (capped at 30s) and retrying forever. The bar
+  aggregator's own tick-path write connection reconnects the same way
+  (it used to hold one connection for its whole life, so a Postgres
+  restart broke every write until the process itself restarted).
+  Known limitation, not fixed by any of this: `reconcile()` marks any
+  strategy container exit `CRASHED`, a terminal status the supervisor
+  never auto-relaunches -- a sandbox VM or Docker hiccup after the Mac
+  sleeps (not a Redis/Postgres disconnect, which this fixes) ends the
+  affected run(s), and they have to be restarted manually via the API.
 - **A real `select()`-based reply timeout** and a **stale-price guard**
   close off the blocking-`readline()` and no-staleness-check rows of the
   bug table.
@@ -48,11 +79,15 @@ infrastructure, not just fakes. What shipped:
   `bars_intraday` is recent.
 - **Deployment**: launchd agents for the whole live stack plus a Docker
   restart policy, in `deploy/` (`install-live-stack.sh`,
-  `start-colima.sh`, `provision-sandbox-vm.sh`, and the plists).
-  `provision-sandbox-vm.sh` is idempotent -- it merges `daemon.json`
-  rather than overwriting it, backs up before writing, and prints
-  "already provisioned" when `runsc` is already registered. None of
-  this has been installed or run yet; the operator installs it.
+  `start-colima.sh`, `provision-sandbox-vm.sh`, and the plists). Every
+  plist carries a PATH (installed from the operator's own PATH at
+  install time) -- launchd's own default PATH is just
+  `/usr/bin:/bin:/usr/sbin:/sbin`, which hid `colima` and `docker` from
+  every agent that shells out to them. `provision-sandbox-vm.sh` is
+  idempotent -- it merges `daemon.json` rather than overwriting it,
+  backs up before writing, and prints "already provisioned" when
+  `runsc` is already registered. None of this has been installed or run
+  yet; the operator installs it.
 
 **What remains:** the live drill itself. `docs/live-resilience-drill.md`
 is the runbook (start the stack, start a run, confirm no gap, kill Wi-Fi

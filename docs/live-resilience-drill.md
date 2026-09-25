@@ -66,28 +66,38 @@ Turn Wi-Fi off for 10 minutes, then on.
 
 Expected, once Wi-Fi is back:
 - `bars_intraday` has no gap across the outage (re-run step 4's query).
-  The aggregator backfills 1m bars from Binance REST on three triggers --
-  at startup, after 90s of silence, and via a 5-minute sweep over the
-  last 30 minutes -- so the gap should close within a few minutes of
-  reconnecting even without a process restart.
-- The run received roughly 10 bars with `catchup = true`, in order
-  (check `logs/live_supervisor.log` for `"live.order_refused"` entries
-  with reason `"catch-up bar: price no longer tradeable"`, one per
-  catch-up bar that tried to trade). The supervisor replays missed bars
-  per run and flags each one as catch-up; the paper API separately
-  refuses any MARKET order whose reference bar closed more than 180s
-  ago, which is what actually blocks a catch-up bar from trading even if
-  the supervisor's own flag were ignored. Replay is capped at 24h -- for
-  a 10-minute outage this never engages, but if it ever does, the skip
-  is logged as `live.replay_gap` and stored in `live_runs.last_gap_note`.
+  The aggregator backfills 1m bars from Binance REST on four triggers --
+  at startup, for the exact minute still open at that startup once its
+  tick-built bar is discarded as incomplete, after 90s of silence, and
+  via a 5-minute sweep over the last 30 minutes -- so the gap should
+  close within a few minutes of reconnecting even without a process
+  restart.
+- The run received roughly 10 bars with `catchup = true`, in order.
+  Check `logs/live_supervisor.log` for one `"live.catchup_refused"`
+  entry per catch-up bar that tried to trade (`live_run_id`,
+  `instrument_id`, `bar_ts`), and cross-check
+  `SELECT orders_refused, last_refusal FROM live_runs WHERE
+  live_run_id=<live_run_id>` -- `orders_refused` should be roughly 10
+  higher than before the outage and `last_refusal` should read
+  `"catch-up bar: price no longer tradeable"`. The supervisor's own
+  `catchup` flag (recomputed at send time, not just once per pass) is
+  the only thing enforcing this: the paper API's staleness guard checks
+  the instrument's *latest* known bar, not each order's own reference
+  bar, so once the feed is live again it does not by itself catch a
+  catch-up order trading on an old bar. Replay is capped at 24h -- for a
+  10-minute outage this never engages, but if it ever does, the skip is
+  logged as `live.replay_gap` and stored in `live_runs.last_gap_note`.
 - No crash: `SELECT status, stopped_reason FROM live_runs WHERE
   live_run_id=<live_run_id>` still shows `RUNNING`.
 - Orders resume being placed (not just refused) on the first live bar
   after the catch-up run ends.
 
-Known limitation: ticks that arrive during the startup backfill are not
-captured, so the first live minute after a restart may be built from
-partial ticks rather than the full set.
+Known limitation: the bar during which Wi-Fi drops, and the first bar
+after it returns, are built from whatever ticks this process actually
+saw -- partial in both cases -- and are never corrected afterward: a
+backfilled bar for the same minute is skipped (`ON CONFLICT DO
+NOTHING`) if a tick-built row already exists. The first bar after
+reconnection is traded on live, not just recorded.
 
 ## 6. Kill the supervisor mid-run
 
@@ -98,10 +108,32 @@ launchctl kickstart -k gui/$(id -u)/com.satyam.trading.live_supervisor
 Expected: the run relaunches (a new container, same `live_run_id`),
 `ctx.state` picks up where it left off (compare
 `SELECT strategy_state FROM live_runs WHERE live_run_id=<live_run_id>`
-before and after), and no bar is duplicated or missing in
-`live_run_cursors`. `ctx.state` (up to 64 KB) is what makes this
-possible -- it survives the container relaunch; anything a strategy
-needs remembered across a restart has to fit in that budget.
+before and after), and no bar was duplicated or skipped across the
+relaunch. `live_run_cursors` only holds each instrument's *latest*
+delivered `ts`, not a history, so check this instead: note
+`bars_seen` just before the kill, then after the run has caught back up
+compare its growth against the number of 1-minute bars actually in the
+window --
+
+```bash
+psql "$DATABASE_URL" -c \
+  "SELECT count(*) FROM bars_intraday
+   WHERE instrument_id = <instrument_id> AND interval_sec = 60
+     AND ts > '<kill_time>'"
+```
+
+should equal the increase in `SELECT bars_seen FROM live_runs WHERE
+live_run_id=<live_run_id>`. `ctx.state` (up to 64 KB) is what makes the
+relaunch clean -- it survives the container relaunch; anything a
+strategy needs remembered across a restart has to fit in that budget.
+
+Not drilled here, but worth knowing: this step kills the *supervisor*
+process, which `reconcile()` (run by whatever relaunches the
+supervisor) then converges back to what `live_runs` says should be
+running. If the *strategy container* itself exits instead (a sandbox
+VM or Docker hiccup, e.g. after the Mac sleeps) `reconcile()` marks
+that run `CRASHED` -- a terminal status it never auto-relaunches from.
+Recovering that run means starting it again via the API, by hand.
 
 ## 7. Restart Redis
 

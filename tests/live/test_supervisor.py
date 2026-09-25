@@ -11,6 +11,7 @@ from decimal import Decimal
 from unittest.mock import MagicMock
 
 import psycopg
+import structlog.testing
 
 from trading.live.protocol import FRAME_ERROR, FRAME_ORDERS, encode_frame
 from trading.live.supervisor import MAX_ORDERS_PER_MINUTE, LiveRun, handle_bar
@@ -419,15 +420,23 @@ def test_a_replay_cap_gap_is_recorded_on_the_run_even_with_nothing_to_deliver(
 
     # now is 2 days later with a 1-hour replay cap -- the single stored
     # bar is entirely outside the window, so nothing is delivered.
-    ok = supervisor.deliver_pending(
-        db_conn, "http://x", run, datetime(2026, 9, 27, 8, 0, tzinfo=UTC)
-    )
+    with structlog.testing.capture_logs() as cap:
+        ok = supervisor.deliver_pending(
+            db_conn, "http://x", run, datetime(2026, 9, 27, 8, 0, tzinfo=UTC)
+        )
 
     assert ok is True
     row = db_conn.execute(
         "SELECT last_gap_note FROM live_runs WHERE live_run_id=%s", (live_run_id,)
     ).fetchone()
     assert row[0] is not None and "replay cap" in row[0]
+
+    # Spec §4: a replay-cap skip is "logged and recorded" -- the row
+    # write above is the "recorded" half, this is the "logged" half.
+    gap_logs = [e for e in cap if e.get("event") == "live.replay_gap"]
+    assert len(gap_logs) == 1
+    assert gap_logs[0]["live_run_id"] == live_run_id
+    assert "replay cap" in gap_logs[0]["note"]
 
 
 def test_a_db_outage_does_not_crash_the_supervisor_loop(monkeypatch) -> None:  # noqa: ANN001
@@ -461,3 +470,52 @@ def test_a_db_outage_does_not_crash_the_supervisor_loop(monkeypatch) -> None:  #
     supervisor.run_supervisor(stop)
 
     assert calls["n"] == 2
+
+
+def test_a_delivery_failure_for_one_run_does_not_stop_the_others(monkeypatch) -> None:  # noqa: ANN001
+    """A query failure mid-pass (e.g. the DB drops between pending_bars
+    and the cursor UPDATE) must not propagate out of run_supervisor and
+    kill delivery for every other run in the same pass. The failing
+    run's cursor was never advanced, so its bar is simply retried next
+    pass."""
+    from trading.live import supervisor
+
+    stop = threading.Event()
+
+    class _FakeDB:
+        def get(self):  # noqa: ANN202
+            return MagicMock()
+
+    class _FakePubSub:
+        def get_message(self, timeout):  # noqa: ANN001, ANN202, ARG002
+            return None
+
+    monkeypatch.setattr(supervisor, "ReconnectingConnection", lambda *a, **k: _FakeDB())  # noqa: ARG005
+    monkeypatch.setattr(supervisor, "SyncResilientPubSub", lambda *a, **k: _FakePubSub())  # noqa: ARG005
+
+    run1 = _run([], live_run_id=1)
+    run2 = _run([], live_run_id=2)
+    populated = {"done": False}
+
+    def _fake_reconcile(conn, runs):  # noqa: ANN001, ANN202, ARG001
+        if not populated["done"]:
+            runs[1] = run1
+            runs[2] = run2
+            populated["done"] = True
+
+    monkeypatch.setattr(supervisor, "reconcile", _fake_reconcile)
+
+    delivered: list[int] = []
+
+    def _fake_deliver(conn, api_url, run, now):  # noqa: ANN001, ANN202, ARG001
+        if run.live_run_id == 1:
+            raise psycopg.OperationalError("boom mid-pass")
+        delivered.append(run.live_run_id)
+        stop.set()
+        return True
+
+    monkeypatch.setattr(supervisor, "deliver_pending", _fake_deliver)
+
+    supervisor.run_supervisor(stop)
+
+    assert delivered == [2]

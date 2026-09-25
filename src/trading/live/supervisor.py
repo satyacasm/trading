@@ -101,10 +101,6 @@ class LiveRun:
         self._order_times.append(time.monotonic())
 
 
-def _connect() -> Connection:
-    return psycopg.connect(get_settings().database_url, autocommit=True)
-
-
 def start_run(
     conn: Connection,
     strategy_id: int,
@@ -407,6 +403,7 @@ def deliver_pending(conn: Connection, api_url: str, run: LiveRun, now: datetime)
     )
     if gap_note is not None:
         run.last_gap_note = gap_note
+        log.warning("live.replay_gap", live_run_id=run.live_run_id, note=gap_note)
         if not pending:
             # Nothing will reach handle_bar's own write this cycle --
             # persist the note now rather than losing it until the next
@@ -607,8 +604,11 @@ def run_supervisor(stop: threading.Event | None = None) -> None:
         last_delivery = time.monotonic()
         now = datetime.now(UTC)
         for live_run_id, run in list(runs.items()):
-            if not deliver_pending(conn, api_url, run, now):
-                runs.pop(live_run_id, None)
+            try:
+                if not deliver_pending(conn, api_url, run, now):
+                    runs.pop(live_run_id, None)
+            except Exception:  # noqa: BLE001 - one run's failure must not stop this pass for the rest
+                log.warning("live.deliver_failed", live_run_id=live_run_id, exc_info=True)
 
 
 def main() -> int:

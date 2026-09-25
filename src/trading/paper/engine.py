@@ -1023,7 +1023,7 @@ async def run_engine(
 
     async def _consume_ticks() -> None:
         nonlocal processed
-        async for message in resilient_messages(redis, patterns=[pattern]):
+        async for message in resilient_messages(redis, patterns=[pattern], pubsub=tick_pubsub):
             if message["type"] != "pmessage":
                 continue
             try:
@@ -1036,7 +1036,9 @@ async def run_engine(
                 return
 
     async def _consume_control() -> None:
-        async for message in resilient_messages(redis, channels=[control_channel]):
+        async for message in resilient_messages(
+            redis, channels=[control_channel], pubsub=control_pubsub
+        ):
             if message["type"] != "message":
                 continue
             try:
@@ -1160,6 +1162,25 @@ async def run_engine(
                 log.warning("paper_engine.reconcile_failed", reason=str(exc))
             finally:
                 reconcile_conn.close()
+
+    # Subscribed synchronously, before any task exists to compete with this
+    # await on the event loop -- restoring the guarantee the old direct
+    # `pubsub.listen()` code had. Handing the already-subscribed pubsub to
+    # resilient_messages (rather than letting it subscribe lazily once
+    # _consume_ticks/_consume_control finally get their turn) closes the
+    # window where a message published right after startup could be lost:
+    # with subscription happening inside the task instead, it has to wait
+    # behind every other task this function schedules -- in particular the
+    # periodic checks below, whose synchronous DB calls block the whole
+    # loop -- and a fixed-delay publisher (real callers and every test that
+    # publishes shortly after starting the engine) can fire before it lands.
+    # Reproduced against a real Redis: a control/tick publish sent ~0.2s
+    # after startup arrived 0.6-1.2s before the corresponding
+    # psubscribe/subscribe actually reached Redis, so it was never seen.
+    tick_pubsub = redis.pubsub()
+    await tick_pubsub.psubscribe(pattern)
+    control_pubsub = redis.pubsub()
+    await control_pubsub.subscribe(control_channel)
 
     tick_task = asyncio.create_task(_consume_ticks())
     control_task = asyncio.create_task(_consume_control())

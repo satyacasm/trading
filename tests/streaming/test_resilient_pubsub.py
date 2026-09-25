@@ -121,6 +121,33 @@ def test_backoff_resets_after_a_message_is_delivered():
     assert calls == [1.0, 2.0, 1.0]
 
 
+def test_resilient_messages_uses_a_pre_subscribed_pubsub_without_resubscribing():
+    """A caller that already subscribed (to guarantee a message published
+    right after startup isn't lost -- paper/engine.py's run_engine does
+    this before creating any consumer task, exactly restoring the
+    synchronous-subscribe-before-anything-else guarantee the old direct
+    `pubsub.listen()` code had) can hand that pubsub straight to
+    resilient_messages. It must be consumed as-is, with no extra
+    `redis_client.pubsub()`/psubscribe() call before the first listen()
+    -- an unconditional resubscribe here would race the caller's own
+    subscription against whatever it published right after handing off,
+    the exact bug that caused paper/engine.py's tests to hang."""
+    calls: list[float] = []
+
+    async def _sleep(seconds):
+        calls.append(seconds)
+
+    behaviors = [[{"type": "pmessage", "data": "m1"}]]
+    fake = _FakeRedis(behaviors)
+    pre_subscribed = _FakePubSub(behaviors)  # the caller already subscribed this one itself
+
+    agen = resilient_messages(fake, patterns=["ticks:*"], sleep=_sleep, pubsub=pre_subscribed)
+
+    out = asyncio.run(_collect(agen, 1))
+    assert out == [{"type": "pmessage", "data": "m1"}]
+    assert fake.pubsub_calls == 0  # the caller's own pubsub was used, not a fresh one
+
+
 def test_resilient_messages_against_real_redis(redis_client) -> None:
     from trading.config import get_settings
 

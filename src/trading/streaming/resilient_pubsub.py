@@ -51,6 +51,7 @@ async def resilient_messages(
     channels: Sequence[str] = (),
     sleep: Sleeper = asyncio.sleep,
     max_backoff: float = 30.0,
+    pubsub: Any | None = None,
 ) -> AsyncIterator[dict]:
     """Yield every actual pub/sub message forever (subscribe/psubscribe
     confirmation events from `listen()` are consumed but not yielded, and
@@ -65,9 +66,24 @@ async def resilient_messages(
     evidence of a problem, so it does not incur another backoff sleep. A
     session that only ever produces subscribe confirmations before dying
     (a flaky connection that never gets past resubscribing) must still be
-    scored as a disconnect, not as delivery, or the backoff never engages."""
+    scored as a disconnect, not as delivery, or the backoff never engages.
+
+    `pubsub`, when given, is used as the first connection verbatim --
+    already subscribed by the caller, no extra `redis_client.pubsub()`/
+    subscribe call is made before the first `listen()`. This lets a
+    caller subscribe synchronously before doing anything else (before
+    scheduling any concurrent task, in particular) and only then hand off
+    to this generator for ongoing reconnect-on-failure. Without this, the
+    subscribe that used to be the first thing `run_engine` awaited moves
+    inside a task that has to wait its turn on the event loop next to
+    everything else the caller schedules, which can delay it long enough
+    for a message published right after startup to be lost -- paper/
+    engine.py's task-8 regression, reproduced by publishing on a real
+    Redis right after `run_engine` starts while its other periodic tasks
+    are busy. Every reconnect after this first one still opens and
+    subscribes a brand new pubsub via `_subscribe`, same as always."""
     backoff = _INITIAL_BACKOFF
-    pubsub = await _subscribe(redis_client, patterns, channels)
+    pubsub = pubsub if pubsub is not None else await _subscribe(redis_client, patterns, channels)
     while True:
         delivered = False
         raised = False

@@ -4,12 +4,17 @@
   KeepAlive+RunAtLoad: if it exits for any reason, including a crash,
   launchd starts it again. ThrottleInterval stops a crash-loop from
   spinning the CPU. Installed by deploy/install-live-stack.sh, which
-  substitutes __REPO__ and __UV__.
+  substitutes __REPO__, __UV__, and __PATH__.
 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
   <string>com.satyam.trading.gateway</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
 
   <key>ProgramArguments</key>
   <array>

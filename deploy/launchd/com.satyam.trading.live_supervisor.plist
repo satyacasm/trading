@@ -3,6 +3,11 @@
 <dict>
   <key>Label</key>
   <string>com.satyam.trading.live_supervisor</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
 
   <key>ProgramArguments</key>
   <array>

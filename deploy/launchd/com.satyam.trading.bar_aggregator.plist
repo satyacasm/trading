@@ -3,6 +3,11 @@
 <dict>
   <key>Label</key>
   <string>com.satyam.trading.bar_aggregator</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
 
   <key>ProgramArguments</key>
   <array>

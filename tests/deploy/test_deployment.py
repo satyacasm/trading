@@ -26,6 +26,8 @@ _SERVICE_NAMES = (
     "perp_ingestor",
 )
 
+_ALL_LAUNCHD_NAMES = _SERVICE_NAMES + ("colima",)
+
 
 def _plist(name: str) -> dict:
     path = LAUNCHD_DIR / f"com.satyam.trading.{name}.plist"
@@ -65,6 +67,23 @@ def test_gateway_runs_uvicorn_on_loopback_8000() -> None:
     assert "trading.streaming.gateway:app" in joined
     assert "127.0.0.1" in joined
     assert "8000" in joined
+
+
+@pytest.mark.parametrize("name", _ALL_LAUNCHD_NAMES)
+def test_every_plist_sets_environment_path_token(name: str) -> None:
+    """C1: launchd's own PATH is /usr/bin:/bin:/usr/sbin:/sbin, so colima
+    (start-colima.sh) and docker (Popen in agent_contract/sandbox.py) are
+    invisible to any launchd-run process without this. The token is filled
+    in by install-live-stack.sh at install time (see
+    test_install_script_substitutes_the_path_token)."""
+    data = _plist(name)
+    assert data["EnvironmentVariables"]["PATH"] == "__PATH__"
+
+
+def test_install_script_substitutes_the_path_token() -> None:
+    text = (REPO_ROOT / "deploy" / "install-live-stack.sh").read_text()
+    assert "__PATH__" in text
+    assert "resolve_launchd_path" in text
 
 
 def test_colima_plist_runs_at_load_with_no_keepalive() -> None:

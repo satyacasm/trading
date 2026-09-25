@@ -777,7 +777,7 @@
 
 **Files:** Create `src/trading/sources/binance_spot.py`; Create `src/trading/streaming/spot_backfill.py`; Test `tests/sources/test_binance_spot.py`; Test `tests/streaming/test_spot_backfill.py`
 
-**Interfaces:** Consumes: `DataSource.BINANCE_SPOT_KLINE` (Task 1); `bucket_start` from `trading.streaming.bar_aggregator` (existing, `interval_seconds=60`). Produces: `@dataclass(frozen=True) class SpotKline: ts: datetime; open: Decimal; high: Decimal; low: Decimal; close: Decimal; volume: Decimal; trades: int`; `def spot_symbol(pair: str) -> str` ("BTC-USDT" -> "BTCUSDT"); `def fetch_spot_klines(symbol: str, *, start_ms: int, end_ms: int, client: httpx.Client | None = None) -> list[SpotKline]`; `def backfill_window(conn: Connection, instrument_id: int, symbol: str, since: datetime, until: datetime, *, fetch: Callable[..., list[SpotKline]] = fetch_spot_klines, now: Callable[[], datetime] = lambda: datetime.now(UTC)) -> list[SpotKline]`; `def last_bar_ts(conn: Connection, instrument_id: int) -> datetime | None`. Task 5 consumes `backfill_window`, `last_bar_ts`, `spot_symbol`.
+**Interfaces:** Consumes: `DataSource.BINANCE_SPOT_KLINE` (Task 1); `bucket_start` from `trading.streaming.bar_aggregator` (existing, `interval_seconds=60`). Produces: `def parse_spot_klines(rows: list[list[Any]]) -> list[SpotKline]` (exported, imported by the tests); `@dataclass(frozen=True) class SpotKline: ts: datetime; open: Decimal; high: Decimal; low: Decimal; close: Decimal; volume: Decimal; trades: int`; `def spot_symbol(pair: str) -> str` ("BTC-USDT" -> "BTCUSDT"); `def fetch_spot_klines(symbol: str, *, start_ms: int, end_ms: int, client: httpx.Client | None = None) -> list[SpotKline]`; `def backfill_window(conn: Connection, instrument_id: int, symbol: str, since: datetime, until: datetime, *, fetch: Callable[..., list[SpotKline]] = fetch_spot_klines, now: Callable[[], datetime] = lambda: datetime.now(UTC)) -> list[SpotKline]`; `def last_bar_ts(conn: Connection, instrument_id: int) -> datetime | None`. Task 5 consumes `backfill_window`, `last_bar_ts`, `spot_symbol`.
 
 - [ ] Step 1: Write the failing tests. Create `tests/sources/test_binance_spot.py`:
   ```python
@@ -1453,7 +1453,7 @@
 
 **Files:** Modify `src/trading/streaming/bar_aggregator.py` (`run_aggregation_loop`, `_consume_ticks`/`_consume_bars`/`_periodic_flush`, lines 484-556); Test `tests/streaming/test_bar_aggregator.py` (append)
 
-**Interfaces:** Consumes: `resilient_messages` (Task 2); `backfill_window`, `last_bar_ts`, `spot_symbol` (Task 4); `_startup_spot_backfill`'s helpers, `backfill_conn_factory`/`to_thread`/`spot_fetch` (Task 5). Produces: `run_aggregation_loop(..., backfill_silence_seconds: float = 90.0, backfill_sweep_seconds: float = 300.0, backfill_sweep_window_minutes: int = 30)` (new keyword-only, defaulting to spec §8's values so a caller that omits them still gets the right behaviour; `main()` passes `get_settings()`'s values explicitly). `_consume_ticks`/`_consume_bars` iterate `resilient_messages(redis, patterns=[pattern])` instead of `pubsub.listen()`.
+**Interfaces:** Consumes: `resilient_messages` (Task 2); `ReconnectingConnection` (Task 3, `trading.db`); `backfill_window`, `last_bar_ts`, `spot_symbol` (Task 4); `_startup_spot_backfill`'s helpers, `backfill_conn_factory`/`to_thread`/`spot_fetch` (Task 5). Produces: `run_aggregation_loop(..., backfill_silence_seconds: float = 90.0, backfill_sweep_seconds: float = 300.0, backfill_sweep_window_minutes: int = 30)` (new keyword-only, defaulting to spec §8's values so a caller that omits them still gets the right behaviour; `main()` passes `get_settings()`'s values explicitly, plus `backfill_conn_factory=ReconnectingConnection(settings.database_url).get` from Task 3 -- a shared connection the backfill helpers must never close). `_consume_ticks`/`_consume_bars` iterate `resilient_messages(redis, patterns=[pattern])` instead of `pubsub.listen()`.
 
 - [ ] Step 1: Write the failing tests. Append to `tests/streaming/test_bar_aggregator.py`:
   ```python
@@ -1672,9 +1672,13 @@
                   and previous is not None
                   and (now - previous).total_seconds() > backfill_silence_seconds
               ):
-                  symbol = _query_crypto_spot_instruments(backfill_conn_factory()).get(
-                      tick.instrument_id
-                  )
+                  # Off the event loop, like the startup and sweep paths:
+                  # a DB round-trip here would stall every instrument's ticks.
+                  symbol = (
+                      await to_thread(
+                          lambda: _query_crypto_spot_instruments(backfill_conn_factory())
+                      )
+                  ).get(tick.instrument_id)
                   if symbol is not None:
                       asyncio.create_task(
                           _silence_backfill(
@@ -1747,6 +1751,62 @@
   (The `for one_pubsub in (pubsub, bars_pubsub): ...` cleanup block is deleted too -- `resilient_messages` owns and closes its own pubsub internally on every reconnect and there is no longer an outer one to close here.)
 
 - [ ] Step 4: Run, expect PASS.
+  ```
+  uv run pytest tests/streaming/test_bar_aggregator.py -q
+  ```
+
+- [ ] Step 4a: Write the failing test that production actually turns backfill on. Every backfill kwarg defaults to "off" (`backfill_conn_factory=None`), so without this the whole of design §3 ships tested and never runs. Append to `tests/streaming/test_bar_aggregator.py`:
+  ```python
+  def test_main_turns_backfill_on_with_the_configured_thresholds(monkeypatch) -> None:
+      """Every backfill kwarg defaults to off. A `main()` that forgets one
+      ships the mechanism tested and dead, so assert the wiring itself."""
+      from trading.streaming import bar_aggregator
+
+      captured: dict[str, object] = {}
+
+      async def fake_loop(redis, conn, **kwargs):  # noqa: ANN001, ANN003, ANN202
+          captured.update(kwargs)
+
+      monkeypatch.setattr(bar_aggregator, "run_aggregation_loop", fake_loop)
+      monkeypatch.setattr(bar_aggregator.psycopg, "connect", lambda *a, **k: MagicMock())
+      monkeypatch.setattr(bar_aggregator.Redis, "from_url", lambda *a, **k: MagicMock())
+
+      bar_aggregator.main()
+
+      settings = bar_aggregator.get_settings()
+      assert callable(captured["backfill_conn_factory"])
+      assert captured["backfill_silence_seconds"] == settings.backfill_silence_seconds
+      assert captured["backfill_sweep_seconds"] == settings.backfill_sweep_seconds
+      assert (
+          captured["backfill_sweep_window_minutes"] == settings.backfill_sweep_window_minutes
+      )
+  ```
+  Add `from unittest.mock import MagicMock` to the test file's imports if not already present.
+
+- [ ] Step 4b: Run it, expect FAIL with `KeyError: 'backfill_conn_factory'`.
+  ```
+  uv run pytest tests/streaming/test_bar_aggregator.py::test_main_turns_backfill_on_with_the_configured_thresholds -q
+  ```
+
+- [ ] Step 4c: Wire `main()`. In `src/trading/streaming/bar_aggregator.py`, add `from trading.db import ReconnectingConnection` to the imports and replace the `asyncio.run(run_aggregation_loop(redis, conn))` line in `main()` with:
+  ```python
+          # One long-lived connection for every backfill thread, reconnecting
+          # if Postgres restarts. The backfill helpers never close what the
+          # factory returns, which is only correct because it is shared.
+          backfill_conn = ReconnectingConnection(settings.database_url)
+          asyncio.run(
+              run_aggregation_loop(
+                  redis,
+                  conn,
+                  backfill_conn_factory=backfill_conn.get,
+                  backfill_silence_seconds=settings.backfill_silence_seconds,
+                  backfill_sweep_seconds=settings.backfill_sweep_seconds,
+                  backfill_sweep_window_minutes=settings.backfill_sweep_window_minutes,
+              )
+          )
+  ```
+
+- [ ] Step 4d: Run the whole file, expect PASS.
   ```
   uv run pytest tests/streaming/test_bar_aggregator.py -q
   ```
@@ -2560,7 +2620,7 @@
           started_at=datetime(2026, 9, 4, tzinfo=UTC),
       )
   ```
-  Add `from datetime import UTC, datetime` to this file's imports if not already present. Then append the new tests:
+  Add `from datetime import UTC, datetime, timedelta` to this file's imports if not already present. Then append the new tests:
   ```python
   def _seed_live_run(db_conn, *, started_at) -> int:
       """A minimal strategies/portfolios/live_runs row -- same shape as
@@ -2633,7 +2693,7 @@
       db_conn.execute(
           "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
           "close, volume, trades, source) VALUES (%s, %s, 60, 1, 1, 1, 1, 1, 1, 6)",
-          (iid, datetime(2026, 9, 25, 10, 0, tzinfo=UTC)),
+          (iid, datetime(2026, 9, 25, 10, 1, tzinfo=UTC)),
       )
       placed: list[int] = []
       monkeypatch.setattr(
@@ -2646,7 +2706,7 @@
       run.instrument_ids = {iid}
       run.started_at = started_at
 
-      # 10:10 is well past the bar's 10:01 close + the 2-minute catchup
+      # 10:10 is well past the bar's 10:02 close + the 2-minute catchup
       # threshold -- this bar is delivered with catchup=True.
       ok = supervisor.deliver_pending(
           db_conn, "http://x", run, datetime(2026, 9, 25, 10, 10, tzinfo=UTC)
@@ -2656,6 +2716,45 @@
       assert placed == []
       assert run.orders_refused == 1
       assert run.last_refusal == "catch-up bar: price no longer tradeable"
+
+
+  def test_catchup_orders_do_not_count_toward_the_rate_limit(db_conn, monkeypatch) -> None:
+      """A long replay dispatches many bars in seconds. Orders refused as
+      catch-up are never placed, so counting them would trip the
+      60-a-minute limit and stop the very run being recovered."""
+      from trading.live import supervisor
+      from trading.streaming.seed_instruments import seed_crypto_instruments
+
+      iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+      started_at = datetime(2026, 9, 25, 10, 0, tzinfo=UTC)
+      live_run_id = _seed_live_run(db_conn, started_at=started_at)
+      bar_count = supervisor.MAX_ORDERS_PER_MINUTE + 10
+      for minute in range(1, bar_count + 1):
+          db_conn.execute(
+              "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+              "close, volume, trades, source) VALUES (%s, %s, 60, 1, 1, 1, 1, 1, 1, 6)",
+              (iid, started_at + timedelta(minutes=minute)),
+          )
+      monkeypatch.setattr(supervisor, "place_order", lambda *a, **k: True)
+      stopped: list[str] = []
+      monkeypatch.setattr(
+          supervisor, "stop_run", lambda conn, run, status, reason: stopped.append(status)
+      )
+      run = _run(
+          [encode_frame(FRAME_ORDERS, ts="t", orders=[_intent()], alive=True)] * bar_count,
+          live_run_id=live_run_id,
+      )
+      run.instrument_ids = {iid}
+      run.started_at = started_at
+
+      # Every bar is hours old at "now": all catch-up.
+      ok = supervisor.deliver_pending(
+          db_conn, "http://x", run, started_at + timedelta(hours=6)
+      )
+
+      assert ok is True
+      assert stopped == []
+      assert run.orders_refused == bar_count
 
 
   def test_a_replay_cap_gap_is_recorded_on_the_run_even_with_nothing_to_deliver(
@@ -2735,6 +2834,13 @@
           if frame["type"] != FRAME_ORDERS:
               continue
           for intent in frame.get("orders", []):
+              # Refused before the rate limit sees it: a catch-up replay
+              # dispatches many bars in seconds, and counting orders that
+              # are never placed would stop the very run being recovered.
+              if catchup:
+                  run.orders_refused += 1
+                  run.last_refusal = "catch-up bar: price no longer tradeable"
+                  continue
               run.note_order()
               if run.over_rate_limit():
                   stop_run(
@@ -2744,10 +2850,6 @@
                       f"order-rate limit: more than {MAX_ORDERS_PER_MINUTE} orders in a minute",
                   )
                   return False
-              if catchup:
-                  run.orders_refused += 1
-                  run.last_refusal = "catch-up bar: price no longer tradeable"
-                  continue
               if place_order(api_url, run, intent, run.orders_placed):
                   run.orders_placed += 1
           if not frame.get("alive", True):
@@ -3703,6 +3805,13 @@ This part has no standalone unit test (`_run_live` reads real stdin/writes real 
               continue
           state = frame.get("state", state)
           for intent in frame.get("orders", []):
+              # Refused before the rate limit sees it: a catch-up replay
+              # dispatches many bars in seconds, and counting orders that
+              # are never placed would stop the very run being recovered.
+              if catchup:
+                  run.orders_refused += 1
+                  run.last_refusal = "catch-up bar: price no longer tradeable"
+                  continue
               run.note_order()
               if run.over_rate_limit():
                   stop_run(
@@ -3712,10 +3821,6 @@ This part has no standalone unit test (`_run_live` reads real stdin/writes real 
                       f"order-rate limit: more than {MAX_ORDERS_PER_MINUTE} orders in a minute",
                   )
                   return False
-              if catchup:
-                  run.orders_refused += 1
-                  run.last_refusal = "catch-up bar: price no longer tradeable"
-                  continue
               if place_order(api_url, run, intent, run.orders_placed):
                   run.orders_placed += 1
           if not frame.get("alive", True):

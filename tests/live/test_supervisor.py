@@ -5,27 +5,32 @@ from __future__ import annotations
 import io
 import json
 import subprocess
+import threading
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import MagicMock
+
+import psycopg
 
 from trading.live.protocol import FRAME_ERROR, FRAME_ORDERS, encode_frame
 from trading.live.supervisor import MAX_ORDERS_PER_MINUTE, LiveRun, handle_bar
 
 
-def _run(stdout_lines: list[str]) -> LiveRun:
+def _run(stdout_lines: list[str], *, live_run_id: int = 1) -> LiveRun:
     process = MagicMock(spec=subprocess.Popen)
     process.poll.return_value = None
     process.stdin = MagicMock()
     process.stdout = MagicMock()
     process.stdout.readline.side_effect = [line.encode() for line in stdout_lines] + [b""]
     return LiveRun(
-        live_run_id=1,
+        live_run_id=live_run_id,
         strategy_id=1,
         portfolio_id=1,
         process=process,
         instrument_ids={1},
         runtime="runsc",
         kernel_isolated=True,
+        started_at=datetime(2026, 9, 4, tzinfo=UTC),
     )
 
 
@@ -257,3 +262,202 @@ def test_an_unlevered_run_sends_no_leverage_at_all(monkeypatch) -> None:  # noqa
     )
     assert supervisor.place_order("http://x", _run([]), _intent(), 0) is True
     assert captured["leverage"] is None
+
+
+def _seed_live_run(db_conn, *, started_at) -> int:
+    """A minimal strategies/portfolios/live_runs row -- same shape as
+    tests/live/test_cursors.py's _live_run helper, duplicated here
+    because this file has no shared conftest fixture for it yet."""
+    user_id = db_conn.execute("SELECT user_id FROM users LIMIT 1").fetchone()[0]
+    portfolio_id = db_conn.execute(
+        "INSERT INTO portfolios (user_id, name, base_currency, initial_capital, cash_balance) "
+        "VALUES (%s, 'supervisor-test', 'USDT', 1000, 1000) RETURNING portfolio_id",
+        (user_id,),
+    ).fetchone()[0]
+    strategy_id = db_conn.execute(
+        "INSERT INTO strategies (user_id, name, version, source, source_sha256, "
+        "status, contract_version) VALUES (%s,'t','1.0.0','x','y','REGISTERED','0.1') "
+        "RETURNING strategy_id",
+        (user_id,),
+    ).fetchone()[0]
+    row = db_conn.execute(
+        "INSERT INTO live_runs (strategy_id, portfolio_id, status, started_at) "
+        "VALUES (%s, %s, 'RUNNING', %s) RETURNING live_run_id",
+        (strategy_id, portfolio_id, started_at),
+    ).fetchone()
+    return row[0]
+
+
+def test_deliver_pending_feeds_every_bar_since_the_cursor_in_order(db_conn, monkeypatch) -> None:
+    from trading.live import supervisor
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    started_at = datetime(2026, 9, 25, 10, 0, tzinfo=UTC)
+    live_run_id = _seed_live_run(db_conn, started_at=started_at)
+    for minute, close in ((1, "100"), (2, "101")):
+        db_conn.execute(
+            "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+            "close, volume, trades, source) VALUES (%s, %s, 60, %s, %s, %s, %s, 1, 1, 6)",
+            (iid, datetime(2026, 9, 25, 10, minute, tzinfo=UTC), close, close, close, close),
+        )
+    monkeypatch.setattr(supervisor, "place_order", lambda *a, **k: True)
+    run = _run(
+        [
+            encode_frame(FRAME_ORDERS, ts="t", orders=[], alive=True),
+            encode_frame(FRAME_ORDERS, ts="t", orders=[], alive=True),
+        ],
+        live_run_id=live_run_id,
+    )
+    run.instrument_ids = {iid}
+    run.started_at = started_at
+
+    ok = supervisor.deliver_pending(
+        db_conn, "http://x", run, datetime(2026, 9, 25, 10, 3, tzinfo=UTC)
+    )
+
+    assert ok is True
+    assert run.bars_seen == 2
+    cursor = db_conn.execute(
+        "SELECT last_ts FROM live_run_cursors WHERE live_run_id=%s AND instrument_id=%s",
+        (live_run_id, iid),
+    ).fetchone()
+    assert cursor[0] == datetime(2026, 9, 25, 10, 2, tzinfo=UTC)
+
+
+def test_a_catchup_bars_orders_are_refused_not_placed(db_conn, monkeypatch) -> None:
+    from trading.live import supervisor
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    started_at = datetime(2026, 9, 25, 10, 0, tzinfo=UTC)
+    live_run_id = _seed_live_run(db_conn, started_at=started_at)
+    db_conn.execute(
+        "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+        "close, volume, trades, source) VALUES (%s, %s, 60, 1, 1, 1, 1, 1, 1, 6)",
+        (iid, datetime(2026, 9, 25, 10, 1, tzinfo=UTC)),
+    )
+    placed: list[int] = []
+    monkeypatch.setattr(
+        supervisor, "place_order", lambda *a, **k: (placed.append(1), True)[1]
+    )
+    run = _run(
+        [encode_frame(FRAME_ORDERS, ts="t", orders=[_intent()], alive=True)],
+        live_run_id=live_run_id,
+    )
+    run.instrument_ids = {iid}
+    run.started_at = started_at
+
+    # 10:10 is well past the bar's 10:02 close + the 2-minute catchup
+    # threshold -- this bar is delivered with catchup=True.
+    ok = supervisor.deliver_pending(
+        db_conn, "http://x", run, datetime(2026, 9, 25, 10, 10, tzinfo=UTC)
+    )
+
+    assert ok is True
+    assert placed == []
+    assert run.orders_refused == 1
+    assert run.last_refusal == "catch-up bar: price no longer tradeable"
+
+
+def test_catchup_orders_do_not_count_toward_the_rate_limit(db_conn, monkeypatch) -> None:
+    """A long replay dispatches many bars in seconds. Orders refused as
+    catch-up are never placed, so counting them would trip the
+    60-a-minute limit and stop the very run being recovered."""
+    from trading.live import supervisor
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    started_at = datetime(2026, 9, 25, 10, 0, tzinfo=UTC)
+    live_run_id = _seed_live_run(db_conn, started_at=started_at)
+    bar_count = supervisor.MAX_ORDERS_PER_MINUTE + 10
+    for minute in range(1, bar_count + 1):
+        db_conn.execute(
+            "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+            "close, volume, trades, source) VALUES (%s, %s, 60, 1, 1, 1, 1, 1, 1, 6)",
+            (iid, started_at + timedelta(minutes=minute)),
+        )
+    monkeypatch.setattr(supervisor, "place_order", lambda *a, **k: True)
+    stopped: list[str] = []
+    monkeypatch.setattr(
+        supervisor, "stop_run", lambda conn, run, status, reason: stopped.append(status)
+    )
+    run = _run(
+        [encode_frame(FRAME_ORDERS, ts="t", orders=[_intent()], alive=True)] * bar_count,
+        live_run_id=live_run_id,
+    )
+    run.instrument_ids = {iid}
+    run.started_at = started_at
+
+    # Every bar is hours old at "now": all catch-up.
+    ok = supervisor.deliver_pending(
+        db_conn, "http://x", run, started_at + timedelta(hours=6)
+    )
+
+    assert ok is True
+    assert stopped == []
+    assert run.orders_refused == bar_count
+
+
+def test_a_replay_cap_gap_is_recorded_on_the_run_even_with_nothing_to_deliver(
+    db_conn,
+) -> None:
+    from trading.live import supervisor
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    started_at = datetime(2026, 9, 25, 8, 0, tzinfo=UTC)
+    live_run_id = _seed_live_run(db_conn, started_at=started_at)
+    db_conn.execute(
+        "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+        "close, volume, trades, source) VALUES (%s, %s, 60, 1, 1, 1, 1, 1, 1, 6)",
+        (iid, datetime(2026, 9, 25, 8, 1, tzinfo=UTC)),
+    )
+    run = _run([], live_run_id=live_run_id)
+    run.instrument_ids = {iid}
+    run.started_at = started_at
+
+    # now is 2 days later with a 1-hour replay cap -- the single stored
+    # bar is entirely outside the window, so nothing is delivered.
+    ok = supervisor.deliver_pending(
+        db_conn, "http://x", run, datetime(2026, 9, 27, 8, 0, tzinfo=UTC)
+    )
+
+    assert ok is True
+    row = db_conn.execute(
+        "SELECT last_gap_note FROM live_runs WHERE live_run_id=%s", (live_run_id,)
+    ).fetchone()
+    assert row[0] is not None and "replay cap" in row[0]
+
+
+def test_a_db_outage_does_not_crash_the_supervisor_loop(monkeypatch) -> None:  # noqa: ANN001
+    """ReconnectingConnection.get() can raise psycopg.OperationalError
+    while the database is still down, after sleeping its own backoff
+    (Task 3). run_supervisor's loop must survive that: log it, skip this
+    pass, and try again next iteration -- not let the whole process die
+    on an outage that recovers on its own."""
+    from trading.live import supervisor
+
+    calls = {"n": 0}
+
+    class _FakeDB:
+        def get(self):  # noqa: ANN202
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise psycopg.OperationalError("still down")
+            stop.set()
+            return MagicMock()
+
+    class _FakePubSub:
+        def get_message(self, timeout):  # noqa: ANN001, ANN202, ARG002
+            return None
+
+    monkeypatch.setattr(supervisor, "ReconnectingConnection", lambda *a, **k: _FakeDB())  # noqa: ARG005
+    monkeypatch.setattr(supervisor, "SyncResilientPubSub", lambda *a, **k: _FakePubSub())  # noqa: ARG005
+    monkeypatch.setattr(supervisor, "reconcile", lambda conn, runs: None)  # noqa: ARG005
+
+    stop = threading.Event()
+
+    supervisor.run_supervisor(stop)
+
+    assert calls["n"] == 2

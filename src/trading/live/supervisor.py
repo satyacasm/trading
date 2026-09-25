@@ -28,7 +28,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -40,6 +40,8 @@ from psycopg import Connection
 from trading.agent_contract.sandbox import SandboxLimits, _docker_args
 from trading.agent_contract.smoke import _resolve_limits
 from trading.config import get_settings
+from trading.db import ReconnectingConnection
+from trading.live.cursors import advance_cursor, pending_bars
 from trading.live.protocol import (
     FRAME_BAR,
     FRAME_ERROR,
@@ -50,6 +52,7 @@ from trading.live.protocol import (
     encode_frame,
 )
 from trading.runtime.payload import MODE_LIVE, SmokePayload, encode_payload
+from trading.streaming.resilient_pubsub import SyncResilientPubSub
 
 log = structlog.get_logger(__name__)
 
@@ -75,12 +78,14 @@ class LiveRun:
     instrument_ids: set[int]
     runtime: str
     kernel_isolated: bool
+    started_at: datetime
     bars_seen: int = 0
     orders_placed: int = 0
     # A refused order is information, not a failure -- but a run refused on
     # every bar reads as an idle one unless the count is kept.
     orders_refused: int = 0
     last_refusal: str | None = None
+    last_gap_note: str | None = None
     # What the manifest declared, or None for a strategy that trades
     # nothing levered. Sent on every order this run places: the gateway
     # requires it for a perpetual and refuses it as meaningless otherwise.
@@ -122,7 +127,7 @@ def start_run(
     resolved = _resolve_limits(limits)
     row = conn.execute(
         "INSERT INTO live_runs (strategy_id, portfolio_id, status, runtime, kernel_isolated)"
-        " VALUES (%s,%s,'RUNNING',%s,%s) RETURNING live_run_id",
+        " VALUES (%s,%s,'RUNNING',%s,%s) RETURNING live_run_id, started_at",
         (
             strategy_id,
             portfolio_id,
@@ -131,7 +136,7 @@ def start_run(
         ),
     ).fetchone()
     assert row is not None
-    live_run_id = int(row[0])
+    live_run_id, started_at = int(row[0]), row[1]
 
     payload = encode_payload(
         SmokePayload(
@@ -168,6 +173,7 @@ def start_run(
         instrument_ids=set(instrument_ids),
         runtime=resolved.runtime or "runc",
         kernel_isolated=(resolved.runtime or "runc") in {"runsc"},
+        started_at=started_at,
         leverage=leverage,
     )
 
@@ -318,7 +324,15 @@ def place_order(api_url: str, run: LiveRun, intent: dict[str, Any], seq: int) ->
 
 
 def handle_bar(conn: Connection, api_url: str, run: LiveRun, bar: dict[str, Any]) -> bool:
-    """One bar, end to end. False means the run should stop."""
+    """One bar, end to end. False means the run should stop.
+
+    `bar["catchup"]` (default False, so every pre-cursors caller and
+    test is unaffected) marks a bar delivered late. The runtime still
+    updates ctx.state and indicators on it -- only the ORDER is refused,
+    by this process rather than by the untrusted container, because the
+    enforcing check has to sit outside what it is enforcing against.
+    """
+    catchup = bool(bar.get("catchup", False))
     feed_bar(run, bar)
     frames = read_frames(run)
     if not frames:
@@ -332,6 +346,13 @@ def handle_bar(conn: Connection, api_url: str, run: LiveRun, bar: dict[str, Any]
         if frame["type"] != FRAME_ORDERS:
             continue
         for intent in frame.get("orders", []):
+            # Refused before the rate limit sees it: a catch-up replay
+            # dispatches many bars in seconds, and counting orders that
+            # are never placed would stop the very run being recovered.
+            if catchup:
+                run.orders_refused += 1
+                run.last_refusal = "catch-up bar: price no longer tradeable"
+                continue
             run.note_order()
             if run.over_rate_limit():
                 stop_run(
@@ -346,16 +367,60 @@ def handle_bar(conn: Connection, api_url: str, run: LiveRun, bar: dict[str, Any]
         if not frame.get("alive", True):
             stop_run(conn, run, "STOPPED", frame.get("breaker_reason") or "the breaker latched")
             return False
-    conn.execute(
-        "UPDATE live_runs SET bars_seen=%s, orders_placed=%s, orders_refused=%s,"
-        " last_refusal=%s WHERE live_run_id=%s",
-        (run.bars_seen, run.orders_placed, run.orders_refused, run.last_refusal, run.live_run_id),
-    )
+
+    with conn.transaction():
+        if "instrument_id" in bar and "ts" in bar:
+            advance_cursor(
+                conn, run.live_run_id, int(bar["instrument_id"]), datetime.fromisoformat(bar["ts"])
+            )
+        conn.execute(
+            "UPDATE live_runs SET bars_seen=%s, orders_placed=%s, orders_refused=%s,"
+            " last_refusal=%s, last_gap_note=COALESCE(%s, last_gap_note) WHERE live_run_id=%s",
+            (
+                run.bars_seen,
+                run.orders_placed,
+                run.orders_refused,
+                run.last_refusal,
+                run.last_gap_note,
+                run.live_run_id,
+            ),
+        )
     return True
 
 
+def deliver_pending(conn: Connection, api_url: str, run: LiveRun, now: datetime) -> bool:
+    """Everything design §4 means by "on any notification (or a timer),
+    the supervisor sends everything after the cursor, oldest first" --
+    the single mechanism covering a missed closed_bars:* message, an
+    aggregator restart, and a supervisor restart. Returns False the
+    moment any bar's handle_bar says the run should stop.
+    """
+    settings = get_settings()
+    pending, gap_note = pending_bars(
+        conn,
+        run.live_run_id,
+        run.instrument_ids,
+        run.started_at,
+        now=now,
+        catchup_after=timedelta(seconds=settings.live_catchup_after_seconds),
+        replay_cap=timedelta(hours=settings.live_replay_cap_hours),
+    )
+    if gap_note is not None:
+        run.last_gap_note = gap_note
+        if not pending:
+            # Nothing will reach handle_bar's own write this cycle --
+            # persist the note now rather than losing it until the next
+            # bar that happens to arrive.
+            conn.execute(
+                "UPDATE live_runs SET last_gap_note=%s WHERE live_run_id=%s",
+                (gap_note, run.live_run_id),
+            )
+    return all(handle_bar(conn, api_url, run, item.frame) for item in pending)
+
+
 _SELECT_RUNNING = """
-    SELECT r.live_run_id, r.strategy_id, r.portfolio_id, s.source, s.manifest, p.cash_balance
+    SELECT r.live_run_id, r.strategy_id, r.portfolio_id, s.source, s.manifest,
+           p.cash_balance, r.started_at
     FROM live_runs r
     JOIN strategies s ON s.strategy_id = r.strategy_id
     JOIN portfolios p ON p.portfolio_id = r.portfolio_id
@@ -391,7 +456,7 @@ def reconcile(conn: Connection, runs: dict[int, LiveRun]) -> None:
     for live_run_id, row in wanted.items():
         if live_run_id in runs:
             continue
-        _, strategy_id, portfolio_id, source, manifest, cash = row
+        _, strategy_id, portfolio_id, source, manifest, cash, started_at = row
         if manifest is None:
             stop_run_row(conn, live_run_id, "CRASHED", "this version stores no manifest")
             continue
@@ -416,6 +481,7 @@ def reconcile(conn: Connection, runs: dict[int, LiveRun]) -> None:
             schedules,
             Decimal(str(cash)),
             leverage=declared_leverage,
+            started_at=started_at,
         )
 
 
@@ -454,6 +520,8 @@ def _launch(
     instrument_ids: list[int],
     schedules: Any,
     starting_cash: Decimal,
+    *,
+    started_at: datetime,
     limits: SandboxLimits | None = None,
     leverage: Decimal | None = None,
 ) -> LiveRun:
@@ -490,31 +558,40 @@ def _launch(
         instrument_ids=set(instrument_ids),
         runtime=resolved.runtime or "runc",
         kernel_isolated=(resolved.runtime or "runc") == "runsc",
+        started_at=started_at,
         leverage=leverage,
     )
 
 
 def run_supervisor(stop: threading.Event | None = None) -> None:
-    """Subscribe to closed bars and drive every running strategy.
-
-    Bars, not ticks: `on_bar` is the contract's dispatch handler and the
-    unit the backtester feeds, so a live run is comparable to a backtest of
-    the same strategy. Crypto bars arrive around the clock, so a run is
-    demonstrable outside NSE hours.
+    """Poll `closed_bars:*` for a wake-up, and on a timer regardless,
+    then ask every run to deliver everything it hasn't seen yet (design
+    §4). The message's own payload is never read past its type -- the
+    cursor mechanism (Task 9) already knows what each run needs, so a
+    wake-up for ANY instrument is reason enough to check every run.
     """
     settings = get_settings()
     api_url = "http://localhost:8000"
-    conn = _connect()
-    client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
-    # The sync redis stubs leave `pubsub()` untyped -- the same real
-    # upstream gap `bar_aggregator` already carries a suppression for.
-    pubsub = client.pubsub()  # type: ignore[no-untyped-call]
-    pubsub.psubscribe(_BAR_CHANNEL_PATTERN)
+    db = ReconnectingConnection(settings.database_url, autocommit=True)
+    pubsub = SyncResilientPubSub(
+        lambda: redis.Redis.from_url(settings.redis_url, decode_responses=True),
+        patterns=[_BAR_CHANNEL_PATTERN],
+    )
     runs: dict[int, LiveRun] = {}
     log.info("live.supervisor_started", channel=_BAR_CHANNEL_PATTERN)
     last_reconcile = 0.0
+    last_delivery = 0.0
 
     while stop is None or not stop.is_set():
+        try:
+            conn = db.get()
+        except psycopg.OperationalError as exc:
+            # The DB is still down after ReconnectingConnection's own
+            # backoff sleep and reconnect attempt -- skip this pass
+            # rather than let the whole supervisor process die on an
+            # outage that will recover on its own.
+            log.warning("live.db_unavailable", reason=str(exc))
+            continue
         if time.monotonic() - last_reconcile > 5.0:
             try:
                 reconcile(conn, runs)
@@ -523,33 +600,15 @@ def run_supervisor(stop: threading.Event | None = None) -> None:
             last_reconcile = time.monotonic()
 
         message = pubsub.get_message(timeout=1.0)
-        if not message or message["type"] != "pmessage":
+        woken = message is not None and message.get("type") == "pmessage"
+        due = time.monotonic() - last_delivery > settings.live_delivery_timer_seconds
+        if not woken and not due:
             continue
-        try:
-            bar = json.loads(message["data"])
-        except json.JSONDecodeError:
-            continue
-        instrument_id = int(bar.get("instrument_id", 0))
+        last_delivery = time.monotonic()
+        now = datetime.now(UTC)
         for live_run_id, run in list(runs.items()):
-            if instrument_id not in run.instrument_ids:
-                continue
-            if not handle_bar(conn, api_url, run, _bar_frame(bar)):
+            if not deliver_pending(conn, api_url, run, now):
                 runs.pop(live_run_id, None)
-
-
-def _bar_frame(bar: dict[str, Any]) -> dict[str, Any]:
-    """A published bar as the wire frame the runner expects. Money stays a
-    string end to end."""
-    return {
-        "instrument_id": int(bar["instrument_id"]),
-        "ts": bar["ts"],
-        "interval_sec": int(bar.get("interval_sec", 60)),
-        "open": str(bar["open"]),
-        "high": str(bar["high"]),
-        "low": str(bar["low"]),
-        "close": str(bar["close"]),
-        "volume": None if bar.get("volume") is None else str(bar["volume"]),
-    }
 
 
 def main() -> int:

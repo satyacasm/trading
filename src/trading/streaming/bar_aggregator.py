@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import psycopg
 import structlog
@@ -23,6 +24,7 @@ from redis.asyncio.client import PubSub
 
 from trading.config import get_settings
 from trading.contracts import DataSource
+from trading.sources.binance_spot import fetch_spot_klines, spot_symbol
 from trading.streaming.models import Bar, Tick
 
 INTERVAL_SECONDS = 60
@@ -104,6 +106,15 @@ class BarAggregator:
         # steady trickle is a feed that reorders, a burst is a host that
         # slept. The loop logs this; the class stays free of I/O.
         self.late_ticks_dropped = 0
+
+    def seed_closed_through(self, mapping: dict[int, datetime]) -> None:
+        """Prime `_closed_through` from the database at startup, so a
+        late tick for a minute this PROCESS never bucketed -- because a
+        previous process instance already closed and announced it -- is
+        dropped rather than reopening and republishing an already-final
+        bar (design §1 row 4; `_closed_through` was in-memory only, and
+        a restart forgot it)."""
+        self._closed_through.update(mapping)
 
     def ingest(self, tick: Tick) -> list[ClosedBar]:
         bucket = bucket_start(tick.ts, self._interval_seconds)
@@ -342,6 +353,91 @@ async def _publish_closed_bar(
     )
 
 
+_SELECT_CRYPTO_SPOT_INSTRUMENTS = """
+    SELECT instrument_id, symbol FROM instruments
+    WHERE asset_class = 'CRYPTO' AND segment = 'SPOT'
+"""
+
+
+def _query_crypto_spot_instruments(conn: Connection) -> dict[int, str]:
+    rows = conn.execute(_SELECT_CRYPTO_SPOT_INSTRUMENTS).fetchall()
+    return {int(row[0]): str(row[1]) for row in rows}
+
+
+async def _startup_spot_backfill(
+    conn_factory: Callable[[], Connection],
+    aggregator: BarAggregator,
+    redis: Redis,
+    *,
+    to_thread: Callable[..., Any],
+    fetch: Any = None,
+) -> None:
+    """Seed `_closed_through` from the database and fill whatever
+    elapsed while this process was down, from each crypto spot
+    instrument's last stored bar to the first bucket this process can
+    honestly claim in full. Runs once, awaited, before ticks are
+    consumed, off the event loop thread so a slow Binance response
+    never delays the first tick subscription. A REST failure for one
+    instrument is logged and skipped -- it never blocks the others or
+    startup itself.
+    """
+    # Imported here, not at module level: trading.streaming.spot_backfill
+    # imports bucket_start from this module, so a top-level import here
+    # would be circular (whichever of the two modules loads first would
+    # find the other only partially initialized).
+    from trading.streaming.spot_backfill import backfill_window, last_bar_ts
+
+    fetch = fetch or fetch_spot_klines
+
+    def _do() -> tuple[dict[int, datetime], list[tuple[int, Any]]]:
+        conn = conn_factory()
+        instruments = _query_crypto_spot_instruments(conn)
+        seeded: dict[int, datetime] = {}
+        announced: list[tuple[int, Any]] = []
+        cutoff = bucket_start(datetime.now(UTC), INTERVAL_SECONDS)
+        for instrument_id, symbol in instruments.items():
+            latest = last_bar_ts(conn, instrument_id)
+            if latest is None:
+                continue
+            seeded[instrument_id] = latest
+            try:
+                inserted = backfill_window(
+                    conn,
+                    instrument_id,
+                    spot_symbol(symbol),
+                    since=latest + timedelta(seconds=INTERVAL_SECONDS),
+                    until=cutoff,
+                    fetch=fetch,
+                )
+            except Exception as exc:  # noqa: BLE001 - a REST failure must never block startup
+                log.warning(
+                    "bar_aggregator.startup_backfill_failed",
+                    instrument_id=instrument_id,
+                    reason=str(exc),
+                )
+                continue
+            for kline in inserted:
+                seeded[instrument_id] = max(seeded[instrument_id], kline.ts)
+                announced.append((instrument_id, kline))
+        return seeded, announced
+
+    seeded, announced = await to_thread(_do)
+    aggregator.seed_closed_through(seeded)
+    for instrument_id, kline in announced:
+        await _announce_bar(
+            redis,
+            instrument_id=instrument_id,
+            ts=kline.ts,
+            open_=kline.open,
+            high=kline.high,
+            low=kline.low,
+            close=kline.close,
+            volume=kline.volume,
+            interval_seconds=INTERVAL_SECONDS,
+            source=DataSource.BINANCE_SPOT_KLINE,
+        )
+
+
 async def run_aggregation_loop(
     redis: Redis,
     conn: Connection,
@@ -353,6 +449,9 @@ async def run_aggregation_loop(
     source: DataSource = DataSource.BINANCE_WS,
     pattern: str = _TICK_PATTERN,
     bars_pattern: str = _BAR_PATTERN,
+    backfill_conn_factory: Callable[[], Connection] | None = None,
+    to_thread: Callable[..., Any] = asyncio.to_thread,
+    spot_fetch: Any = None,
 ) -> None:
     """Subscribe to `pattern` (`ticks:*` by default) and `bars_pattern`
     (`bars:*` by default), writing each resulting bar to `bars_intraday`.
@@ -395,6 +494,10 @@ async def run_aggregation_loop(
     `bars_pattern` path -- those bars are complete by construction.
     """
     aggregator = BarAggregator(interval_seconds)
+    if backfill_conn_factory is not None:
+        await _startup_spot_backfill(
+            backfill_conn_factory, aggregator, redis, to_thread=to_thread, fetch=spot_fetch
+        )
     first_complete_bucket = bucket_start(datetime.now(UTC), interval_seconds) + timedelta(
         seconds=interval_seconds
     )

@@ -954,3 +954,99 @@ def test_a_tick_for_a_new_bucket_still_opens_one_after_a_flush() -> None:
     closed = aggregator.flush_stale(base + timedelta(minutes=5))
     assert [c.bucket for c in closed] == [base + timedelta(minutes=1)]
     assert aggregator.late_ticks_dropped == 0
+
+
+def test_seed_closed_through_drops_a_late_tick_for_an_already_written_minute():
+    """The actual production bug (design §1 row 4): _closed_through is
+    in-memory only, so a late tick after a restart reopened an
+    already-announced minute and republished it with different values,
+    crashing a live strategy on 'arrived out of order'."""
+    from trading.streaming.bar_aggregator import BarAggregator
+    from trading.streaming.models import Tick
+
+    aggregator = BarAggregator()
+    aggregator.seed_closed_through({1: datetime(2026, 9, 25, 10, 5, tzinfo=UTC)})
+
+    closed = aggregator.ingest(
+        Tick(
+            instrument_id=1,
+            ts=datetime(2026, 9, 25, 10, 3, 30, tzinfo=UTC),  # a minute already seeded
+            price=Decimal("100"),
+            quantity=Decimal("1"),
+        )
+    )
+    assert closed == []
+    assert aggregator.late_ticks_dropped == 1
+
+
+def test_startup_backfill_writes_and_announces_with_a_fake_fetch(db_conn, redis_client) -> None:
+    """Exercises the extracted helper directly rather than the whole
+    run_aggregation_loop -- that loop only terminates on a tick/bar
+    count, and no ticks are published in this test."""
+    import asyncio
+    import json
+
+    from redis.asyncio import Redis as AsyncRedis
+
+    from trading.config import get_settings
+    from trading.sources.binance_spot import SpotKline
+    from trading.streaming.bar_aggregator import BarAggregator, _startup_spot_backfill
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    db_conn.execute(
+        "INSERT INTO bars_intraday (instrument_id, ts, interval_sec, open, high, low, "
+        "close, volume, trades, source) VALUES (%s, %s, 60, 1, 1, 1, 1, 1, 1, 6)",
+        (iid, datetime(2026, 9, 25, 9, 58, tzinfo=UTC)),
+    )
+
+    def _fake_fetch(symbol, *, start_ms, end_ms, client=None):
+        return [
+            SpotKline(
+                ts=datetime(2026, 9, 25, 9, 59, tzinfo=UTC),
+                open=Decimal("100"),
+                high=Decimal("100"),
+                low=Decimal("100"),
+                close=Decimal("100"),
+                volume=Decimal("0"),
+                trades=0,
+            )
+        ]
+
+    async def _inline_to_thread(fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    async def _next_pmessage(pubsub):
+        async for msg in pubsub.listen():
+            if msg["type"] == "pmessage":
+                return msg
+
+    async def _run():
+        async_redis = AsyncRedis.from_url(get_settings().redis_url, decode_responses=True)
+        pubsub = async_redis.pubsub()
+        await pubsub.psubscribe("closed_bars:*")
+        aggregator = BarAggregator()
+        try:
+            await _startup_spot_backfill(
+                lambda: db_conn,
+                aggregator,
+                async_redis,
+                to_thread=_inline_to_thread,
+                fetch=_fake_fetch,
+            )
+            message = await asyncio.wait_for(_next_pmessage(pubsub), timeout=5)
+            return aggregator, message
+        finally:
+            await pubsub.aclose()
+            await async_redis.connection_pool.disconnect()
+
+    aggregator, message = asyncio.run(_run())
+
+    assert aggregator._closed_through[iid] == datetime(2026, 9, 25, 9, 59, tzinfo=UTC)
+    row = db_conn.execute(
+        "SELECT open, source FROM bars_intraday WHERE instrument_id=%s AND ts=%s",
+        (iid, datetime(2026, 9, 25, 9, 59, tzinfo=UTC)),
+    ).fetchone()
+    assert row == (Decimal("100.0000"), 11)  # 11 = BINANCE_SPOT_KLINE
+    body = json.loads(message["data"])
+    assert body["instrument_id"] == iid

@@ -562,3 +562,103 @@ def test_a_delivery_failure_for_one_run_does_not_stop_the_others(monkeypatch) ->
     supervisor.run_supervisor(stop)
 
     assert delivered == [2]
+
+
+def test_launch_passes_leverage_to_the_container(monkeypatch) -> None:
+    """The actual bug: _launch built SmokePayload WITHOUT leverage=leverage
+    even though start_run passes it -- a relaunched perpetual strategy
+    silently traded unlevered."""
+    import subprocess
+    from unittest.mock import MagicMock
+
+    from trading.live import supervisor
+
+    captured: dict[str, object] = {}
+
+    def _fake_encode_payload(payload):  # noqa: ANN001
+        captured["leverage"] = payload.leverage
+        return b"x"
+
+    monkeypatch.setattr(supervisor, "encode_payload", _fake_encode_payload)
+    fake_process = MagicMock(spec=subprocess.Popen)
+    fake_process.stdin = MagicMock()
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: fake_process)
+
+    supervisor._launch(
+        MagicMock(),
+        live_run_id=1,
+        strategy_id=1,
+        portfolio_id=1,
+        source="x",
+        instrument_ids=[1],
+        schedules=(),
+        starting_cash=Decimal("1000"),
+        started_at=datetime(2026, 9, 4, tzinfo=UTC),
+        leverage=Decimal("20"),
+    )
+    assert captured["leverage"] == Decimal("20")
+
+
+def test_launch_restores_counters_so_idempotency_keys_never_repeat(monkeypatch) -> None:
+    """The actual bug: a relaunched LiveRun starts bars_seen/orders_placed
+    at 0, so place_order's idempotency key `live-{id}-{seq}` repeats a
+    key already used before the restart -- the gateway then returns the
+    OLD order instead of placing a new one."""
+    import subprocess
+    from unittest.mock import MagicMock
+
+    from trading.live import supervisor
+
+    monkeypatch.setattr(supervisor, "encode_payload", lambda payload: b"x")
+    fake_process = MagicMock(spec=subprocess.Popen)
+    fake_process.stdin = MagicMock()
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: fake_process)
+
+    run = supervisor._launch(
+        MagicMock(),
+        live_run_id=1,
+        strategy_id=1,
+        portfolio_id=1,
+        source="x",
+        instrument_ids=[1],
+        schedules=(),
+        starting_cash=Decimal("1000"),
+        started_at=datetime(2026, 9, 4, tzinfo=UTC),
+        bars_seen=42,
+        orders_placed=7,
+        orders_refused=2,
+        last_refusal="stale",
+        strategy_state={"seen": 5},
+    )
+    assert run.bars_seen == 42
+    assert run.orders_placed == 7
+    assert run.orders_refused == 2
+    assert run.last_refusal == "stale"
+
+
+def test_handle_bar_persists_the_orders_frames_state_column(db_conn, monkeypatch) -> None:
+    from trading.live import supervisor
+    from trading.streaming.seed_instruments import seed_crypto_instruments
+
+    iid = seed_crypto_instruments(db_conn, pairs=["BTC-USDT"])["BTC-USDT"]
+    live_run_id = _seed_live_run(db_conn, started_at=datetime(2026, 9, 25, tzinfo=UTC))
+    monkeypatch.setattr(supervisor, "place_order", lambda *a, **k: True)
+    run = _run(
+        [
+            encode_frame(
+                FRAME_ORDERS, ts="t", orders=[], alive=True, state={"seen": 1}
+            )
+        ],
+        live_run_id=live_run_id,
+    )
+
+    # _bar()'s hardcoded instrument_id=1 does not exist in this test's
+    # instruments table -- advance_cursor's FK requires the seeded iid,
+    # matching every other db_conn test in this file.
+    bar = {**_bar(), "instrument_id": iid}
+    assert supervisor.handle_bar(db_conn, "http://x", run, bar) is True
+
+    row = db_conn.execute(
+        "SELECT strategy_state FROM live_runs WHERE live_run_id=%s", (live_run_id,)
+    ).fetchone()
+    assert row[0] == {"seen": 1}

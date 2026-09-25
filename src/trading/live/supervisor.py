@@ -39,6 +39,7 @@ import psycopg
 import redis
 import structlog
 from psycopg import Connection
+from psycopg.types.json import Jsonb
 
 from trading.agent_contract.sandbox import SandboxLimits, _docker_args
 from trading.agent_contract.smoke import _resolve_limits
@@ -370,12 +371,14 @@ def handle_bar(conn: Connection, api_url: str, run: LiveRun, bar: dict[str, Any]
         stop_run(conn, run, "CRASHED", f"no reply in {timeout}s")
         return False
 
+    state: dict[str, Any] | None = None
     for frame in frames:
         if frame["type"] == FRAME_ERROR:
             stop_run(conn, run, "CRASHED", str(frame.get("error", ""))[:2000])
             return False
         if frame["type"] != FRAME_ORDERS:
             continue
+        state = frame.get("state", state)
         for intent in frame.get("orders", []):
             # Refused before the rate limit sees it: a catch-up replay
             # dispatches many bars in seconds, and counting orders that
@@ -406,13 +409,15 @@ def handle_bar(conn: Connection, api_url: str, run: LiveRun, bar: dict[str, Any]
             )
         conn.execute(
             "UPDATE live_runs SET bars_seen=%s, orders_placed=%s, orders_refused=%s,"
-            " last_refusal=%s, last_gap_note=COALESCE(%s, last_gap_note) WHERE live_run_id=%s",
+            " last_refusal=%s, last_gap_note=COALESCE(%s, last_gap_note),"
+            " strategy_state=COALESCE(%s, strategy_state) WHERE live_run_id=%s",
             (
                 run.bars_seen,
                 run.orders_placed,
                 run.orders_refused,
                 run.last_refusal,
                 run.last_gap_note,
+                None if state is None else Jsonb(state),
                 run.live_run_id,
             ),
         )
@@ -452,7 +457,8 @@ def deliver_pending(conn: Connection, api_url: str, run: LiveRun, now: datetime)
 
 _SELECT_RUNNING = """
     SELECT r.live_run_id, r.strategy_id, r.portfolio_id, s.source, s.manifest,
-           p.cash_balance, r.started_at
+           p.cash_balance, r.started_at, r.bars_seen, r.orders_placed,
+           r.orders_refused, r.last_refusal, r.strategy_state
     FROM live_runs r
     JOIN strategies s ON s.strategy_id = r.strategy_id
     JOIN portfolios p ON p.portfolio_id = r.portfolio_id
@@ -488,7 +494,20 @@ def reconcile(conn: Connection, runs: dict[int, LiveRun]) -> None:
     for live_run_id, row in wanted.items():
         if live_run_id in runs:
             continue
-        _, strategy_id, portfolio_id, source, manifest, cash, started_at = row
+        (
+            _,
+            strategy_id,
+            portfolio_id,
+            source,
+            manifest,
+            cash,
+            started_at,
+            bars_seen,
+            orders_placed,
+            orders_refused,
+            last_refusal,
+            strategy_state,
+        ) = row
         if manifest is None:
             stop_run_row(conn, live_run_id, "CRASHED", "this version stores no manifest")
             continue
@@ -512,8 +531,13 @@ def reconcile(conn: Connection, runs: dict[int, LiveRun]) -> None:
             instrument_ids,
             schedules,
             Decimal(str(cash)),
-            leverage=declared_leverage,
             started_at=started_at,
+            leverage=declared_leverage,
+            bars_seen=bars_seen,
+            orders_placed=orders_placed,
+            orders_refused=orders_refused,
+            last_refusal=last_refusal,
+            strategy_state=strategy_state,
         )
 
 
@@ -556,8 +580,17 @@ def _launch(
     started_at: datetime,
     limits: SandboxLimits | None = None,
     leverage: Decimal | None = None,
+    bars_seen: int = 0,
+    orders_placed: int = 0,
+    orders_refused: int = 0,
+    last_refusal: str | None = None,
+    strategy_state: dict[str, Any] | None = None,
 ) -> LiveRun:
-    """Start a container for a run row that already exists."""
+    """Start a container for a run row that already exists. Restores the
+    counters and ctx.state a fresh LiveRun would otherwise reset to
+    zero/None -- without this, a relaunch's idempotency keys
+    (`live-{id}-{seq}`) collide with ones already used before the
+    restart, and the strategy loses everything it had learned."""
     resolved = _resolve_limits(limits)
     payload = encode_payload(
         SmokePayload(
@@ -566,6 +599,9 @@ def _launch(
             starting_cash=starting_cash,
             slippage_bps=Decimal(str(get_settings().paper_slippage_bps)),
             charge_schedules=tuple(schedules),
+            leverage=leverage,
+            strategy_state=strategy_state,
+            state_max_bytes=get_settings().live_state_max_bytes,
         )
     )
     process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
@@ -591,6 +627,10 @@ def _launch(
         runtime=resolved.runtime or "runc",
         kernel_isolated=(resolved.runtime or "runc") == "runsc",
         started_at=started_at,
+        bars_seen=bars_seen,
+        orders_placed=orders_placed,
+        orders_refused=orders_refused,
+        last_refusal=last_refusal,
         leverage=leverage,
     )
 

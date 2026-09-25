@@ -15,7 +15,7 @@ export type Tick = {
 };
 
 const WS_URL =
-  (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/^http/, "ws") + "/ws";
+  (process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8010").replace(/^http/, "ws") + "/ws";
 const MAX_BACKOFF_MS = 10_000;
 
 // NOTE: callers must pass a MEMOIZED `instrumentIds` array (e.g. via

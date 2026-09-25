@@ -92,13 +92,17 @@ def test_telegram_settings_are_tunable_via_env(monkeypatch, tmp_path):
 
 
 def test_cors_origins_default_to_the_web_apps_port(monkeypatch) -> None:  # noqa: ANN001
-    """Unset, the gateway answers exactly the one origin the web app runs on
-    -- the behaviour before it was configurable."""
+    """Unset, the gateway answers the web app's own origin -- port 3010
+    (3000 is taken by another project on this machine), under both
+    spellings a browser may use for it."""
     from trading.config import Settings
 
     monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
     monkeypatch.setenv("REDIS_URL", "redis://x")
-    assert Settings().cors_allow_origins == "http://localhost:3000"
+    assert Settings().cors_allow_origins.split(",") == [
+        "http://localhost:3010",
+        "http://127.0.0.1:3010",
+    ]
 
 
 def test_cors_origins_accept_a_comma_separated_list(monkeypatch) -> None:  # noqa: ANN001

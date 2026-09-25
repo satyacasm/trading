@@ -156,8 +156,8 @@ def test_index_serves_the_proof_page(client: TestClient) -> None:
 def test_cors_allows_the_local_web_dev_origin(
     client: TestClient, seeded_instrument_id: int, seeded_upstox_equities: None
 ) -> None:
-    response = client.get("/instruments", headers={"Origin": "http://localhost:3000"})
-    assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
+    response = client.get("/instruments", headers={"Origin": "http://localhost:3010"})
+    assert response.headers.get("access-control-allow-origin") == "http://localhost:3010"
 
 
 def test_market_data_routes_are_mounted_on_the_gateway_app(client: TestClient) -> None:

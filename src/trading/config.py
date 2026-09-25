@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     # second dev server -- a git worktree verifying its own branch, say --
     # can be allowed without editing code. The default is the one port the
     # web app runs on, so nothing changes for anyone who sets nothing.
-    cors_allow_origins: str = "http://localhost:3000"
+    cors_allow_origins: str = "http://localhost:3010,http://127.0.0.1:3010"
 
     upstox_api_key: str | None = None
     upstox_api_secret: str | None = None

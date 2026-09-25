@@ -32,7 +32,7 @@ export type CandlesResponse = {
 
 export type Interval = "1m" | "5m" | "15m" | "1h" | "1d";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8010";
 
 export async function fetchInstruments(): Promise<InstrumentSummary[]> {
   const res = await fetch(`${API_URL}/instruments`);

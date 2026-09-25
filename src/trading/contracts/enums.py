@@ -37,6 +37,10 @@ class DataSource(IntEnum):
     # Reserved for the persisted mark series liquidation will need: the
     # mark is index-derived, not a traded price, so it is its own series.
     BINANCE_FUTURES_MARK = 10
+    # Backfilled spot minutes (trading.streaming.spot_backfill), distinct
+    # from live-ticked BINANCE_WS bars and from BINANCE_FUTURES_KLINE --
+    # the same pair's spot and perpetual prices are different series.
+    BINANCE_SPOT_KLINE = 11
 
 
 class JobStatus(StrEnum):

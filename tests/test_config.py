@@ -113,3 +113,23 @@ def test_cors_origins_accept_a_comma_separated_list(monkeypatch) -> None:  # noq
         "http://localhost:3000",
         "http://localhost:3001",
     ]
+
+
+def test_live_resilience_thresholds_have_spec_defaults(monkeypatch, tmp_path):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+
+    s = Settings(_env_file=None)
+
+    assert s.backfill_silence_seconds == 90
+    assert s.backfill_sweep_seconds == 300
+    assert s.backfill_sweep_window_minutes == 30
+    assert s.live_delivery_timer_seconds == 30
+    assert s.live_catchup_after_seconds == 120
+    assert s.live_replay_cap_hours == 24
+    assert s.live_state_max_bytes == 65536
+    assert s.live_reply_timeout_seconds == 30
+    assert s.stale_price_seconds == 180
+    assert s.heartbeat_ttl_seconds == 30
+    assert s.heartbeat_refresh_seconds == 10

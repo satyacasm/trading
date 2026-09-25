@@ -90,6 +90,23 @@ class Settings(BaseSettings):
     # to start rather than guessing a book.
     mcp_stdio_portfolio_id: int | None = None
 
+    # Live-stack-resilience thresholds (docs/superpowers/specs/
+    # 2026-09-25-live-stack-resilience-design.md §8). Every one of these
+    # is a duration an operator may reasonably want to tune per
+    # deployment without a code change -- so they live here, not as
+    # module constants.
+    backfill_silence_seconds: int = 90
+    backfill_sweep_seconds: int = 300
+    backfill_sweep_window_minutes: int = 30
+    live_delivery_timer_seconds: int = 30
+    live_catchup_after_seconds: int = 120
+    live_replay_cap_hours: int = 24
+    live_state_max_bytes: int = 65536
+    live_reply_timeout_seconds: int = 30
+    stale_price_seconds: int = 180
+    heartbeat_ttl_seconds: int = 30
+    heartbeat_refresh_seconds: int = 10
+
     @property
     def raw_archive_root(self) -> Path:
         return self.data_root / "raw"
